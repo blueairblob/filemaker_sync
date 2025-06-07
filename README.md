@@ -338,4 +338,5 @@ FileMaker Pro → ODBC → Python → SQLAlchemy → Supabase/PostgreSQL
 
 ---
 
-**Built with ❤️ for seamless database migration**
+**Built with ❤️ for seamless database migration**#   f i l e m a k e r _ s y n c  
+ 
