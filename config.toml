@@ -1,0 +1,64 @@
+# Toml format
+
+[gui]
+  api_host = "http://localhost"
+  api_port = 5000
+  api_timeout = 5000
+  api_health_check_interval = 30000
+
+[export]
+  path = '/dev/RAT_Trains_Project/Migration/exports'
+  prefix = 'rat'
+  image_formats_supported = ['jpg', 'webp']
+  image_path = 'images'
+
+[database]
+  
+  [database.source] 
+    host = '127.0.0.1'
+    dsn  = 'rat'
+    user = 'train'
+    pwd  = '' 
+    port = ''
+    type = 'odbc'
+    name = ['fmp', 'FileMaker Pro']
+    schema = ['FileMaker_Tables', 'FileMaker_Fields', 'FileMaker_BaseTableFields']
+  
+  [database.target]
+    dsn = 'postgres'
+    db = 'supabase'               # Key to the db target type
+    dt = '%Y%m%d %H:%M:%S'
+    type = 'url'                  # url - using sqlalchemy
+    #host = '127.0.0.1'            # Or not local then aws-0-eu-central-1.pooler.supabase.com for supabase in the cloud
+    host = 'aws-0-eu-central-1.pooler.supabase.com'
+    schema = ['rat_migration', 'rat']
+    mig_schema = 0
+    tgt_schema = 1
+    user = 'migration_user'
+    
+  [database.target.rat_migration.pk]
+    prompts = ['prompt_field']
+    ratbuilders = ['"Builder code"']
+    ratcatalogue = ['image_no']
+    ratroutes = ['start_location', 'end_location']
+    ratcollections = ['collection']
+    ratlabels = ['image_no']
+
+  [database.target.mysql]
+    name = ['mysql', 'MySQL']
+    user = 'trevour'
+    pwd = 'trevour' 
+    port = '3306'
+
+  [database.target.supabase]
+    name = ['supabase', 'Supabase']
+    #user = 'postgres'
+    user = 'postgres.kmoehqdowgdupzdxtbei'
+    #pwd = 'postgres'
+    pwd = 'N1ceBigdatabase!'
+    #port = '54322'                # Or not local then 6543 for supabase in the cloud
+    port = '5432'
+
+#user = 'postgres.kmoehqdowgdupzdxtbei'
+#pwd = 'N1ceBigdatabase!'
+    

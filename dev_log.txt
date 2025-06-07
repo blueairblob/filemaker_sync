@@ -1,0 +1,14 @@
+Install Python 3.12 from Microsoft App Store
+Install Microsoft Visual C++ Build Tools:
+ - Go to https://visualstudio.microsoft.com/visual-cpp-build-tools/
+ - Download "Build Tools for Visual Studio 2022"
+ - Install with "C++ build tools" workload
+  
+cd C:\dev\work\filemaker_sync\
+python3 --version
+python3 -m venv py3
+cd .py3\Scripts\
+. .\activate
+pip install -r .\requirements.txt
+python.exe -m pip install --upgrade pip
+

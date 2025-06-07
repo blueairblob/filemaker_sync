@@ -1,0 +1,25 @@
+# requirements.txt
+# Core dependencies for the FileMaker Sync application
+pyodbc>=5.0.1
+pandas==2.1.4
+sqlalchemy==2.0.23
+pillow==10.1.0
+tqdm==4.66.1
+tomli==2.0.1
+pyinstaller==6.3.0
+
+# Optional: For enhanced GUI styling
+tkinter-tooltip==2.2.0
+
+
+# App 
+colorama
+greenlet
+numpy
+PyMySQL
+python-dateutil
+pytz
+six
+typing-extensions
+tzdata
+psycopg2
