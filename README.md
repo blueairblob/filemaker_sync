@@ -6,28 +6,28 @@ A comprehensive desktop application for migrating and synchronizing data from Fi
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)
 
-## ✨ Features
+## Features
 
-### 🔄 **Data Migration & Sync**
+### Data Migration & Sync
 - **Schema Migration (DDL)**: Export and recreate table structures
 - **Data Migration (DML)**: Transfer all table data with integrity checking
 - **Incremental Sync**: Resume from specific records using image IDs
 - **Duplicate Handling**: Intelligent conflict resolution with detailed logging
 - **Image Processing**: Extract and convert container images (JPEG → JPG/WebP)
 
-### 🖥️ **Dual Interface**
+### Dual Interface
 - **Desktop GUI**: User-friendly interface with real-time progress monitoring
 - **Command Line**: Advanced scripting and automation capabilities
 - **Real-time Logging**: Live output streaming with debug modes
 - **Connection Testing**: Validate both FileMaker and Supabase connections
 
-### 🛡️ **Enterprise Ready**
+### Enterprise Ready
 - **Error Recovery**: Comprehensive error handling and rollback capabilities
 - **Memory Management**: Chunked processing for large datasets
 - **Progress Tracking**: Visual progress bars and detailed status reporting
 - **Audit Trail**: Complete logging of all operations and errors
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Prerequisites
 - Windows 10/11 (64-bit)
@@ -60,7 +60,7 @@ python filemaker_gui.py
 python filemaker_extract.py --help
 ```
 
-## 📋 Configuration
+## Configuration
 
 ### 1. FileMaker ODBC Setup
 1. **Install ODBC Driver** (included with FileMaker Pro)
@@ -93,7 +93,7 @@ user = 'filemaker_user'
 pwd = 'password'
 ```
 
-## 🎮 Usage
+## Usage
 
 ### GUI Application
 1. **Launch** the FileMaker Sync application
@@ -135,7 +135,7 @@ python filemaker_extract.py --db-exp --dml --start-from "IMG001"
 | `--max-rows N` | Limit rows processed |
 | `--start-from ID` | Resume from specific record |
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 filemaker-sync/
@@ -154,7 +154,7 @@ filemaker-sync/
 └── docs/                     # Documentation
 ```
 
-## 🔧 Building Standalone Executable
+## Building Standalone Executable
 
 ### Development Build
 ```bash
@@ -175,7 +175,7 @@ python deploy.py
 - PyInstaller 6.3.0+
 - Inno Setup Compiler (for installer)
 
-## 🗃️ Database Schema
+## Database Schema
 
 ### Source (FileMaker)
 The tool automatically discovers tables through FileMaker's metadata:
@@ -195,7 +195,7 @@ The tool automatically discovers tables through FileMaker's metadata:
 | Date | DATE/TIMESTAMP | Timezone handling |
 | Container | BYTEA | Image extraction available |
 
-## 🔍 Troubleshooting
+## Troubleshooting
 
 ### Common Issues
 
@@ -230,7 +230,7 @@ python filemaker_extract.py --debug --info-only
 - Contains: Connection details, SQL operations, error stack traces
 - Rotation: Daily log files with timestamp
 
-## 🤝 Contributing
+## Contributing
 
 ### Development Setup
 1. Fork the repository
@@ -257,11 +257,11 @@ python filemaker_extract.py --db-exp --ddl --dml --max-rows 10
 python filemaker_gui.py
 ```
 
-## 📄 License
+## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## 🆘 Support
+## Support
 
 ### Documentation
 - [Installation Guide](docs/installation.md)
@@ -271,14 +271,14 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ### Getting Help
 - **Issues**: Use GitHub Issues for bug reports and feature requests
 - **Discussions**: Use GitHub Discussions for questions and community support
-- **Email**: [support@yourcompany.com](mailto:support@yourcompany.com)
+- **Email**: support@yourcompany.com
 
 ### Enterprise Support
 For enterprise deployments, custom integrations, or priority support:
-- Contact: [enterprise@yourcompany.com](mailto:enterprise@yourcompany.com)
+- Contact: enterprise@yourcompany.com
 - Documentation: [Enterprise Guide](docs/enterprise.md)
 
-## 🏗️ Architecture
+## Architecture
 
 ### Core Components
 - **Migration Engine** (`filemaker_extract.py`): Core data processing logic
@@ -300,7 +300,7 @@ FileMaker Pro → ODBC → Python → SQLAlchemy → Supabase/PostgreSQL
 - **Build**: PyInstaller, Inno Setup
 - **Config**: TOML format
 
-## 📊 Performance
+## Performance
 
 ### Benchmarks
 - **Small Database** (< 1K records): 2-5 minutes
@@ -314,7 +314,7 @@ FileMaker Pro → ODBC → Python → SQLAlchemy → Supabase/PostgreSQL
 - Connection pooling for database efficiency
 - Progress tracking for user experience
 
-## 🔮 Roadmap
+## Roadmap
 
 ### Version 2.0 (Planned)
 - [ ] Two-way synchronization
@@ -329,7 +329,7 @@ FileMaker Pro → ODBC → Python → SQLAlchemy → Supabase/PostgreSQL
 - [ ] Advanced filtering options
 - [ ] Performance optimizations
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
 - FileMaker Inc. for ODBC driver support
 - Supabase team for excellent PostgreSQL hosting
@@ -338,5 +338,4 @@ FileMaker Pro → ODBC → Python → SQLAlchemy → Supabase/PostgreSQL
 
 ---
 
-**Built with ❤️ for seamless database migration**#   f i l e m a k e r _ s y n c  
- 
+**Built for seamless database migration**
