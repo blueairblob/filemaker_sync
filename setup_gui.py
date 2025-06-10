@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Setup and Launch Script for Enhanced FileMaker Sync GUI
-Handles initialization, dependency checking, and GUI launch
+Fixed GUI Launcher for FileMaker Sync Dashboard
+Handles missing dependencies and launches the corrected GUI
 """
 
 import sys
@@ -20,15 +20,17 @@ def check_python_version():
     print(f"✓ Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
     return True
 
-def check_dependencies():
-    """Check if required dependencies are installed"""
+def check_and_install_dependencies():
+    """Check if required dependencies are installed and install missing ones"""
     required_packages = [
-        'pandas', 'pyodbc', 'sqlalchemy', 'pillow', 'tqdm', 'tomli'
+        'pandas', 'pyodbc', 'sqlalchemy', 'pillow', 'tqdm', 'tomli', 'tomli_w'
     ]
     
     missing = []
     for package in required_packages:
-        spec = importlib.util.find_spec(package)
+        # Handle special case for tomli_w
+        package_name = 'tomli_w' if package == 'tomli_w' else package
+        spec = importlib.util.find_spec(package_name)
         if spec is None:
             missing.append(package)
         else:
@@ -36,14 +38,28 @@ def check_dependencies():
     
     if missing:
         print(f"❌ Missing packages: {', '.join(missing)}")
-        print("To install missing packages, run:")
-        print(f"pip install {' '.join(missing)}")
-        return False
+        
+        # Offer to install automatically
+        response = input("Would you like to install missing packages automatically? (y/n): ")
+        if response.lower() == 'y':
+            try:
+                for package in missing:
+                    print(f"Installing {package}...")
+                    subprocess.check_call([sys.executable, '-m', 'pip', 'install', package])
+                    print(f"✓ {package} installed")
+                return True
+            except subprocess.CalledProcessError as e:
+                print(f"❌ Failed to install packages: {e}")
+                print("Please install manually with: pip install -r requirements.txt")
+                return False
+        else:
+            print("Please install missing packages with: pip install -r requirements.txt")
+            return False
     
     return True
 
-def check_files():
-    """Check if required files are present"""
+def check_gui_files():
+    """Check if GUI files are present"""
     required_files = [
         'config.toml',
         'filemaker_extract_refactored.py',
@@ -65,6 +81,7 @@ def check_files():
     
     if missing:
         print(f"❌ Missing files: {', '.join(missing)}")
+        print("Please ensure all GUI components are properly installed.")
         return False
     
     return True
@@ -86,12 +103,11 @@ def check_config():
     config_file = Path('config.toml')
     if not config_file.exists():
         print("❌ config.toml not found")
-        print("Create a config.toml file with your database settings")
         
         # Offer to create a sample config
         response = input("Would you like to create a sample config.toml? (y/n): ")
         if response.lower() == 'y':
-            create_sample_config()
+            return create_sample_config()
         return False
     
     try:
@@ -167,7 +183,7 @@ image_path = 'images'
         with open('config.toml', 'w') as f:
             f.write(sample_config)
         print("✓ Sample config.toml created")
-        print("Please edit config.toml with your actual database settings")
+        print("⚠ Please edit config.toml with your actual database settings before using the application")
         return True
     except Exception as e:
         print(f"❌ Error creating sample config: {e}")
@@ -177,12 +193,16 @@ def launch_gui():
     """Launch the GUI application"""
     try:
         # Import and run the GUI
-        from gui.gui_filemaker import main as gui_main
+        sys.path.insert(0, str(Path.cwd()))
+        sys.path.insert(0, str(Path.cwd() / 'gui'))
+        
+        from gui.filemaker_gui import main as gui_main
         print("🚀 Launching FileMaker Sync Dashboard...")
         gui_main()
+        return True
     except ImportError as e:
         print(f"❌ Error importing GUI modules: {e}")
-        print("Make sure all GUI files are present in the gui/ directory")
+        print("Make sure all GUI files are present")
         return False
     except Exception as e:
         print(f"❌ Error launching GUI: {e}")
@@ -195,16 +215,17 @@ def main():
     
     # Check Python version
     if not check_python_version():
+        input("Press Enter to exit...")
         sys.exit(1)
     
-    print("\nChecking dependencies...")
-    if not check_dependencies():
-        print("\nPlease install missing dependencies and try again.")
+    print("\nChecking and installing dependencies...")
+    if not check_and_install_dependencies():
+        input("Press Enter to exit...")
         sys.exit(1)
     
     print("\nChecking required files...")
-    if not check_files():
-        print("\nPlease ensure all required files are present.")
+    if not check_gui_files():
+        input("Press Enter to exit...")
         sys.exit(1)
     
     print("\nCreating directories...")
@@ -213,6 +234,7 @@ def main():
     print("\nChecking configuration...")
     if not check_config():
         print("\nPlease configure config.toml and try again.")
+        input("Press Enter to exit...")
         sys.exit(1)
     
     print("\n" + "=" * 40)
@@ -220,7 +242,16 @@ def main():
     print("=" * 40)
     
     # Launch the GUI
-    launch_gui()
+    if not launch_gui():
+        input("Press Enter to exit...")
+        sys.exit(1)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nLauncher interrupted by user")
+    except Exception as e:
+        print(f"\nUnexpected error: {e}")
+        input("Press Enter to exit...")
+        sys.exit(1)

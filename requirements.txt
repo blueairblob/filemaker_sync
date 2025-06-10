@@ -6,6 +6,7 @@ sqlalchemy==2.0.23
 pillow==10.1.0
 tqdm==4.66.1
 tomli==2.0.1
+tomli-w==1.0.0
 pyinstaller==6.3.0
 
 # Enhanced GUI dependencies
@@ -28,9 +29,6 @@ tzdata>=2023.3
 # Development and debugging
 pytest>=7.4.0
 pytest-cov>=4.1.0
-
-# Optional: Enhanced GUI styling (if we want to add themed widgets later)
-# tkinter-tooltip==2.2.0  # Uncomment if you want enhanced tooltips
 
 # App 
 colorama
