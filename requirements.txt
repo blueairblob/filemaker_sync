@@ -30,5 +30,16 @@ pytest>=7.4.0
 pytest-cov>=4.1.0
 
 # Optional: Enhanced GUI styling (if we want to add themed widgets later)
-tkinter-tooltip==2.2.0  # Uncomment if you want enhanced tooltips
+# tkinter-tooltip==2.2.0  # Uncomment if you want enhanced tooltips
 
+# App 
+colorama
+greenlet
+numpy
+PyMySQL
+python-dateutil
+pytz
+six
+typing-extensions
+tzdata
+psycopg2

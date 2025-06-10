@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-GUI Widgets Module
+GUI Widgets Module - FIXED VERSION
 Custom widgets for the FileMaker Sync Dashboard
+Fixed layout manager conflicts
 """
 
 import tkinter as tk
@@ -153,7 +154,7 @@ class MigrationOverview(ttk.Frame):
             ))
 
 class QuickActions(ttk.Frame):
-    """Widget for quick action buttons"""
+    """Widget for quick action buttons - FIXED LAYOUT"""
     
     def __init__(self, parent, **kwargs):
         super().__init__(parent, **kwargs)
@@ -161,9 +162,16 @@ class QuickActions(ttk.Frame):
     
     def create_widgets(self):
         # Header
-        ttk.Label(self, text="Quick Actions", font=('Arial', 14, 'bold')).pack(pady=(5, 10))
+        header_frame = ttk.Frame(self)
+        header_frame.pack(fill='x', pady=(5, 10))
         
-        # Action buttons
+        ttk.Label(header_frame, text="Quick Actions", font=('Arial', 14, 'bold')).pack()
+        
+        # FIXED: Use a single frame for buttons and pack them instead of mixing grid/pack
+        button_container = ttk.Frame(self)
+        button_container.pack(fill='x', pady=5)
+        
+        # Action buttons - using pack instead of grid to avoid conflicts
         self.action_buttons = {}
         button_configs = [
             ('Full Sync', 'both_required'),
@@ -174,21 +182,28 @@ class QuickActions(ttk.Frame):
             ('View Logs', 'none')
         ]
         
-        for i, (text, requirement) in enumerate(button_configs):
-            row = i // 2
-            col = i % 2
+        # Create buttons in rows using frames
+        for i in range(0, len(button_configs), 2):
+            row_frame = ttk.Frame(button_container)
+            row_frame.pack(fill='x', pady=2)
             
-            button = ttk.Button(self, text=text, width=18)
-            button.grid(row=row, column=col, padx=5, pady=3, sticky='ew')
-            self.action_buttons[text] = button
-        
-        # Configure grid
-        self.columnconfigure(0, weight=1)
-        self.columnconfigure(1, weight=1)
+            # First button in row
+            if i < len(button_configs):
+                text, requirement = button_configs[i]
+                button1 = ttk.Button(row_frame, text=text, width=18)
+                button1.pack(side='left', padx=(0, 5), fill='x', expand=True)
+                self.action_buttons[text] = button1
+            
+            # Second button in row (if exists)
+            if i + 1 < len(button_configs):
+                text, requirement = button_configs[i + 1]
+                button2 = ttk.Button(row_frame, text=text, width=18)
+                button2.pack(side='right', padx=(5, 0), fill='x', expand=True)
+                self.action_buttons[text] = button2
         
         # Progress indicator
         self.progress_frame = ttk.Frame(self)
-        self.progress_frame.grid(row=3, column=0, columnspan=2, sticky='ew', pady=(10, 0))
+        self.progress_frame.pack(fill='x', pady=(10, 0))
         
         self.progress_label = ttk.Label(self.progress_frame, text="")
         self.progress_label.pack()
@@ -196,18 +211,19 @@ class QuickActions(ttk.Frame):
         self.progress_bar = ttk.Progressbar(self.progress_frame, mode='indeterminate')
         self.progress_bar.pack(fill='x', pady=5)
         
-        self.progress_frame.grid_remove()  # Hide initially
+        # Hide progress initially
+        self.progress_frame.pack_forget()
     
     def show_progress(self, operation: str):
         """Show progress for an operation"""
         self.progress_label.configure(text=f"Running: {operation}")
         self.progress_bar.start()
-        self.progress_frame.grid()
+        self.progress_frame.pack(fill='x', pady=(10, 0))
     
     def hide_progress(self):
         """Hide progress indicator"""
         self.progress_bar.stop()
-        self.progress_frame.grid_remove()
+        self.progress_frame.pack_forget()
     
     def update_button_states(self, fm_connected: bool, target_connected: bool):
         """Update button states based on connections"""
@@ -233,7 +249,10 @@ class RecentActivity(ttk.Frame):
     
     def create_widgets(self):
         # Header
-        ttk.Label(self, text="Recent Activity", font=('Arial', 14, 'bold')).pack(pady=(5, 10))
+        header_frame = ttk.Frame(self)
+        header_frame.pack(fill='x', pady=(5, 10))
+        
+        ttk.Label(header_frame, text="Recent Activity", font=('Arial', 14, 'bold')).pack()
         
         # Activity list
         self.activity_listbox = tk.Listbox(self, height=8, font=('Arial', 9))
