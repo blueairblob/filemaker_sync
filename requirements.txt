@@ -8,18 +8,27 @@ tqdm==4.66.1
 tomli==2.0.1
 pyinstaller==6.3.0
 
-# Optional: For enhanced GUI styling
-tkinter-tooltip==2.2.0
+# Enhanced GUI dependencies
+# tkinter is built into Python, but these enhance the experience
+colorama>=0.4.6
 
+# Database drivers
+PyMySQL>=1.1.0
+psycopg2-binary>=2.9.9
 
-# App 
-colorama
-greenlet
-numpy
-PyMySQL
-python-dateutil
-pytz
-six
-typing-extensions
-tzdata
-psycopg2
+# Core Python libraries (usually included but listed for completeness)
+greenlet>=3.0.0
+numpy>=1.25.0
+python-dateutil>=2.8.0
+pytz>=2023.3
+six>=1.16.0
+typing-extensions>=4.8.0
+tzdata>=2023.3
+
+# Development and debugging
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# Optional: Enhanced GUI styling (if we want to add themed widgets later)
+tkinter-tooltip==2.2.0  # Uncomment if you want enhanced tooltips
+
