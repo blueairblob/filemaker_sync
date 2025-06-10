@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-GUI Log Viewer Module
-Dedicated window for viewing and analyzing logs
+GUI Log Viewer Module - FIXED VERSION
+Enhanced log viewer with auto-scroll, full datetime, and improved parsing
 """
 
 import tkinter as tk
@@ -10,11 +10,12 @@ from pathlib import Path
 from datetime import datetime
 from typing import List
 from dataclasses import asdict
+import re
 
 from gui_logging import LogManager, LogEntry
 
 class LogViewerWindow:
-    """Dedicated window for viewing and analyzing logs"""
+    """ENHANCED log viewer with all requested fixes"""
     
     def __init__(self, parent, log_manager: LogManager):
         self.parent = parent
@@ -22,17 +23,27 @@ class LogViewerWindow:
         
         self.window = tk.Toplevel(parent)
         self.window.title("Log Viewer")
-        self.window.geometry("900x600")
+        self.window.geometry("1000x700")
         self.window.transient(parent)
+        
+        # FIXED: Proper close handling
+        self.window.protocol("WM_DELETE_WINDOW", self.on_close)
+        
+        # Auto-scroll setting
+        self.auto_scroll_var = tk.BooleanVar(value=True)
         
         self.create_widgets()
         self.refresh_logs()
         
-        # Auto-refresh every 5 seconds
+        # Auto-refresh every 3 seconds
         self.auto_refresh()
     
+    def on_close(self):
+        """Handle window close properly"""
+        self.window.destroy()
+    
     def create_widgets(self):
-        """Create the log viewer interface"""
+        """Create the enhanced log viewer interface"""
         # Main container
         main_container = ttk.Frame(self.window)
         main_container.pack(fill='both', expand=True, padx=10, pady=10)
@@ -69,6 +80,9 @@ class LogViewerWindow:
         search_entry.grid(row=0, column=5)
         search_entry.bind('<KeyRelease>', self.on_search_change)
         
+        # FIXED: Auto-scroll checkbox
+        ttk.Checkbutton(filter_frame, text="Auto-scroll", variable=self.auto_scroll_var).grid(row=0, column=6, padx=(10, 0))
+        
         # Action buttons
         action_frame = ttk.Frame(control_frame)
         action_frame.pack(side='right')
@@ -77,23 +91,27 @@ class LogViewerWindow:
         ttk.Button(action_frame, text="Clear Filters", command=self.clear_filters).pack(side='left', padx=2)
         ttk.Button(action_frame, text="Export Logs", command=self.export_logs).pack(side='left', padx=2)
         
-        # Log display
+        # FIXED: Enhanced log display with full datetime and source app
         log_frame = ttk.Frame(main_container)
         log_frame.pack(fill='both', expand=True)
         
-        self.log_tree = ttk.Treeview(log_frame, columns=('Time', 'Level', 'Component', 'Message'), 
+        # Updated columns to include full datetime and source
+        self.log_tree = ttk.Treeview(log_frame, 
+                                    columns=('DateTime', 'Level', 'Source', 'Component', 'Message'), 
                                     show='headings', height=20)
         
-        # Configure columns
-        self.log_tree.heading('Time', text='Time')
+        # FIXED: Configure columns with proper widths
+        self.log_tree.heading('DateTime', text='Date & Time')
         self.log_tree.heading('Level', text='Level')
+        self.log_tree.heading('Source', text='Source')
         self.log_tree.heading('Component', text='Component')
         self.log_tree.heading('Message', text='Message')
         
-        self.log_tree.column('Time', width=150)
+        self.log_tree.column('DateTime', width=150)
         self.log_tree.column('Level', width=80)
-        self.log_tree.column('Component', width=120)
-        self.log_tree.column('Message', width=500)
+        self.log_tree.column('Source', width=120)
+        self.log_tree.column('Component', width=100)
+        self.log_tree.column('Message', width=400)
         
         # Scrollbar for log tree
         log_scroll = ttk.Scrollbar(log_frame, orient='vertical', command=self.log_tree.yview)
@@ -111,7 +129,7 @@ class LogViewerWindow:
         status_bar.pack(fill='x', pady=(5, 0))
     
     def refresh_logs(self):
-        """Refresh the log display"""
+        """ENHANCED log refresh with better parsing"""
         # Clear existing items
         for item in self.log_tree.get_children():
             self.log_tree.delete(item)
@@ -120,17 +138,14 @@ class LogViewerWindow:
         logs = self.get_filtered_logs()
         
         # Update component filter options
-        components = sorted(set(log.component for log in self.log_manager.memory_logs))
+        components = sorted(set(self.extract_component_from_log(log) for log in self.log_manager.memory_logs))
+        components = [c for c in components if c]  # Remove empty components
         self.component_combo['values'] = ["ALL"] + components
         
         # Add logs to tree
         for log in logs:
-            # Format timestamp
-            try:
-                dt = datetime.fromisoformat(log.timestamp)
-                time_str = dt.strftime("%H:%M:%S")
-            except:
-                time_str = log.timestamp
+            # FIXED: Enhanced parsing to extract source application
+            datetime_str, level, source, component, message = self.parse_log_entry(log)
             
             # Color code by level
             tags = []
@@ -140,21 +155,67 @@ class LogViewerWindow:
                 tags = ['warning']
             elif log.level == "CRITICAL":
                 tags = ['critical']
+            elif log.level == "DEBUG":
+                tags = ['debug']
             
             self.log_tree.insert('', 'end', values=(
-                time_str, log.level, log.component, log.message
+                datetime_str, level, source, component, message
             ), tags=tags)
         
         # Configure tag colors
         self.log_tree.tag_configure('error', foreground='red')
         self.log_tree.tag_configure('warning', foreground='orange')
         self.log_tree.tag_configure('critical', foreground='dark red', background='light pink')
+        self.log_tree.tag_configure('debug', foreground='gray')
+        
+        # FIXED: Auto-scroll to bottom if enabled
+        if self.auto_scroll_var.get() and logs:
+            self.log_tree.see(self.log_tree.get_children()[-1])
         
         self.status_var.set(f"Showing {len(logs)} log entries")
     
+    def parse_log_entry(self, log: LogEntry) -> tuple:
+        """ENHANCED log entry parsing to extract all components"""
+        # Format full datetime
+        try:
+            dt = datetime.fromisoformat(log.timestamp)
+            datetime_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+        except:
+            datetime_str = log.timestamp
+        
+        level = log.level
+        component = log.component
+        message = log.message
+        
+        # FIXED: Extract source application from message if available
+        # Look for patterns like [FileMakerSync:94] at the start of the message
+        source = "GUI"  # Default for GUI-generated logs
+        
+        # Try to extract source from detailed log format
+        source_pattern = r'\[([^:\]]+):\d+\]'
+        match = re.search(source_pattern, message)
+        if match:
+            source = match.group(1)
+            # Clean up the message by removing the source pattern
+            message = re.sub(r'\[[^:\]]+:\d+\]\s*', '', message)
+        
+        # Additional parsing for specific components
+        if component == "Command":
+            source = "CLI"
+        elif component in ["Application", "Config"]:
+            source = "GUI"
+        elif component in ["Connection", "Operation"]:
+            source = "Backend"
+        
+        return datetime_str, level, source, component, message
+    
+    def extract_component_from_log(self, log: LogEntry) -> str:
+        """Extract component name for filtering"""
+        return log.component
+    
     def get_filtered_logs(self) -> List[LogEntry]:
         """Get logs with current filters applied"""
-        logs = self.log_manager.get_recent_logs(limit=500)
+        logs = self.log_manager.get_recent_logs(limit=1000)
         
         # Level filter
         level_filter = self.level_var.get()
@@ -169,7 +230,8 @@ class LogViewerWindow:
         # Search filter
         search_term = self.search_var.get().lower()
         if search_term:
-            logs = [log for log in logs if search_term in log.message.lower()]
+            logs = [log for log in logs if search_term in log.message.lower() or 
+                   search_term in log.component.lower()]
         
         return logs
     
@@ -210,33 +272,44 @@ class LogViewerWindow:
             self.show_log_detail_window(log_entry)
     
     def show_log_detail_window(self, log_entry: LogEntry):
-        """Show detailed log entry in a popup window"""
+        """ENHANCED log detail window"""
         detail_window = tk.Toplevel(self.window)
         detail_window.title("Log Entry Details")
-        detail_window.geometry("600x400")
+        detail_window.geometry("700x500")
         detail_window.transient(self.window)
+        detail_window.protocol("WM_DELETE_WINDOW", detail_window.destroy)
         
         # Create text widget with details
         from tkinter import scrolledtext
         text_widget = scrolledtext.ScrolledText(detail_window, wrap=tk.WORD)
         text_widget.pack(fill='both', expand=True, padx=10, pady=10)
         
-        # Format log details
+        # ENHANCED format log details
+        datetime_str, level, source, component, message = self.parse_log_entry(log_entry)
+        
         details_text = f"""Log Entry Details
 ================
 
-Timestamp: {log_entry.timestamp}
-Level: {log_entry.level}
-Component: {log_entry.component}
+Full Timestamp: {log_entry.timestamp}
+Formatted Time: {datetime_str}
+Level: {level}
+Source Application: {source}
+Component: {component}
 Session ID: {log_entry.session_id}
 
 Message:
-{log_entry.message}
+{message}
 """
         
         if log_entry.details:
             import json
             details_text += f"\n\nAdditional Details:\n{json.dumps(log_entry.details, indent=2)}"
+        
+        # Add raw log data for debugging
+        details_text += f"\n\nRaw Log Data:\n{'-' * 20}\n"
+        details_text += f"Original Message: {log_entry.message}\n"
+        details_text += f"Component: {log_entry.component}\n"
+        details_text += f"Level: {log_entry.level}\n"
         
         text_widget.insert('1.0', details_text)
         text_widget.configure(state='disabled')
@@ -251,7 +324,7 @@ Message:
         filename = filedialog.asksaveasfilename(
             title="Export Logs",
             defaultextension=".json",
-            filetypes=[("JSON files", "*.json"), ("Text files", "*.txt"), ("All files", "*.*")]
+            filetypes=[("JSON files", "*.json"), ("Text files", "*.txt"), ("CSV files", "*.csv"), ("All files", "*.*")]
         )
         
         if filename:
@@ -259,21 +332,59 @@ Message:
                 filepath = Path(filename)
                 logs = self.get_filtered_logs()
                 
-                self.log_manager.export_logs(filepath, logs)
+                if filepath.suffix.lower() == '.csv':
+                    self.export_logs_csv(filepath, logs)
+                elif filepath.suffix.lower() == '.json':
+                    self.log_manager.export_logs(filepath, logs)
+                else:
+                    self.export_logs_text(filepath, logs)
+                
                 messagebox.showinfo("Export Complete", f"Logs exported to {filename}")
                 self.status_var.set(f"Exported {len(logs)} logs to {filename}")
                 
             except Exception as e:
                 messagebox.showerror("Export Error", f"Failed to export logs: {e}")
     
+    def export_logs_csv(self, filepath: Path, logs: List[LogEntry]):
+        """Export logs in CSV format"""
+        import csv
+        
+        with open(filepath, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            # Write header
+            writer.writerow(['DateTime', 'Level', 'Source', 'Component', 'Message', 'Session_ID'])
+            
+            # Write data
+            for log in logs:
+                datetime_str, level, source, component, message = self.parse_log_entry(log)
+                writer.writerow([datetime_str, level, source, component, message, log.session_id])
+    
+    def export_logs_text(self, filepath: Path, logs: List[LogEntry]):
+        """Export logs in enhanced text format"""
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write("FileMaker Sync Log Export\n")
+            f.write("=" * 50 + "\n")
+            f.write(f"Export Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Total Entries: {len(logs)}\n")
+            f.write("=" * 50 + "\n\n")
+            
+            for log in logs:
+                datetime_str, level, source, component, message = self.parse_log_entry(log)
+                f.write(f"[{datetime_str}] {level} - {source} - {component}\n")
+                f.write(f"  {message}\n")
+                if log.details:
+                    import json
+                    f.write(f"  Details: {json.dumps(log.details)}\n")
+                f.write("\n")
+    
     def auto_refresh(self):
-        """Auto-refresh logs every 5 seconds"""
+        """Auto-refresh logs every 3 seconds"""
         if self.window.winfo_exists():
             self.refresh_logs()
-            self.window.after(5000, self.auto_refresh)
+            self.window.after(3000, self.auto_refresh)
 
 class LogStatsWindow:
-    """Window showing log statistics and analysis"""
+    """ENHANCED log statistics window"""
     
     def __init__(self, parent, log_manager: LogManager):
         self.parent = parent
@@ -281,20 +392,27 @@ class LogStatsWindow:
         
         self.window = tk.Toplevel(parent)
         self.window.title("Log Statistics")
-        self.window.geometry("600x500")
+        self.window.geometry("700x600")
         self.window.transient(parent)
+        self.window.protocol("WM_DELETE_WINDOW", self.window.destroy)
         
         self.create_widgets()
         self.update_stats()
     
     def create_widgets(self):
-        """Create the statistics interface"""
+        """Create the enhanced statistics interface"""
         main_container = ttk.Frame(self.window)
         main_container.pack(fill='both', expand=True, padx=10, pady=10)
         
         # Header
-        ttk.Label(main_container, text="Log Statistics & Analysis", 
-                 font=('Arial', 16, 'bold')).pack(pady=(0, 20))
+        header_frame = ttk.Frame(main_container)
+        header_frame.pack(fill='x', pady=(0, 10))
+        
+        ttk.Label(header_frame, text="Log Statistics & Analysis", 
+                 font=('Arial', 16, 'bold')).pack(side='left')
+        
+        ttk.Button(header_frame, text="Refresh", command=self.update_stats).pack(side='right')
+        ttk.Button(header_frame, text="Export Stats", command=self.export_stats).pack(side='right', padx=(0, 5))
         
         # Create notebook for different stats
         notebook = ttk.Notebook(main_container)
@@ -315,8 +433,15 @@ class LogStatsWindow:
         notebook.add(component_frame, text="By Component")
         self.create_component_tab(component_frame)
         
-        # Refresh button
-        ttk.Button(main_container, text="Refresh", command=self.update_stats).pack(pady=(10, 0))
+        # By Source tab
+        source_frame = ttk.Frame(notebook)
+        notebook.add(source_frame, text="By Source")
+        self.create_source_tab(source_frame)
+        
+        # Timeline tab
+        timeline_frame = ttk.Frame(notebook)
+        notebook.add(timeline_frame, text="Timeline")
+        self.create_timeline_tab(timeline_frame)
     
     def create_summary_tab(self, parent):
         """Create summary statistics tab"""
@@ -336,6 +461,10 @@ class LogStatsWindow:
         self.level_tree.heading('Count', text='Count')
         self.level_tree.heading('Percentage', text='Percentage')
         
+        self.level_tree.column('Level', width=100)
+        self.level_tree.column('Count', width=100)
+        self.level_tree.column('Percentage', width=100)
+        
         self.level_tree.pack(fill='both', expand=True)
     
     def create_component_tab(self, parent):
@@ -347,7 +476,51 @@ class LogStatsWindow:
         self.component_tree.heading('Count', text='Count')
         self.component_tree.heading('Last Entry', text='Last Entry')
         
+        self.component_tree.column('Component', width=150)
+        self.component_tree.column('Count', width=100)
+        self.component_tree.column('Last Entry', width=150)
+        
         self.component_tree.pack(fill='both', expand=True)
+    
+    def create_source_tab(self, parent):
+        """NEW: Create source application statistics tab"""
+        self.source_tree = ttk.Treeview(parent, columns=('Source', 'Count', 'Percentage'), 
+                                       show='headings', height=15)
+        
+        self.source_tree.heading('Source', text='Source Application')
+        self.source_tree.heading('Count', text='Count')
+        self.source_tree.heading('Percentage', text='Percentage')
+        
+        self.source_tree.column('Source', width=150)
+        self.source_tree.column('Count', width=100)
+        self.source_tree.column('Percentage', width=100)
+        
+        self.source_tree.pack(fill='both', expand=True)
+    
+    def create_timeline_tab(self, parent):
+        """NEW: Create timeline statistics tab"""
+        timeline_frame = ttk.Frame(parent)
+        timeline_frame.pack(fill='both', expand=True, padx=10, pady=10)
+        
+        # Controls
+        control_frame = ttk.Frame(timeline_frame)
+        control_frame.pack(fill='x', pady=(0, 10))
+        
+        ttk.Label(control_frame, text="Time Period:").pack(side='left')
+        self.timeline_var = tk.StringVar(value="Last Hour")
+        timeline_combo = ttk.Combobox(control_frame, textvariable=self.timeline_var,
+                                     values=["Last Hour", "Last 4 Hours", "Last Day", "All Time"],
+                                     state="readonly")
+        timeline_combo.pack(side='left', padx=(5, 0))
+        timeline_combo.bind('<<ComboboxSelected>>', self.update_timeline)
+        
+        # Timeline display
+        self.timeline_text = tk.Text(timeline_frame, wrap=tk.WORD, height=15)
+        timeline_scroll = ttk.Scrollbar(timeline_frame, orient='vertical', command=self.timeline_text.yview)
+        self.timeline_text.configure(yscrollcommand=timeline_scroll.set)
+        
+        self.timeline_text.pack(side='left', fill='both', expand=True)
+        timeline_scroll.pack(side='right', fill='y')
     
     def update_stats(self):
         """Update all statistics"""
@@ -356,12 +529,29 @@ class LogStatsWindow:
         if not logs:
             return
         
+        # Parse logs to extract source information
+        parsed_logs = []
+        for log in logs:
+            viewer = LogViewerWindow.__new__(LogViewerWindow)  # Create instance without __init__
+            viewer.log_manager = self.log_manager
+            datetime_str, level, source, component, message = viewer.parse_log_entry(log)
+            parsed_logs.append({
+                'log': log,
+                'datetime_str': datetime_str,
+                'level': level,
+                'source': source,
+                'component': component,
+                'message': message
+            })
+        
         # Update summary
         total_logs = len(logs)
         levels = {}
         components = {}
+        sources = {}
         
-        for log in logs:
+        for parsed in parsed_logs:
+            log = parsed['log']
             # Count by level
             levels[log.level] = levels.get(log.level, 0) + 1
             
@@ -371,6 +561,10 @@ class LogStatsWindow:
             components[log.component]['count'] += 1
             if log.timestamp > components[log.component]['last']:
                 components[log.component]['last'] = log.timestamp
+            
+            # Count by source
+            source = parsed['source']
+            sources[source] = sources.get(source, 0) + 1
         
         # Update summary text
         self.summary_text.delete('1.0', tk.END)
@@ -388,12 +582,24 @@ Log Levels:
             summary += f"  {level}: {count:,} ({percentage:.1f}%)\n"
         
         summary += f"\nComponents: {len(components)} unique components\n"
-        summary += f"Most Active Component: {max(components.keys(), key=lambda k: components[k]['count'])}\n"
+        if components:
+            most_active = max(components.keys(), key=lambda k: components[k]['count'])
+            summary += f"Most Active Component: {most_active}\n"
+        
+        summary += f"\nSource Applications: {len(sources)} different sources\n"
+        if sources:
+            most_active_source = max(sources.keys(), key=lambda k: sources[k])
+            summary += f"Most Active Source: {most_active_source}\n"
         
         # Recent activity
         recent_errors = [log for log in logs[-100:] if log.level in ['ERROR', 'CRITICAL']]
         if recent_errors:
             summary += f"\nRecent Errors: {len(recent_errors)} in last 100 entries\n"
+        
+        # Memory usage stats
+        import sys
+        memory_usage = sys.getsizeof(logs) / 1024  # KB
+        summary += f"\nMemory Usage: {memory_usage:.1f} KB for log storage\n"
         
         self.summary_text.insert('1.0', summary)
         
@@ -417,3 +623,93 @@ Log Levels:
                 last_str = info['last']
             
             self.component_tree.insert('', 'end', values=(component, f"{info['count']:,}", last_str))
+        
+        # Update source tree
+        for item in self.source_tree.get_children():
+            self.source_tree.delete(item)
+        
+        for source, count in sorted(sources.items(), key=lambda x: x[1], reverse=True):
+            percentage = (count / total_logs) * 100
+            self.source_tree.insert('', 'end', values=(source, f"{count:,}", f"{percentage:.1f}%"))
+        
+        # Update timeline
+        self.update_timeline()
+    
+    def update_timeline(self, event=None):
+        """Update timeline display"""
+        period = self.timeline_var.get()
+        logs = self.log_manager.memory_logs
+        
+        # Filter logs by time period
+        now = datetime.now()
+        if period == "Last Hour":
+            cutoff = now.replace(minute=0, second=0, microsecond=0)
+        elif period == "Last 4 Hours":
+            cutoff = now.replace(hour=now.hour-4, minute=0, second=0, microsecond=0)
+        elif period == "Last Day":
+            cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        else:  # All Time
+            cutoff = None
+        
+        if cutoff:
+            filtered_logs = [log for log in logs 
+                           if datetime.fromisoformat(log.timestamp) >= cutoff]
+        else:
+            filtered_logs = logs
+        
+        # Group by hour
+        hourly_stats = {}
+        for log in filtered_logs:
+            try:
+                dt = datetime.fromisoformat(log.timestamp)
+                hour_key = dt.strftime("%Y-%m-%d %H:00")
+                
+                if hour_key not in hourly_stats:
+                    hourly_stats[hour_key] = {'total': 0, 'by_level': {}}
+                
+                hourly_stats[hour_key]['total'] += 1
+                level = log.level
+                hourly_stats[hour_key]['by_level'][level] = hourly_stats[hour_key]['by_level'].get(level, 0) + 1
+            except:
+                continue
+        
+        # Display timeline
+        self.timeline_text.delete('1.0', tk.END)
+        timeline_text = f"Activity Timeline - {period}\n"
+        timeline_text += "=" * 40 + "\n\n"
+        
+        for hour, stats in sorted(hourly_stats.items()):
+            timeline_text += f"{hour}: {stats['total']} entries\n"
+            for level, count in sorted(stats['by_level'].items()):
+                timeline_text += f"  {level}: {count}\n"
+            timeline_text += "\n"
+        
+        if not hourly_stats:
+            timeline_text += "No log entries in selected time period.\n"
+        
+        self.timeline_text.insert('1.0', timeline_text)
+    
+    def export_stats(self):
+        """Export statistics to file"""
+        filename = filedialog.asksaveasfilename(
+            title="Export Statistics",
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("JSON files", "*.json"), ("All files", "*.*")]
+        )
+        
+        if filename:
+            try:
+                # Get current statistics text
+                stats_content = self.summary_text.get('1.0', tk.END)
+                
+                with open(filename, 'w', encoding='utf-8') as f:
+                    f.write("FileMaker Sync - Log Statistics Export\n")
+                    f.write("=" * 50 + "\n")
+                    f.write(f"Export Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    f.write("=" * 50 + "\n\n")
+                    f.write(stats_content)
+                
+                messagebox.showinfo("Export Complete", f"Statistics exported to {filename}")
+                
+            except Exception as e:
+                messagebox.showerror("Export Error", f"Failed to export statistics: {e}")
