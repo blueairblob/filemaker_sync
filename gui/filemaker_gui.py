@@ -359,12 +359,11 @@ class FileMakerSyncGUI:
         header_frame = ttk.Frame(parent)
         header_frame.pack(fill='x', pady=(0, 20))
         
-        title_label = ttk.Label(header_frame, text="FileMaker Sync Dashboard", 
-                               font=('Arial', 20, 'bold'))
+        title_label = ttk.Label(header_frame, text="FileMaker Sync Dashboard", font=('Arial', 20, 'bold'))
         title_label.pack(side='left')
         
         subtitle_label = ttk.Label(header_frame, 
-                                  text="Monitor and manage your FileMaker to Supabase migration",
+                                  text="Monitor and manage your FileMaker Pro to Supabase Cloud migration",
                                   font=('Arial', 10))
         subtitle_label.pack(side='left', padx=(20, 0))
         
@@ -382,17 +381,17 @@ class FileMakerSyncGUI:
         conn_frame.pack(fill='x', pady=(0, 20))
         
         # FileMaker status card
-        fm_card_frame = ttk.LabelFrame(conn_frame, text=" FileMaker Pro ", padding=10)
+        fm_card_frame = ttk.LabelFrame(conn_frame, text=" Source ", padding=10)
         fm_card_frame.pack(side='left', fill='x', expand=True, padx=(0, 10))
         
         self.fm_status_card = StatusCard(fm_card_frame, "FileMaker Pro")
         self.fm_status_card.pack(fill='x')
         
         # Target status card
-        target_card_frame = ttk.LabelFrame(conn_frame, text=" Supabase Target ", padding=10)
+        target_card_frame = ttk.LabelFrame(conn_frame, text=" Target ", padding=10)
         target_card_frame.pack(side='right', fill='x', expand=True, padx=(10, 0))
         
-        self.target_status_card = StatusCard(target_card_frame, "Supabase Target")
+        self.target_status_card = StatusCard(target_card_frame, "Supabase Cloud")
         self.target_status_card.pack(fill='x')
     
     def create_main_content(self, parent):
