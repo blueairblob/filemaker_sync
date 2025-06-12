@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
+# FILE: gui/gui_logviewer.py
 """
 GUI Log Viewer Module - FIXED VERSION
-Enhanced log viewer with auto-scroll, full datetime, and improved parsing
+Enhanced log viewer with proper column sizing and message handling
 """
 
 import tkinter as tk
@@ -15,7 +16,7 @@ import re
 from gui_logging import LogManager, LogEntry
 
 class LogViewerWindow:
-    """ENHANCED log viewer with all requested fixes"""
+    """FIXED log viewer with proper column sizing and message handling"""
     
     def __init__(self, parent, log_manager: LogManager):
         self.parent = parent
@@ -23,11 +24,12 @@ class LogViewerWindow:
         
         self.window = tk.Toplevel(parent)
         self.window.title("Log Viewer")
-        self.window.geometry("1000x700")
-        self.window.transient(parent)
+        self.window.geometry("1200x700")
+        # REMOVED: self.window.transient(parent) - this was causing the focus issues
         
-        # FIXED: Proper close handling
-        self.window.protocol("WM_DELETE_WINDOW", self.on_close)
+        # FIXED: Proper window management
+        self.window.protocol("WM_DELETE_WINDOW", self.close_window)
+        self.window.focus_set()  # Set focus initially
         
         # Auto-scroll setting
         self.auto_scroll_var = tk.BooleanVar(value=True)
@@ -38,9 +40,25 @@ class LogViewerWindow:
         # Auto-refresh every 3 seconds
         self.auto_refresh()
     
-    def on_close(self):
-        """Handle window close properly"""
-        self.window.destroy()
+    def close_window(self):
+        """Properly close the window"""
+        try:
+            # Cancel any pending timers
+            if hasattr(self, '_search_timer'):
+                self.window.after_cancel(self._search_timer)
+            if hasattr(self, '_refresh_timer'):
+                self.window.after_cancel(self._refresh_timer)
+            
+            # Destroy the window
+            self.window.quit()  # Stop the window's event loop
+            self.window.destroy()
+        except Exception as e:
+            print(f"Error closing log viewer: {e}")
+            # Force destroy if normal close fails
+            try:
+                self.window.destroy()
+            except:
+                pass
     
     def create_widgets(self):
         """Create the enhanced log viewer interface"""
@@ -80,7 +98,7 @@ class LogViewerWindow:
         search_entry.grid(row=0, column=5)
         search_entry.bind('<KeyRelease>', self.on_search_change)
         
-        # FIXED: Auto-scroll checkbox
+        # Auto-scroll checkbox
         ttk.Checkbutton(filter_frame, text="Auto-scroll", variable=self.auto_scroll_var).grid(row=0, column=6, padx=(10, 0))
         
         # Action buttons
@@ -91,37 +109,28 @@ class LogViewerWindow:
         ttk.Button(action_frame, text="Clear Filters", command=self.clear_filters).pack(side='left', padx=2)
         ttk.Button(action_frame, text="Export Logs", command=self.export_logs).pack(side='left', padx=2)
         
-        # FIXED: Enhanced log display with full datetime and source app
+        # FIXED: Enhanced log display with proper TEXT widget instead of Treeview
         log_frame = ttk.Frame(main_container)
         log_frame.pack(fill='both', expand=True)
         
-        # Updated columns to include full datetime and source
-        self.log_tree = ttk.Treeview(log_frame, 
-                                    columns=('DateTime', 'Level', 'Source', 'Component', 'Message'), 
-                                    show='headings', height=20)
+        # Use Text widget with proper formatting instead of Treeview
+        from tkinter import scrolledtext
+        self.log_text = scrolledtext.ScrolledText(
+            log_frame, 
+            wrap=tk.NONE,  # No word wrapping for proper column alignment
+            font=('Consolas', 9),  # Monospace font for alignment
+            height=25,
+            state='disabled'
+        )
+        self.log_text.pack(fill='both', expand=True)
         
-        # FIXED: Configure columns with proper widths
-        self.log_tree.heading('DateTime', text='Date & Time')
-        self.log_tree.heading('Level', text='Level')
-        self.log_tree.heading('Source', text='Source')
-        self.log_tree.heading('Component', text='Component')
-        self.log_tree.heading('Message', text='Message')
-        
-        self.log_tree.column('DateTime', width=150)
-        self.log_tree.column('Level', width=80)
-        self.log_tree.column('Source', width=120)
-        self.log_tree.column('Component', width=100)
-        self.log_tree.column('Message', width=400)
-        
-        # Scrollbar for log tree
-        log_scroll = ttk.Scrollbar(log_frame, orient='vertical', command=self.log_tree.yview)
-        self.log_tree.configure(yscrollcommand=log_scroll.set)
-        
-        self.log_tree.pack(side='left', fill='both', expand=True)
-        log_scroll.pack(side='right', fill='y')
-        
-        # Double-click to view details
-        self.log_tree.bind('<Double-1>', self.show_log_details)
+        # Configure text tags for coloring
+        self.log_text.tag_configure('header', font=('Consolas', 9, 'bold'), background='lightgray')
+        self.log_text.tag_configure('error', foreground='red')
+        self.log_text.tag_configure('warning', foreground='orange')
+        self.log_text.tag_configure('critical', foreground='dark red', background='light pink')
+        self.log_text.tag_configure('debug', foreground='gray')
+        self.log_text.tag_configure('info', foreground='black')
         
         # Status bar
         self.status_var = tk.StringVar(value="Ready")
@@ -129,10 +138,10 @@ class LogViewerWindow:
         status_bar.pack(fill='x', pady=(5, 0))
     
     def refresh_logs(self):
-        """ENHANCED log refresh with better parsing"""
-        # Clear existing items
-        for item in self.log_tree.get_children():
-            self.log_tree.delete(item)
+        """FIXED log refresh using Text widget for proper rendering"""
+        # Clear existing content
+        self.log_text.configure(state='normal')
+        self.log_text.delete('1.0', tk.END)
         
         # Get filtered logs
         logs = self.get_filtered_logs()
@@ -142,37 +151,54 @@ class LogViewerWindow:
         components = [c for c in components if c]  # Remove empty components
         self.component_combo['values'] = ["ALL"] + components
         
-        # Add logs to tree
+        # Add header
+        header = f"{'Date & Time':<20} {'Level':<8} {'Source':<10} {'Component':<12} {'Message'}\n"
+        header += "-" * 120 + "\n"
+        self.log_text.insert(tk.END, header, 'header')
+        
+        # Add logs with proper formatting
         for log in logs:
-            # FIXED: Enhanced parsing to extract source application
+            # Parse log entry
             datetime_str, level, source, component, message = self.parse_log_entry(log)
             
-            # Color code by level
-            tags = []
-            if log.level == "ERROR":
-                tags = ['error']
-            elif log.level == "WARNING":
-                tags = ['warning']
-            elif log.level == "CRITICAL":
-                tags = ['critical']
-            elif log.level == "DEBUG":
-                tags = ['debug']
+            # Format datetime to be shorter
+            try:
+                dt = datetime.fromisoformat(log.timestamp)
+                short_datetime = dt.strftime("%m-%d %H:%M:%S")
+            except:
+                short_datetime = datetime_str[-8:]  # Last 8 chars
             
-            self.log_tree.insert('', 'end', values=(
-                datetime_str, level, source, component, message
-            ), tags=tags)
+            # Format line with fixed widths
+            log_line = f"{short_datetime:<20} {level:<8} {source:<10} {component:<12} {message}\n"
+            
+            # Determine tag for coloring
+            tag = level.lower() if level.lower() in ['error', 'warning', 'critical', 'debug'] else 'info'
+            
+            # Insert with color tag
+            self.log_text.insert(tk.END, log_line, tag)
         
-        # Configure tag colors
-        self.log_tree.tag_configure('error', foreground='red')
-        self.log_tree.tag_configure('warning', foreground='orange')
-        self.log_tree.tag_configure('critical', foreground='dark red', background='light pink')
-        self.log_tree.tag_configure('debug', foreground='gray')
+        # Disable editing
+        self.log_text.configure(state='disabled')
         
-        # FIXED: Auto-scroll to bottom if enabled
+        # Auto-scroll to bottom if enabled
         if self.auto_scroll_var.get() and logs:
-            self.log_tree.see(self.log_tree.get_children()[-1])
+            self.log_text.see(tk.END)
         
         self.status_var.set(f"Showing {len(logs)} log entries")
+    
+    def truncate_message(self, message: str, max_length: int) -> str:
+        """Truncate message for display while preserving readability"""
+        if len(message) <= max_length:
+            return message
+        
+        # Try to break at a word boundary
+        truncated = message[:max_length]
+        last_space = truncated.rfind(' ')
+        
+        if last_space > max_length * 0.7:  # If we find a space in the last 30%
+            return truncated[:last_space] + "..."
+        else:
+            return truncated + "..."
     
     def parse_log_entry(self, log: LogEntry) -> tuple:
         """ENHANCED log entry parsing to extract all components"""
@@ -253,35 +279,31 @@ class LogViewerWindow:
         self.refresh_logs()
     
     def show_log_details(self, event):
-        """Show detailed log information in a popup"""
-        selection = self.log_tree.selection()
-        if not selection:
+        """Show detailed log information in a popup - UPDATED for Text widget"""
+        # Get current cursor position
+        cursor_pos = self.log_text.index(tk.INSERT)
+        line_num = int(cursor_pos.split('.')[0]) - 3  # Subtract header lines
+        
+        if line_num < 0:
             return
         
-        # Get the selected log entry
-        item_values = self.log_tree.item(selection[0])['values']
-        if not item_values:
-            return
-        
-        # Find the corresponding log entry
+        # Get the corresponding log entry
         logs = self.get_filtered_logs()
-        selected_index = self.log_tree.index(selection[0])
-        
-        if selected_index < len(logs):
-            log_entry = logs[selected_index]
+        if line_num < len(logs):
+            log_entry = logs[line_num]
             self.show_log_detail_window(log_entry)
     
     def show_log_detail_window(self, log_entry: LogEntry):
         """ENHANCED log detail window"""
         detail_window = tk.Toplevel(self.window)
         detail_window.title("Log Entry Details")
-        detail_window.geometry("700x500")
+        detail_window.geometry("800x600")  # Larger for better viewing
         detail_window.transient(self.window)
         detail_window.protocol("WM_DELETE_WINDOW", detail_window.destroy)
         
         # Create text widget with details
         from tkinter import scrolledtext
-        text_widget = scrolledtext.ScrolledText(detail_window, wrap=tk.WORD)
+        text_widget = scrolledtext.ScrolledText(detail_window, wrap=tk.WORD, font=('Consolas', 10))
         text_widget.pack(fill='both', expand=True, padx=10, pady=10)
         
         # ENHANCED format log details
@@ -297,13 +319,14 @@ Source Application: {source}
 Component: {component}
 Session ID: {log_entry.session_id}
 
-Message:
+Full Message:
+{'-' * 50}
 {message}
 """
         
         if log_entry.details:
             import json
-            details_text += f"\n\nAdditional Details:\n{json.dumps(log_entry.details, indent=2)}"
+            details_text += f"\n\nAdditional Details:\n{'-' * 30}\n{json.dumps(log_entry.details, indent=2)}"
         
         # Add raw log data for debugging
         details_text += f"\n\nRaw Log Data:\n{'-' * 20}\n"
@@ -379,9 +402,13 @@ Message:
     
     def auto_refresh(self):
         """Auto-refresh logs every 3 seconds"""
-        if self.window.winfo_exists():
-            self.refresh_logs()
-            self.window.after(3000, self.auto_refresh)
+        try:
+            if self.window.winfo_exists():
+                self.refresh_logs()
+                self._refresh_timer = self.window.after(3000, self.auto_refresh)
+        except (tk.TclError, AttributeError):
+            # Window was destroyed, stop refreshing
+            pass
 
 class LogStatsWindow:
     """ENHANCED log statistics window"""
@@ -445,7 +472,7 @@ class LogStatsWindow:
     
     def create_summary_tab(self, parent):
         """Create summary statistics tab"""
-        self.summary_text = tk.Text(parent, wrap=tk.WORD, height=20)
+        self.summary_text = tk.Text(parent, wrap=tk.WORD, height=20, font=('Consolas', 10))
         scrollbar = ttk.Scrollbar(parent, orient='vertical', command=self.summary_text.yview)
         self.summary_text.configure(yscrollcommand=scrollbar.set)
         
@@ -483,7 +510,7 @@ class LogStatsWindow:
         self.component_tree.pack(fill='both', expand=True)
     
     def create_source_tab(self, parent):
-        """NEW: Create source application statistics tab"""
+        """Create source application statistics tab"""
         self.source_tree = ttk.Treeview(parent, columns=('Source', 'Count', 'Percentage'), 
                                        show='headings', height=15)
         
@@ -498,7 +525,7 @@ class LogStatsWindow:
         self.source_tree.pack(fill='both', expand=True)
     
     def create_timeline_tab(self, parent):
-        """NEW: Create timeline statistics tab"""
+        """Create timeline statistics tab"""
         timeline_frame = ttk.Frame(parent)
         timeline_frame.pack(fill='both', expand=True, padx=10, pady=10)
         
@@ -515,7 +542,7 @@ class LogStatsWindow:
         timeline_combo.bind('<<ComboboxSelected>>', self.update_timeline)
         
         # Timeline display
-        self.timeline_text = tk.Text(timeline_frame, wrap=tk.WORD, height=15)
+        self.timeline_text = tk.Text(timeline_frame, wrap=tk.WORD, height=15, font=('Consolas', 10))
         timeline_scroll = ttk.Scrollbar(timeline_frame, orient='vertical', command=self.timeline_text.yview)
         self.timeline_text.configure(yscrollcommand=timeline_scroll.set)
         

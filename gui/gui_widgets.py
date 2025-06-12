@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # FILE: gui/gui_widgets.py
 """
-GUI Widgets Module - Complete Widget Definitions
+GUI Widgets Module - Improved UI with Compact Messages and Details Buttons
 Custom widgets for the FileMaker Sync Dashboard
 """
 
@@ -11,11 +11,12 @@ from datetime import datetime
 from typing import Dict, Any, Callable
 
 class StatusCard(ttk.Frame):
-    """Custom widget for displaying connection status with test button"""
+    """Custom widget for displaying connection status with test button and details"""
     
     def __init__(self, parent, title: str, **kwargs):
         super().__init__(parent, **kwargs)
         self.title = title
+        self.full_message = "Not tested"  # Store full message for details
         self.create_widgets()
     
     def create_widgets(self):
@@ -27,106 +28,181 @@ class StatusCard(ttk.Frame):
         self.status_label = ttk.Label(header_frame, text="●", font=('Arial', 16))
         self.status_label.pack(side='left', padx=(0, 10))
         
-        # Title and message
-        info_frame = ttk.Frame(header_frame)
-        info_frame.pack(side='left', fill='x', expand=True)
+        # Message frame (NO TITLE - section label is sufficient)
+        message_frame = ttk.Frame(header_frame)
+        message_frame.pack(side='left', fill='x', expand=True)
         
-        self.title_label = ttk.Label(info_frame, text=self.title, font=('Arial', 12, 'bold'))
-        self.title_label.pack(anchor='w')
+        self.message_label = ttk.Label(message_frame, text="Not tested", font=('Arial', 10))
+        self.message_label.pack(side='left')
         
-        self.message_label = ttk.Label(info_frame, text="Not tested", font=('Arial', 9))
-        self.message_label.pack(anchor='w')
+        # Details button (initially hidden)
+        self.details_button = ttk.Button(message_frame, text="Details", width=8, 
+                                        command=self.show_details)
         
-        # Test button - THIS WAS MISSING!
-        self.test_button = ttk.Button(header_frame, text="Test", width=8)
-        self.test_button.pack(side='right', padx=(10, 0))
+        # Button frame for test button
+        button_frame = ttk.Frame(header_frame)
+        button_frame.pack(side='right', padx=(10, 0))
+        
+        self.test_button = ttk.Button(button_frame, text="Test", width=8)
+        self.test_button.pack()
     
     def update_status(self, connected: bool, message: str):
-        """Update the status display"""
+        """Update the status display with compact message and details button"""
+        self.full_message = message  # Store full message
+        
+        # Create compact message
         if connected:
+            if "DSN:" in message:
+                dsn_part = message.split("DSN:")[-1].strip()
+                compact_message = f"Connected via {dsn_part.split()[0]}"
+            elif "Connected to" in message:
+                compact_message = "Connected successfully"
+            else:
+                compact_message = "Connected"
+            
             self.status_label.configure(foreground='green')
             self.message_label.configure(foreground='dark green')
+            
+            # Hide details button for successful connections
+            self.details_button.pack_forget()
+            
         else:
+            # For errors, show compact message with details button
+            if "Connection failed" in message:
+                compact_message = "Connection failed"
+            elif "not found" in message.lower():
+                compact_message = "Service not found"
+            elif "timeout" in message.lower():
+                compact_message = "Connection timeout"
+            elif "authentication" in message.lower():
+                compact_message = "Authentication failed"
+            else:
+                # Truncate long error messages
+                compact_message = message[:30] + "..." if len(message) > 30 else message
+            
             self.status_label.configure(foreground='red')
             self.message_label.configure(foreground='dark red')
+            
+            # Show details button for errors
+            self.details_button.pack(side='left', padx=(5, 0))
         
-        self.message_label.configure(text=message)
+        self.message_label.configure(text=compact_message)
+    
+    def show_details(self):
+        """Show detailed message in a modal dialog"""
+        detail_window = tk.Toplevel(self)
+        detail_window.title(f"{self.title} - Connection Details")
+        detail_window.geometry("500x300")
+        detail_window.transient(self.winfo_toplevel())
+        detail_window.grab_set()
+        
+        # Center the window
+        detail_window.update_idletasks()
+        x = (detail_window.winfo_screenwidth() // 2) - (detail_window.winfo_width() // 2)
+        y = (detail_window.winfo_screenheight() // 2) - (detail_window.winfo_height() // 2)
+        detail_window.geometry(f"+{x}+{y}")
+        
+        # Main frame
+        main_frame = ttk.Frame(detail_window)
+        main_frame.pack(fill='both', expand=True, padx=15, pady=15)
+        
+        # Title
+        title_label = ttk.Label(main_frame, text=f"{self.title} Connection Details", 
+                               font=('Arial', 12, 'bold'))
+        title_label.pack(pady=(0, 10))
+        
+        # Message text with scrollbar
+        from tkinter import scrolledtext
+        text_widget = scrolledtext.ScrolledText(main_frame, wrap=tk.WORD, height=8)
+        text_widget.pack(fill='both', expand=True, pady=(0, 10))
+        
+        # Insert full message
+        text_widget.insert('1.0', self.full_message)
+        text_widget.configure(state='disabled')
+        
+        # Close button
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill='x')
+        
+        ttk.Button(button_frame, text="Close", command=detail_window.destroy).pack(side='right')
 
 class MigrationOverview(ttk.Frame):
-    """Widget showing migration progress overview"""
+    """Widget showing migration progress overview - COMPACT VERSION"""
     
     def __init__(self, parent, **kwargs):
         super().__init__(parent, **kwargs)
         self.create_widgets()
     
     def create_widgets(self):
-        # Header
+        # Header with refresh button only - COMPACT
         header_frame = ttk.Frame(self)
-        header_frame.pack(fill='x', padx=5, pady=5)
+        header_frame.pack(fill='x', padx=2, pady=2)
         
-        ttk.Label(header_frame, text="Migration Overview", font=('Arial', 14, 'bold')).pack(side='left')
-        self.refresh_button = ttk.Button(header_frame, text="↻ Refresh", width=12)
+        self.refresh_button = ttk.Button(header_frame, text="↻ Refresh", width=10)
         self.refresh_button.pack(side='right')
         
-        # Summary stats
+        # Summary stats - COMPACT spacing
         stats_frame = ttk.Frame(self)
-        stats_frame.pack(fill='x', padx=5, pady=10)
+        stats_frame.pack(fill='x', padx=2, pady=2)
         
-        # Create stat boxes
+        # Create stat boxes - only Tables Done and Completion percentage
         self.stat_boxes = {}
         stat_configs = [
-            ('source_rows', 'Source Rows'),
-            ('target_rows', 'Target Rows'),
-            ('tables_done', 'Tables Done'),
-            ('completion', 'Complete')
+            ('tables_done', 'Tables Migrated'),
+            ('completion', 'Completion %')
         ]
         
         for i, (key, label) in enumerate(stat_configs):
-            stat_frame = ttk.LabelFrame(stats_frame, text=label, padding=5)
-            stat_frame.grid(row=0, column=i, padx=5, sticky='ew')
+            stat_frame = ttk.LabelFrame(stats_frame, text=label, padding=3)
+            stat_frame.grid(row=0, column=i, padx=3, sticky='ew')
             
-            value_label = ttk.Label(stat_frame, text="0", font=('Arial', 14, 'bold'))
+            value_label = ttk.Label(stat_frame, text="0", font=('Arial', 16, 'bold'))
             value_label.pack()
             
             self.stat_boxes[key] = value_label
         
-        # Configure grid weights
-        for i in range(4):
+        # Configure grid weights for equal distribution
+        for i in range(2):
             stats_frame.columnconfigure(i, weight=1)
         
-        # Table progress list
+        # Table progress list - COMPACT with auto-sizing
         self.table_frame = ttk.Frame(self)
-        self.table_frame.pack(fill='both', expand=True, padx=5, pady=5)
+        self.table_frame.pack(fill='both', expand=True, padx=2, pady=2)
         
-        # Create treeview for table details
+        # Create treeview for table details - START WITH MINIMAL HEIGHT
         columns = ('Table', 'Source', 'Target', 'Status', 'Progress')
-        self.table_tree = ttk.Treeview(self.table_frame, columns=columns, show='headings', height=8)
+        self.table_tree = ttk.Treeview(self.table_frame, columns=columns, show='headings', height=3)
+        
+        # Set column widths more efficiently
+        self.table_tree.column('#0', width=0, stretch=False)  # Hide tree column
+        self.table_tree.column('Table', width=120, minwidth=100)
+        self.table_tree.column('Source', width=80, minwidth=60)
+        self.table_tree.column('Target', width=80, minwidth=60)
+        self.table_tree.column('Status', width=100, minwidth=80)
+        self.table_tree.column('Progress', width=80, minwidth=60)
         
         for col in columns:
             self.table_tree.heading(col, text=col)
-            self.table_tree.column(col, width=100)
         
-        # Scrollbar for treeview
+        # Scrollbar for treeview (only show when needed)
         scrollbar = ttk.Scrollbar(self.table_frame, orient='vertical', command=self.table_tree.yview)
         self.table_tree.configure(yscrollcommand=scrollbar.set)
         
         self.table_tree.pack(side='left', fill='both', expand=True)
-        scrollbar.pack(side='right', fill='y')
+        # Don't pack scrollbar initially - will show only when needed
     
     def update_overview(self, data: Dict[str, Any]):
-        """Update the overview with new data"""
+        """Update the overview with new data - AUTO-SIZING VERSION"""
         try:
             # Extract summary data safely
             summary = data.get('summary', {})
             
-            # Update summary stats
-            source_total = summary.get('source_total_rows', 0)
-            target_total = summary.get('target_total_rows', 0)
+            # Update summary stats - ONLY essential ones
             tables_migrated = summary.get('tables_migrated', 0)
             total_tables = summary.get('total_tables', 0)
+            source_total = summary.get('source_total_rows', 0)
+            target_total = summary.get('target_total_rows', 0)
             
-            self.stat_boxes['source_rows'].configure(text=f"{source_total:,}")
-            self.stat_boxes['target_rows'].configure(text=f"{target_total:,}")
             self.stat_boxes['tables_done'].configure(text=f"{tables_migrated}/{total_tables}")
             
             completion = 0
@@ -139,6 +215,20 @@ class MigrationOverview(ttk.Frame):
                 self.table_tree.delete(item)
             
             tables_data = data.get('tables', {})
+            table_count = len(tables_data)
+            
+            # AUTO-SIZE the table height based on data
+            if table_count > 0:
+                # Set height to fit data (minimum 3, maximum 12 to prevent huge tables)
+                optimal_height = min(max(table_count, 3), 12)
+                self.table_tree.configure(height=optimal_height)
+                
+                # Show scrollbar only if needed
+                if table_count > 12:
+                    scrollbar = self.table_frame.winfo_children()[-1]  # Get scrollbar
+                    if hasattr(scrollbar, 'pack'):
+                        scrollbar.pack(side='right', fill='y')
+            
             for table_name, table_info in tables_data.items():
                 source_rows = table_info.get('source_rows', 0)
                 target_rows = table_info.get('target_rows', 0)
@@ -166,18 +256,14 @@ class MigrationOverview(ttk.Frame):
             print(f"Error updating overview: {e}")
 
 class QuickActions(ttk.Frame):
-    """Widget for quick action buttons"""
+    """Widget for quick action buttons - NO INTERNAL TITLE"""
     
     def __init__(self, parent, **kwargs):
         super().__init__(parent, **kwargs)
         self.create_widgets()
     
     def create_widgets(self):
-        # Header
-        header_frame = ttk.Frame(self)
-        header_frame.pack(fill='x', pady=(5, 10))
-        
-        ttk.Label(header_frame, text="Quick Actions", font=('Arial', 14, 'bold')).pack()
+        # NO header/title - just buttons directly
         
         # Button container
         button_container = ttk.Frame(self)

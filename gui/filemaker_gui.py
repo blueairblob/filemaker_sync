@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # FILE: gui/filemaker_gui.py
 """
-Enhanced FileMaker Sync GUI - FIXED VERSION
-Complete modular replacement for filemaker_gui.py with Activity section removed
-Fixed missing test_button attribute error
+Enhanced FileMaker Sync GUI - COMPACT VERSION
+Compact layout with larger section fonts and no redundant titles
 """
 
 import tkinter as tk
@@ -299,13 +298,13 @@ class ConfigurationWindow:
             messagebox.showerror("Error", f"Could not open config file: {e}")
 
 class FileMakerSyncGUI:
-    """Enhanced FileMaker Sync GUI - Main Application Class"""
+    """Enhanced FileMaker Sync GUI - COMPACT VERSION"""
     
     def __init__(self, root):
         self.root = root
         self.root.title("FileMaker Sync Dashboard")
-        self.root.geometry("1000x700")  # Smaller without Activity section
-        self.root.minsize(800, 600)
+        self.root.geometry("1000x650")  # Slightly smaller due to compact layout
+        self.root.minsize(800, 550)
         
         # Initialize core systems
         self.log_manager = LogManager()
@@ -330,7 +329,7 @@ class FileMakerSyncGUI:
         self.log_manager.log(LogLevel.INFO, "Application", "FileMaker Sync Dashboard started")
     
     def create_widgets(self):
-        """Create the main dashboard layout"""
+        """Create the main dashboard layout - COMPACT VERSION"""
         # Configure root
         self.root.configure(bg='#f0f0f0')
         
@@ -347,7 +346,7 @@ class FileMakerSyncGUI:
         # Connection status row
         self.create_connection_status(main_container)
         
-        # Main content area (Migration Overview takes full width now)
+        # Main content area
         self.create_main_content(main_container)
         
         # Status bar
@@ -357,17 +356,18 @@ class FileMakerSyncGUI:
     def create_header(self, parent):
         """Create header section"""
         header_frame = ttk.Frame(parent)
-        header_frame.pack(fill='x', pady=(0, 20))
+        header_frame.pack(fill='x', pady=(0, 15))
         
-        title_label = ttk.Label(header_frame, text="FileMaker Sync Dashboard", font=('Arial', 20, 'bold'))
+        title_label = ttk.Label(header_frame, text="FileMaker Sync Dashboard", 
+                               font=('Arial', 18, 'bold'))
         title_label.pack(side='left')
         
         subtitle_label = ttk.Label(header_frame, 
-                                  text="Monitor and manage your FileMaker Pro to Supabase Cloud migration",
-                                  font=('Arial', 10))
+                                  text="Monitor and manage your FileMaker to Supabase migration",
+                                  font=('Arial', 9))
         subtitle_label.pack(side='left', padx=(20, 0))
         
-        # Activity log button (clock icon) - REPLACED Activity section
+        # Activity log button (clock icon)
         activity_button = ttk.Button(header_frame, text="🕒", width=3, 
                                     command=self.open_log_viewer)
         activity_button.pack(side='right', padx=(0, 10))
@@ -376,39 +376,51 @@ class FileMakerSyncGUI:
         ttk.Label(header_frame, text="Activity Log", font=('Arial', 8)).pack(side='right')
     
     def create_connection_status(self, parent):
-        """Create connection status section"""
+        """Create connection status section - COMPACT"""
         conn_frame = ttk.Frame(parent)
-        conn_frame.pack(fill='x', pady=(0, 20))
+        conn_frame.pack(fill='x', pady=(0, 15))
+        
+        # LARGER SECTION FONTS - Use LabelFrame with bigger font
+        style = ttk.Style()
+        style.configure('Large.TLabelframe.Label', font=('Arial', 12, 'bold'))
         
         # FileMaker status card
-        fm_card_frame = ttk.LabelFrame(conn_frame, text=" Source ", padding=10)
-        fm_card_frame.pack(side='left', fill='x', expand=True, padx=(0, 10))
+        fm_card_frame = ttk.LabelFrame(conn_frame, text="FileMaker Pro", 
+                                      style='Large.TLabelframe', padding=8)
+        fm_card_frame.pack(side='left', fill='x', expand=True, padx=(0, 8))
         
         self.fm_status_card = StatusCard(fm_card_frame, "FileMaker Pro")
         self.fm_status_card.pack(fill='x')
         
         # Target status card
-        target_card_frame = ttk.LabelFrame(conn_frame, text=" Target ", padding=10)
-        target_card_frame.pack(side='right', fill='x', expand=True, padx=(10, 0))
+        target_card_frame = ttk.LabelFrame(conn_frame, text="Supabase Target", 
+                                          style='Large.TLabelframe', padding=8)
+        target_card_frame.pack(side='right', fill='x', expand=True, padx=(8, 0))
         
-        self.target_status_card = StatusCard(target_card_frame, "Supabase Cloud")
+        self.target_status_card = StatusCard(target_card_frame, "Supabase Target")
         self.target_status_card.pack(fill='x')
     
     def create_main_content(self, parent):
-        """Create main content area - Migration Overview takes full width"""
+        """Create main content area - SUPER COMPACT VERSION"""
         content_frame = ttk.Frame(parent)
         content_frame.pack(fill='both', expand=True)
         
-        # Migration Overview (full width)
-        migration_frame = ttk.LabelFrame(content_frame, text=" Migration Overview ", padding=10)
-        migration_frame.pack(fill='both', expand=True, padx=(0, 0), pady=(0, 10))
+        # Configure style for larger section fonts
+        style = ttk.Style()
+        style.configure('Large.TLabelframe.Label', font=('Arial', 12, 'bold'))
+        
+        # Migration Overview - MINIMAL padding
+        migration_frame = ttk.LabelFrame(content_frame, text="Migration Overview", 
+                                        style='Large.TLabelframe', padding=5)
+        migration_frame.pack(fill='both', expand=True, pady=(0, 8))
         
         self.migration_overview = MigrationOverview(migration_frame)
         self.migration_overview.pack(fill='both', expand=True)
         
-        # Quick Actions (full width below migration overview)
-        actions_frame = ttk.LabelFrame(content_frame, text=" Quick Actions ", padding=10)
-        actions_frame.pack(fill='x', pady=(10, 0))
+        # Quick Actions - MINIMAL padding
+        actions_frame = ttk.LabelFrame(content_frame, text="Quick Actions", 
+                                      style='Large.TLabelframe', padding=5)
+        actions_frame.pack(fill='x')
         
         self.quick_actions = QuickActions(actions_frame)
         self.quick_actions.pack(fill='x')
@@ -443,7 +455,7 @@ class FileMakerSyncGUI:
     
     def setup_bindings(self):
         """Set up event bindings"""
-        # Connection test buttons - NOW THESE SHOULD WORK!
+        # Connection test buttons
         self.fm_status_card.test_button.configure(command=self.test_filemaker_connection)
         self.target_status_card.test_button.configure(command=self.test_target_connection)
         
@@ -601,12 +613,23 @@ class FileMakerSyncGUI:
         """Open log viewer window"""
         if self.log_viewer_window is None:
             self.log_viewer_window = LogViewerWindow(self.root, self.log_manager)
-            # Clean up reference when window is closed
+            # FIXED: Clean up reference when window is closed
             def on_close():
                 self.log_viewer_window = None
-            self.log_viewer_window.window.protocol("WM_DELETE_WINDOW", on_close)
+            # Store the original close method
+            original_close = self.log_viewer_window.close_window
+            def enhanced_close():
+                original_close()
+                on_close()
+            self.log_viewer_window.close_window = enhanced_close
         else:
-            self.log_viewer_window.window.lift()
+            try:
+                self.log_viewer_window.window.lift()
+                self.log_viewer_window.window.focus_force()
+            except:
+                # Window was destroyed, create new one
+                self.log_viewer_window = None
+                self.open_log_viewer()
     
     def open_log_stats(self):
         """Open log statistics window"""
