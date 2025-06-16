@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # FILE: gui/gui_logviewer.py
 """
-GUI Log Viewer Module - FIXED VERSION
-Properly handles window lifecycle and prevents common tkinter issues
+Fixed GUI Log Viewer Module with Proper Real-time Updates
+Resolves log refresh issues and provides better integration with logging system
 """
 
 import tkinter as tk
@@ -13,11 +13,12 @@ from typing import List, Optional
 from dataclasses import asdict
 import re
 import threading
+import queue
 
 from gui_logging import LogManager, LogEntry
 
 class LogViewerWindow:
-    """Fixed log viewer with proper window management"""
+    """Fixed log viewer with proper real-time updates and window management"""
     
     def __init__(self, parent, log_manager: LogManager):
         self.parent = parent
@@ -27,25 +28,38 @@ class LogViewerWindow:
         self._search_timer = None
         self._destroyed = False
         
-        # Auto-scroll setting
+        # Log update queue for thread-safe updates
+        self.log_update_queue = queue.Queue()
+        
+        # Auto-scroll and refresh settings
         self.auto_scroll_var = tk.BooleanVar(value=True)
+        self.auto_refresh_var = tk.BooleanVar(value=True)
+        self.refresh_interval = 2000  # 2 seconds
+        
+        # Current log count to detect new logs
+        self.last_log_count = 0
         
         self.create_window()
         self.create_widgets()
-        self.refresh_logs()
         
-        # Start auto-refresh
+        # Register callback for new log entries
+        self.log_manager.add_callback(self.on_new_log_entry)
+        
+        # Initial load and start auto-refresh
+        self.refresh_logs()
         self.start_auto_refresh()
+        
+        # Add test button for debugging
+        self.add_debug_features()
     
     def create_window(self):
         """Create the window with proper settings"""
         self.window = tk.Toplevel(self.parent)
-        self.window.title("FileMaker Sync - Activity Log")
+        self.window.title(f"FileMaker Sync - Activity Log (Session: {self.log_manager.session_id})")
         self.window.geometry("1200x700")
         
         # Set window icon if available
         try:
-            # Try to inherit icon from parent
             self.window.iconbitmap(default="")
         except:
             pass
@@ -102,6 +116,9 @@ class LogViewerWindow:
         self._destroyed = True
         
         try:
+            # Remove callback from log manager
+            self.log_manager.remove_callback(self.on_new_log_entry)
+            
             # Cancel any pending timers
             if self._refresh_timer:
                 self.window.after_cancel(self._refresh_timer)
@@ -127,6 +144,9 @@ class LogViewerWindow:
         main_container = ttk.Frame(self.window)
         main_container.pack(fill='both', expand=True, padx=10, pady=10)
         
+        # Header with title and stats
+        self.create_header(main_container)
+        
         # Control panel
         self.create_control_panel(main_container)
         
@@ -135,6 +155,28 @@ class LogViewerWindow:
         
         # Status bar
         self.create_status_bar(main_container)
+    
+    def create_header(self, parent):
+        """Create header with statistics"""
+        header_frame = ttk.Frame(parent)
+        header_frame.pack(fill='x', pady=(0, 10))
+        
+        # Title
+        title_label = ttk.Label(header_frame, text="Activity Log Viewer", 
+                               font=('Arial', 14, 'bold'))
+        title_label.pack(side='left')
+        
+        # Stats frame
+        stats_frame = ttk.Frame(header_frame)
+        stats_frame.pack(side='right')
+        
+        self.stats_label = ttk.Label(stats_frame, text="Loading...", font=('Arial', 9))
+        self.stats_label.pack(side='right')
+        
+        # Live indicator
+        self.live_indicator = ttk.Label(stats_frame, text="● LIVE", 
+                                       foreground='green', font=('Arial', 9, 'bold'))
+        self.live_indicator.pack(side='right', padx=(0, 10))
     
     def create_control_panel(self, parent):
         """Create the control panel with filters and buttons"""
@@ -145,41 +187,54 @@ class LogViewerWindow:
         filter_frame = ttk.LabelFrame(control_frame, text="Filters", padding=5)
         filter_frame.pack(side='left', fill='x', expand=True, padx=(0, 10))
         
+        # Row 1: Level and Component filters
+        row1_frame = ttk.Frame(filter_frame)
+        row1_frame.pack(fill='x', pady=2)
+        
         # Log level filter
-        ttk.Label(filter_frame, text="Level:").grid(row=0, column=0, padx=(0, 5), sticky='w')
+        ttk.Label(row1_frame, text="Level:").pack(side='left', padx=(0, 5))
         self.level_var = tk.StringVar(value="ALL")
-        level_combo = ttk.Combobox(filter_frame, textvariable=self.level_var, 
+        level_combo = ttk.Combobox(row1_frame, textvariable=self.level_var, 
                                   values=["ALL", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
                                   width=10, state="readonly")
-        level_combo.grid(row=0, column=1, padx=(0, 10), sticky='w')
+        level_combo.pack(side='left', padx=(0, 10))
         level_combo.bind('<<ComboboxSelected>>', self.on_filter_change)
         
         # Component filter
-        ttk.Label(filter_frame, text="Component:").grid(row=0, column=2, padx=(0, 5), sticky='w')
+        ttk.Label(row1_frame, text="Component:").pack(side='left', padx=(0, 5))
         self.component_var = tk.StringVar(value="ALL")
-        self.component_combo = ttk.Combobox(filter_frame, textvariable=self.component_var, 
+        self.component_combo = ttk.Combobox(row1_frame, textvariable=self.component_var, 
                                            width=15, state="readonly")
-        self.component_combo.grid(row=0, column=3, padx=(0, 10), sticky='w')
+        self.component_combo.pack(side='left', padx=(0, 10))
         self.component_combo.bind('<<ComboboxSelected>>', self.on_filter_change)
         
+        # Row 2: Search and options
+        row2_frame = ttk.Frame(filter_frame)
+        row2_frame.pack(fill='x', pady=2)
+        
         # Search
-        ttk.Label(filter_frame, text="Search:").grid(row=0, column=4, padx=(0, 5), sticky='w')
+        ttk.Label(row2_frame, text="Search:").pack(side='left', padx=(0, 5))
         self.search_var = tk.StringVar()
-        search_entry = ttk.Entry(filter_frame, textvariable=self.search_var, width=20)
-        search_entry.grid(row=0, column=5, sticky='w')
+        search_entry = ttk.Entry(row2_frame, textvariable=self.search_var, width=20)
+        search_entry.pack(side='left', padx=(0, 10))
         search_entry.bind('<KeyRelease>', self.on_search_change)
         
-        # Auto-scroll checkbox
-        ttk.Checkbutton(filter_frame, text="Auto-scroll", 
-                       variable=self.auto_scroll_var).grid(row=0, column=6, padx=(10, 0), sticky='w')
+        # Options
+        ttk.Checkbutton(row2_frame, text="Auto-scroll", 
+                       variable=self.auto_scroll_var).pack(side='left', padx=(10, 0))
+        
+        ttk.Checkbutton(row2_frame, text="Auto-refresh", 
+                       variable=self.auto_refresh_var,
+                       command=self.toggle_auto_refresh).pack(side='left', padx=(10, 0))
         
         # Action buttons
         action_frame = ttk.Frame(control_frame)
         action_frame.pack(side='right')
         
-        ttk.Button(action_frame, text="Refresh", command=self.refresh_logs).pack(side='left', padx=2)
+        ttk.Button(action_frame, text="Refresh Now", command=self.refresh_logs).pack(side='left', padx=2)
         ttk.Button(action_frame, text="Clear Filters", command=self.clear_filters).pack(side='left', padx=2)
         ttk.Button(action_frame, text="Export", command=self.export_logs).pack(side='left', padx=2)
+        ttk.Button(action_frame, text="Clear Logs", command=self.clear_logs).pack(side='left', padx=2)
         ttk.Button(action_frame, text="Close", command=self.close_window).pack(side='left', padx=2)
     
     def create_log_display(self, parent):
@@ -198,9 +253,9 @@ class LogViewerWindow:
         self.log_tree.heading('Message', text='Message')
         
         # Set column widths
-        self.log_tree.column('Time', width=120, minwidth=100)
+        self.log_tree.column('Time', width=100, minwidth=80)
         self.log_tree.column('Level', width=80, minwidth=60)
-        self.log_tree.column('Component', width=100, minwidth=80)
+        self.log_tree.column('Component', width=120, minwidth=80)
         self.log_tree.column('Message', width=600, minwidth=300)
         
         # Scrollbars
@@ -226,15 +281,118 @@ class LogViewerWindow:
         self.log_tree.tag_configure('CRITICAL', background='#ff9999')
         self.log_tree.tag_configure('WARNING', background='#ffffcc')
         self.log_tree.tag_configure('DEBUG', foreground='gray')
+        self.log_tree.tag_configure('INFO', foreground='black')
     
     def create_status_bar(self, parent):
         """Create the status bar"""
+        status_frame = ttk.Frame(parent)
+        status_frame.pack(fill='x', pady=(5, 0))
+        
         self.status_var = tk.StringVar(value="Ready")
-        status_bar = ttk.Label(parent, textvariable=self.status_var, relief='sunken')
-        status_bar.pack(fill='x', pady=(5, 0))
+        status_bar = ttk.Label(status_frame, textvariable=self.status_var, relief='sunken')
+        status_bar.pack(side='left', fill='x', expand=True)
+        
+        # Connection status
+        self.connection_status_label = ttk.Label(status_frame, text="", font=('Arial', 8))
+        self.connection_status_label.pack(side='right', padx=(5, 0))
+    
+    def add_debug_features(self):
+        """Add debug features for testing logging"""
+        if self.log_manager.debug_mode:
+            # Add a debug frame to the control panel
+            debug_frame = ttk.LabelFrame(self.window, text="Debug Controls", padding=5)
+            debug_frame.pack(side='bottom', fill='x', padx=10, pady=(5, 10))
+            
+            ttk.Button(debug_frame, text="Generate Test Logs", 
+                      command=self.generate_test_logs).pack(side='left', padx=2)
+            ttk.Button(debug_frame, text="Test All Levels", 
+                      command=self.test_all_log_levels).pack(side='left', padx=2)
+            ttk.Button(debug_frame, text="Log Statistics", 
+                      command=self.show_log_statistics).pack(side='left', padx=2)
+    
+    def on_new_log_entry(self, log_entry: LogEntry):
+        """Handle new log entries from the callback (thread-safe)"""
+        if self._destroyed:
+            return
+        
+        # Put the log entry in the queue for processing on the main thread
+        try:
+            self.log_update_queue.put_nowait(log_entry)
+        except queue.Full:
+            pass  # Queue is full, skip this entry
+        
+        # Schedule processing on the main thread
+        if self.window and self.window.winfo_exists():
+            self.window.after_idle(self.process_log_queue)
+    
+    def process_log_queue(self):
+        """Process queued log entries on the main thread"""
+        if self._destroyed:
+            return
+        
+        try:
+            # Process all queued log entries
+            new_entries = []
+            while not self.log_update_queue.empty():
+                try:
+                    entry = self.log_update_queue.get_nowait()
+                    new_entries.append(entry)
+                except queue.Empty:
+                    break
+            
+            if new_entries and self.auto_refresh_var.get():
+                # Add new entries to the display if they match current filters
+                for entry in new_entries:
+                    if self.entry_matches_filters(entry):
+                        self.add_log_entry_to_tree(entry)
+                
+                # Auto-scroll if enabled
+                if self.auto_scroll_var.get():
+                    children = self.log_tree.get_children()
+                    if children:
+                        self.log_tree.see(children[-1])
+                
+                # Update status
+                self.update_status_display()
+                
+        except Exception as e:
+            print(f"Error processing log queue: {e}")
+    
+    def entry_matches_filters(self, entry: LogEntry) -> bool:
+        """Check if a log entry matches current filters"""
+        # Level filter
+        level_filter = self.level_var.get()
+        if level_filter != "ALL" and entry.level != level_filter:
+            return False
+        
+        # Component filter
+        component_filter = self.component_var.get()
+        if component_filter != "ALL" and entry.component != component_filter:
+            return False
+        
+        # Search filter
+        search_term = self.search_var.get().lower()
+        if search_term:
+            if (search_term not in entry.message.lower() and 
+                search_term not in entry.component.lower()):
+                return False
+        
+        return True
+    
+    def add_log_entry_to_tree(self, entry: LogEntry):
+        """Add a single log entry to the tree"""
+        time_str = self.format_time(entry.timestamp)
+        message = self.truncate_message(entry.message, 100)
+        
+        # Determine row tag for coloring
+        tag = entry.level if entry.level in ['ERROR', 'CRITICAL', 'WARNING', 'DEBUG', 'INFO'] else ''
+        
+        self.log_tree.insert('', 'end', 
+                            values=(time_str, entry.level, entry.component, message),
+                            tags=(tag,))
     
     def refresh_logs(self):
-        """Refresh the log display"""
+        """Refresh the log display with comprehensive error handling"""
         if self._destroyed or not self.window or not self.window.winfo_exists():
             return
         
@@ -251,18 +409,7 @@ class LogViewerWindow:
             
             # Add logs to tree
             for log in logs:
-                time_str = self.format_time(log.timestamp)
-                message = self.truncate_message(log.message, 100)
-                
-                # Determine row tag for coloring
-                tag = log.level if log.level in ['ERROR', 'CRITICAL', 'WARNING', 'DEBUG'] else ''
-                
-                item_id = self.log_tree.insert('', 'end', 
-                                              values=(time_str, log.level, log.component, message),
-                                              tags=(tag,))
-                
-                # Store full log entry for details view
-                self.log_tree.set(item_id, 'log_entry', log)
+                self.add_log_entry_to_tree(log)
             
             # Auto-scroll to bottom if enabled
             if self.auto_scroll_var.get() and logs:
@@ -270,24 +417,97 @@ class LogViewerWindow:
                 if children:
                     self.log_tree.see(children[-1])
             
-            # Update status
-            self.status_var.set(f"Showing {len(logs)} log entries")
+            # Update status and statistics
+            self.update_status_display()
+            self.update_statistics_display()
+            
+            # Update last log count
+            self.last_log_count = self.log_manager.get_log_count()
             
         except Exception as e:
             print(f"Error refreshing logs: {e}")
+            self.status_var.set(f"Error refreshing logs: {e}")
     
     def update_component_filter(self):
         """Update the component filter dropdown"""
         try:
-            components = sorted(set(log.component for log in self.log_manager.memory_logs if log.component))
+            # Get all components from recent logs
+            recent_logs = self.log_manager.get_recent_logs(limit=1000)
+            components = sorted(set(log.component for log in recent_logs if log.component))
+            
+            current_value = self.component_var.get()
             self.component_combo['values'] = ["ALL"] + components
-        except:
-            pass
+            
+            # Restore selection if it's still valid
+            if current_value not in self.component_combo['values']:
+                self.component_var.set("ALL")
+        except Exception as e:
+            print(f"Error updating component filter: {e}")
+    
+    def update_status_display(self):
+        """Update the status bar with current information"""
+        try:
+            # Get current log count and filter info
+            total_logs = self.log_manager.get_log_count()
+            displayed_logs = len(self.log_tree.get_children())
+            
+            # Create status message
+            status_parts = [f"Total: {total_logs:,}", f"Displayed: {displayed_logs:,}"]
+            
+            # Add filter info if active
+            active_filters = []
+            if self.level_var.get() != "ALL":
+                active_filters.append(f"Level: {self.level_var.get()}")
+            if self.component_var.get() != "ALL":
+                active_filters.append(f"Component: {self.component_var.get()}")
+            if self.search_var.get():
+                active_filters.append(f"Search: '{self.search_var.get()}'")
+            
+            if active_filters:
+                status_parts.append(f"Filters: {', '.join(active_filters)}")
+            
+            self.status_var.set(" | ".join(status_parts))
+            
+        except Exception as e:
+            self.status_var.set(f"Status update error: {e}")
+    
+    def update_statistics_display(self):
+        """Update the header statistics display"""
+        try:
+            stats = self.log_manager.get_log_statistics()
+            
+            # Format statistics
+            total = stats['total_logs']
+            by_level = stats.get('by_level', {})
+            
+            errors = by_level.get('ERROR', 0) + by_level.get('CRITICAL', 0)
+            warnings = by_level.get('WARNING', 0)
+            
+            stats_text = f"Total: {total:,}"
+            if errors > 0:
+                stats_text += f" | Errors: {errors}"
+            if warnings > 0:
+                stats_text += f" | Warnings: {warnings}"
+            
+            # Add session info
+            stats_text += f" | Session: {stats.get('session_id', 'Unknown')}"
+            
+            self.stats_label.configure(text=stats_text)
+            
+            # Update live indicator color based on recent activity
+            current_count = self.log_manager.get_log_count()
+            if current_count > self.last_log_count:
+                self.live_indicator.configure(foreground='green')
+            else:
+                self.live_indicator.configure(foreground='gray')
+                
+        except Exception as e:
+            self.stats_label.configure(text=f"Stats error: {e}")
     
     def format_time(self, timestamp: str) -> str:
         """Format timestamp for display"""
         try:
-            dt = datetime.fromisoformat(timestamp)
+            dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
             return dt.strftime("%H:%M:%S")
         except:
             return timestamp[-8:] if len(timestamp) >= 8 else timestamp
@@ -309,26 +529,25 @@ class LogViewerWindow:
     def get_filtered_logs(self) -> List[LogEntry]:
         """Get logs with current filters applied"""
         try:
-            logs = self.log_manager.get_recent_logs(limit=1000)
+            # Get recent logs with filters
+            level_filter = self.level_var.get() if self.level_var.get() != "ALL" else None
+            component_filter = self.component_var.get() if self.component_var.get() != "ALL" else None
             
-            # Level filter
-            level_filter = self.level_var.get()
-            if level_filter != "ALL":
-                logs = [log for log in logs if log.level == level_filter]
+            logs = self.log_manager.get_recent_logs(
+                limit=1000, 
+                level_filter=level_filter,
+                component_filter=component_filter
+            )
             
-            # Component filter
-            component_filter = self.component_var.get()
-            if component_filter != "ALL":
-                logs = [log for log in logs if log.component == component_filter]
-            
-            # Search filter
+            # Apply search filter
             search_term = self.search_var.get().lower()
             if search_term:
                 logs = [log for log in logs if search_term in log.message.lower() or 
                        search_term in log.component.lower()]
             
             return logs
-        except:
+        except Exception as e:
+            print(f"Error getting filtered logs: {e}")
             return []
     
     def on_filter_change(self, event=None):
@@ -356,6 +575,44 @@ class LogViewerWindow:
         self.search_var.set("")
         self.refresh_logs()
     
+    def clear_logs(self):
+        """Clear all logs from memory"""
+        if messagebox.askyesno("Clear Logs", 
+                              "Are you sure you want to clear all logs from memory?\n\n"
+                              "This will remove all log entries from the current session."):
+            self.log_manager.clear_logs()
+            self.refresh_logs()
+    
+    def toggle_auto_refresh(self):
+        """Toggle auto-refresh functionality"""
+        if self.auto_refresh_var.get():
+            self.start_auto_refresh()
+            self.live_indicator.configure(text="● LIVE", foreground='green')
+        else:
+            self.stop_auto_refresh()
+            self.live_indicator.configure(text="⏸ PAUSED", foreground='orange')
+    
+    def start_auto_refresh(self):
+        """Start auto-refresh timer"""
+        if not self._destroyed and self.window and self.window.winfo_exists():
+            try:
+                # Only refresh if there are new logs
+                current_count = self.log_manager.get_log_count()
+                if current_count != self.last_log_count and self.auto_refresh_var.get():
+                    self.refresh_logs()
+                
+                # Schedule next refresh
+                if self.auto_refresh_var.get():
+                    self._refresh_timer = self.window.after(self.refresh_interval, self.start_auto_refresh)
+            except Exception as e:
+                print(f"Error in auto-refresh: {e}")
+    
+    def stop_auto_refresh(self):
+        """Stop auto-refresh timer"""
+        if self._refresh_timer:
+            self.window.after_cancel(self._refresh_timer)
+            self._refresh_timer = None
+    
     def show_log_details(self, event):
         """Show detailed log information"""
         if self._destroyed:
@@ -367,22 +624,22 @@ class LogViewerWindow:
         
         item = selection[0]
         
-        # Get log entry from tree item
         try:
-            # Since we can't store objects directly, we'll find the log by timestamp and message
+            # Get log entry details from tree values
             values = self.log_tree.item(item)['values']
             if len(values) >= 4:
                 time_str, level, component, message = values[:4]
                 
-                # Find matching log entry
-                for log in self.get_filtered_logs():
+                # Find matching log entry in recent logs
+                logs = self.get_filtered_logs()
+                for log in logs:
                     if (log.level == level and 
                         log.component == component and 
-                        message in log.message):
+                        message.replace("...", "") in log.message):
                         self.show_log_detail_window(log)
                         break
         except Exception as e:
-            print(f"Error showing log details: {e}")
+            messagebox.showerror("Error", f"Failed to show log details: {e}")
     
     def show_log_detail_window(self, log_entry: LogEntry):
         """Show detailed log information in a popup"""
@@ -393,10 +650,14 @@ class LogViewerWindow:
             detail_window.transient(self.window)
             detail_window.grab_set()
             
+            # Main frame
+            main_frame = ttk.Frame(detail_window)
+            main_frame.pack(fill='both', expand=True, padx=10, pady=10)
+            
             # Create scrolled text widget
             from tkinter import scrolledtext
-            text_widget = scrolledtext.ScrolledText(detail_window, wrap=tk.WORD, font=('Consolas', 10))
-            text_widget.pack(fill='both', expand=True, padx=10, pady=10)
+            text_widget = scrolledtext.ScrolledText(main_frame, wrap=tk.WORD, font=('Consolas', 10))
+            text_widget.pack(fill='both', expand=True, pady=(0, 10))
             
             # Format log details
             details_text = f"""Log Entry Details
@@ -420,8 +681,8 @@ Message:
             text_widget.configure(state='disabled')
             
             # Button frame
-            button_frame = ttk.Frame(detail_window)
-            button_frame.pack(fill='x', padx=10, pady=(0, 10))
+            button_frame = ttk.Frame(main_frame)
+            button_frame.pack(fill='x')
             
             ttk.Button(button_frame, text="Close", command=detail_window.destroy).pack(side='right')
             
@@ -445,64 +706,85 @@ Message:
                 logs = self.get_filtered_logs()
                 filepath = Path(filename)
                 
-                if filepath.suffix.lower() == '.json':
-                    self.export_logs_json(filepath, logs)
-                elif filepath.suffix.lower() == '.csv':
-                    self.export_logs_csv(filepath, logs)
-                else:
-                    self.export_logs_text(filepath, logs)
+                # Use the log manager's export functionality
+                self.log_manager.export_logs(filepath, logs)
                 
                 messagebox.showinfo("Export Complete", f"Exported {len(logs)} logs to {filename}")
                 
         except Exception as e:
             messagebox.showerror("Export Error", f"Failed to export logs: {e}")
     
-    def export_logs_json(self, filepath: Path, logs: List[LogEntry]):
-        """Export logs in JSON format"""
-        import json
+    # Debug functions
+    def generate_test_logs(self):
+        """Generate test logs for debugging"""
+        self.log_manager.test_logging()
+    
+    def test_all_log_levels(self):
+        """Test all log levels with various components"""
+        components = ["Test", "GUI", "Database", "Connection", "Operation", "Export"]
+        levels = [
+            self.log_manager.LogLevel.DEBUG,
+            self.log_manager.LogLevel.INFO, 
+            self.log_manager.LogLevel.WARNING,
+            self.log_manager.LogLevel.ERROR,
+            self.log_manager.LogLevel.CRITICAL
+        ]
         
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump([asdict(log) for log in logs], f, indent=2)
+        for i, component in enumerate(components):
+            for j, level in enumerate(levels):
+                message = f"Test {level.value} message from {component} component"
+                details = {"test_number": i * len(levels) + j, "component": component, "level": level.value}
+                self.log_manager.log(level, component, message, details)
     
-    def export_logs_csv(self, filepath: Path, logs: List[LogEntry]):
-        """Export logs in CSV format"""
-        import csv
+    def show_log_statistics(self):
+        """Show detailed log statistics"""
+        stats = self.log_manager.get_log_statistics()
         
-        with open(filepath, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(['Timestamp', 'Level', 'Component', 'Message', 'Session_ID'])
-            
-            for log in logs:
-                writer.writerow([log.timestamp, log.level, log.component, log.message, log.session_id])
-    
-    def export_logs_text(self, filepath: Path, logs: List[LogEntry]):
-        """Export logs in text format"""
-        with open(filepath, 'w', encoding='utf-8') as f:
-            f.write("FileMaker Sync Log Export\n")
-            f.write("=" * 50 + "\n")
-            f.write(f"Export Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Total Entries: {len(logs)}\n\n")
-            
-            for log in logs:
-                f.write(f"[{log.timestamp}] {log.level} - {log.component}\n")
-                f.write(f"  {log.message}\n")
-                if log.details:
-                    import json
-                    f.write(f"  Details: {json.dumps(log.details)}\n")
-                f.write("\n")
-    
-    def start_auto_refresh(self):
-        """Start auto-refresh timer"""
-        if not self._destroyed and self.window and self.window.winfo_exists():
-            try:
-                self.refresh_logs()
-                self._refresh_timer = self.window.after(3000, self.start_auto_refresh)
-            except:
-                pass
+        # Create statistics window
+        stats_window = tk.Toplevel(self.window)
+        stats_window.title("Log Statistics")
+        stats_window.geometry("500x400")
+        stats_window.transient(self.window)
+        
+        # Create text widget
+        from tkinter import scrolledtext
+        text_widget = scrolledtext.ScrolledText(stats_window, wrap=tk.WORD, font=('Consolas', 10))
+        text_widget.pack(fill='both', expand=True, padx=10, pady=10)
+        
+        # Format statistics
+        stats_text = f"""Log Statistics
+==============
+
+Total Entries: {stats['total_logs']:,}
+Session ID: {stats.get('session_id', 'Unknown')}
+Current Level: {stats['current_level']}
+Console Enabled: {stats['console_enabled']}
+Debug Mode: {stats['debug_mode']}
+
+Time Range:
+  Oldest: {stats.get('oldest_entry', 'N/A')}
+  Newest: {stats.get('newest_entry', 'N/A')}
+
+By Level:
+{'-' * 20}
+"""
+        
+        for level, count in sorted(stats.get('by_level', {}).items()):
+            percentage = (count / stats['total_logs']) * 100 if stats['total_logs'] > 0 else 0
+            stats_text += f"{level:10}: {count:6,} ({percentage:5.1f}%)\n"
+        
+        stats_text += f"\nBy Component:\n{'-' * 20}\n"
+        
+        for component, count in sorted(stats.get('by_component', {}).items(), key=lambda x: x[1], reverse=True):
+            percentage = (count / stats['total_logs']) * 100 if stats['total_logs'] > 0 else 0
+            stats_text += f"{component:15}: {count:6,} ({percentage:5.1f}%)\n"
+        
+        text_widget.insert('1.0', stats_text)
+        text_widget.configure(state='disabled')
 
 
 class LogStatsWindow:
-    """Log statistics window with proper window management"""
+    """Enhanced log statistics window"""
     
     def __init__(self, parent, log_manager: LogManager):
         self.parent = parent
@@ -517,7 +799,7 @@ class LogStatsWindow:
     def create_window(self):
         """Create the statistics window"""
         self.window = tk.Toplevel(self.parent)
-        self.window.title("Log Statistics")
+        self.window.title("Log Statistics & Analysis")
         self.window.geometry("700x600")
         self.window.minsize(600, 500)
         
@@ -576,7 +858,7 @@ class LogStatsWindow:
         header_frame = ttk.Frame(main_container)
         header_frame.pack(fill='x', pady=(0, 10))
         
-        ttk.Label(header_frame, text="Log Statistics", 
+        ttk.Label(header_frame, text="Log Statistics & Analysis", 
                  font=('Arial', 16, 'bold')).pack(side='left')
         
         ttk.Button(header_frame, text="Refresh", command=self.update_stats).pack(side='right')
@@ -591,53 +873,21 @@ class LogStatsWindow:
         scrollbar.pack(side='right', fill='y')
     
     def update_stats(self):
-        """Update statistics display"""
+        """Update statistics display with comprehensive analysis"""
         if self._destroyed:
             return
         
         try:
-            logs = self.log_manager.memory_logs
+            stats = self.log_manager.get_log_statistics()
+            logs = self.log_manager.get_recent_logs(limit=1000)
             
             if not logs:
                 self.stats_text.delete('1.0', tk.END)
                 self.stats_text.insert('1.0', "No log entries available.")
                 return
             
-            # Calculate statistics
-            total_logs = len(logs)
-            levels = {}
-            components = {}
-            
-            for log in logs:
-                levels[log.level] = levels.get(log.level, 0) + 1
-                components[log.component] = components.get(log.component, 0) + 1
-            
-            # Generate statistics text
-            stats_text = f"""Log Statistics Summary
-=====================
-
-Total Entries: {total_logs:,}
-Session ID: {self.log_manager.session_id}
-Time Range: {logs[0].timestamp} to {logs[-1].timestamp}
-
-By Level:
-{'-' * 20}
-"""
-            
-            for level, count in sorted(levels.items()):
-                percentage = (count / total_logs) * 100
-                stats_text += f"{level:10}: {count:6,} ({percentage:5.1f}%)\n"
-            
-            stats_text += f"\nBy Component:\n{'-' * 20}\n"
-            
-            for component, count in sorted(components.items(), key=lambda x: x[1], reverse=True):
-                percentage = (count / total_logs) * 100
-                stats_text += f"{component:15}: {count:6,} ({percentage:5.1f}%)\n"
-            
-            # Recent activity
-            recent_errors = [log for log in logs[-100:] if log.level in ['ERROR', 'CRITICAL']]
-            stats_text += f"\nRecent Activity:\n{'-' * 20}\n"
-            stats_text += f"Recent Errors: {len(recent_errors)} in last 100 entries\n"
+            # Generate comprehensive statistics
+            stats_text = self.generate_comprehensive_stats(stats, logs)
             
             # Update display
             self.stats_text.delete('1.0', tk.END)
@@ -646,3 +896,94 @@ By Level:
         except Exception as e:
             self.stats_text.delete('1.0', tk.END)
             self.stats_text.insert('1.0', f"Error generating statistics: {e}")
+    
+    def generate_comprehensive_stats(self, stats: dict, logs: List[LogEntry]) -> str:
+        """Generate comprehensive statistics report"""
+        total_logs = len(logs)
+        
+        # Time analysis
+        if logs:
+            oldest = logs[-1].timestamp
+            newest = logs[0].timestamp
+            try:
+                oldest_dt = datetime.fromisoformat(oldest.replace('Z', '+00:00'))
+                newest_dt = datetime.fromisoformat(newest.replace('Z', '+00:00'))
+                duration = newest_dt - oldest_dt
+                duration_str = str(duration).split('.')[0]  # Remove microseconds
+            except:
+                duration_str = "Unknown"
+        else:
+            oldest = newest = duration_str = "N/A"
+        
+        # Level analysis
+        by_level = stats.get('by_level', {})
+        by_component = stats.get('by_component', {})
+        
+        # Error analysis
+        error_logs = [log for log in logs if log.level in ['ERROR', 'CRITICAL']]
+        warning_logs = [log for log in logs if log.level == 'WARNING']
+        
+        # Recent activity (last 50 entries)
+        recent_activity = logs[:50]
+        recent_errors = [log for log in recent_activity if log.level in ['ERROR', 'CRITICAL']]
+        
+        # Generate report
+        report = f"""Log Statistics & Analysis Report
+==============================
+
+Session Information:
+  Session ID: {stats.get('session_id', 'Unknown')}
+  Current Log Level: {stats['current_level']}
+  Debug Mode: {'Enabled' if stats['debug_mode'] else 'Disabled'}
+  Console Logging: {'Enabled' if stats['console_enabled'] else 'Disabled'}
+
+Data Summary:
+  Total Entries: {total_logs:,}
+  Time Span: {duration_str}
+  Oldest Entry: {oldest}
+  Newest Entry: {newest}
+
+Level Distribution:
+{'-' * 30}
+"""
+        
+        for level, count in sorted(by_level.items()):
+            percentage = (count / total_logs) * 100
+            report += f"  {level:10}: {count:6,} ({percentage:5.1f}%)\n"
+        
+        report += f"\nComponent Activity:\n{'-' * 30}\n"
+        
+        for component, count in sorted(by_component.items(), key=lambda x: x[1], reverse=True):
+            percentage = (count / total_logs) * 100
+            report += f"  {component:15}: {count:6,} ({percentage:5.1f}%)\n"
+        
+        report += f"\nError Analysis:\n{'-' * 30}\n"
+        report += f"  Total Errors: {len(error_logs):,}\n"
+        report += f"  Total Warnings: {len(warning_logs):,}\n"
+        report += f"  Error Rate: {(len(error_logs) / total_logs * 100):.2f}%\n"
+        
+        if recent_errors:
+            report += f"\nRecent Errors (Last 50 entries):\n{'-' * 30}\n"
+            for error in recent_errors[:5]:  # Show last 5 errors
+                time_str = error.timestamp.split('T')[1][:8] if 'T' in error.timestamp else error.timestamp[-8:]
+                report += f"  [{time_str}] {error.level} - {error.component}: {error.message[:60]}...\n"
+        
+        # Health assessment
+        error_rate = len(error_logs) / total_logs * 100 if total_logs > 0 else 0
+        warning_rate = len(warning_logs) / total_logs * 100 if total_logs > 0 else 0
+        
+        if error_rate == 0 and warning_rate < 5:
+            health = "Excellent"
+        elif error_rate < 1 and warning_rate < 10:
+            health = "Good"
+        elif error_rate < 5 and warning_rate < 20:
+            health = "Fair"
+        else:
+            health = "Poor"
+        
+        report += f"\nSystem Health Assessment:\n{'-' * 30}\n"
+        report += f"  Overall Health: {health}\n"
+        report += f"  Error Rate: {error_rate:.2f}%\n"
+        report += f"  Warning Rate: {warning_rate:.2f}%\n"
+        
+        return report
