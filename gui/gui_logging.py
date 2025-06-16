@@ -207,7 +207,10 @@ class LogManager:
                 'by_level': {},
                 'by_component': {},
                 'oldest_entry': None,
-                'newest_entry': None
+                'newest_entry': None,
+                'current_level': self.log_level,
+                'console_enabled': self.console_logging,
+                'debug_mode': self.debug_mode
             }
         
         # Count by level
@@ -218,12 +221,6 @@ class LogManager:
             by_level[log.level] = by_level.get(log.level, 0) + 1
             by_component[log.component] = by_component.get(log.component, 0) + 1
         
-        return {
-            'total_logs': len(self.memory_logs),
-            'by_level': by_level,
-            'by_component': by_component,
-            'oldest_entry': self.memory_logs[0].timestamp if self.memory_logs else None,
-            'newest_entry': self.memory_logs[-1].timestamp if self.memory_logs else None,
         return {
             'total_logs': len(self.memory_logs),
             'by_level': by_level,
