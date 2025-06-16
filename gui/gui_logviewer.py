@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 # FILE: gui/gui_logviewer.py
 """
-Fixed GUI Log Viewer Module with Proper Real-time Updates
-Resolves log refresh issues and provides better integration with logging system
+GUI Log Viewer Module
 """
 
 import tkinter as tk
@@ -14,61 +13,65 @@ from dataclasses import asdict
 import re
 import threading
 import queue
+import time
 
-from gui_logging import LogManager, LogEntry
+from gui_logging import LogManager, LogEntry, LogLevel  # Import LogLevel separately
 
 class LogViewerWindow:
-    """Fixed log viewer with proper real-time updates and window management"""
+    """Thread-safe log viewer that prevents hanging"""
     
     def __init__(self, parent, log_manager: LogManager):
         self.parent = parent
         self.log_manager = log_manager
         self.window = None
+        
+        # Thread safety infrastructure
+        self._destroyed = False
+        self._update_lock = threading.RLock()
+        self._gui_update_queue = queue.Queue(maxsize=50)
+        
+        # Timers and refresh control
         self._refresh_timer = None
         self._search_timer = None
-        self._destroyed = False
-        
-        # Log update queue for thread-safe updates
-        self.log_update_queue = queue.Queue()
+        self._gui_processor_timer = None
         
         # Auto-scroll and refresh settings
         self.auto_scroll_var = tk.BooleanVar(value=True)
         self.auto_refresh_var = tk.BooleanVar(value=True)
-        self.refresh_interval = 2000  # 2 seconds
+        self.refresh_interval = 3000  # 3 seconds (slower to prevent hanging)
         
         # Current log count to detect new logs
         self.last_log_count = 0
         
+        # Initialize window and widgets
         self.create_window()
         self.create_widgets()
         
-        # Register callback for new log entries
+        # Register callback for new log entries (thread-safe)
         self.log_manager.add_callback(self.on_new_log_entry)
         
+        # Start thread-safe GUI update processor
+        self.start_gui_update_processor()
+        
         # Initial load and start auto-refresh
-        self.refresh_logs()
+        self.schedule_gui_update(self.refresh_logs)
         self.start_auto_refresh()
         
-        # Add test button for debugging
-        self.add_debug_features()
+        # Add debug features if in debug mode
+        if self.log_manager.debug_mode:
+            self.add_debug_features()
     
     def create_window(self):
-        """Create the window with proper settings"""
+        """Create the window with proper thread-safe settings"""
         self.window = tk.Toplevel(self.parent)
         self.window.title(f"FileMaker Sync - Activity Log (Session: {self.log_manager.session_id})")
         self.window.geometry("1200x700")
-        
-        # Set window icon if available
-        try:
-            self.window.iconbitmap(default="")
-        except:
-            pass
         
         # Make window resizable
         self.window.minsize(800, 500)
         
         # Set proper window management
-        self.window.protocol("WM_DELETE_WINDOW", self.close_window)
+        self.window.protocol("WM_DELETE_WINDOW", self.close_window_safe)
         
         # Center window on parent
         self.center_on_parent()
@@ -101,32 +104,33 @@ class LogViewerWindow:
             y = max(0, min(y, self.window.winfo_screenheight() - window_height))
             
             self.window.geometry(f"+{x}+{y}")
-        except:
-            # Fallback to screen center
-            self.window.update_idletasks()
-            x = (self.window.winfo_screenwidth() // 2) - (self.window.winfo_width() // 2)
-            y = (self.window.winfo_screenheight() // 2) - (self.window.winfo_height() // 2)
-            self.window.geometry(f"+{x}+{y}")
+        except Exception as e:
+            print(f"Error centering window: {e}")
     
-    def close_window(self):
-        """Properly close the window and clean up resources"""
+    def close_window_safe(self):
+        """Thread-safe window close"""
         if self._destroyed:
             return
         
         self._destroyed = True
         
         try:
-            # Remove callback from log manager
-            self.log_manager.remove_callback(self.on_new_log_entry)
-            
-            # Cancel any pending timers
-            if self._refresh_timer:
-                self.window.after_cancel(self._refresh_timer)
-                self._refresh_timer = None
+            # Stop all timers
+            self.stop_auto_refresh()
             
             if self._search_timer:
                 self.window.after_cancel(self._search_timer)
                 self._search_timer = None
+            
+            if self._gui_processor_timer:
+                self.window.after_cancel(self._gui_processor_timer)
+                self._gui_processor_timer = None
+            
+            # Remove callback from log manager
+            try:
+                self.log_manager.remove_callback(self.on_new_log_entry)
+            except:
+                pass
             
             # Destroy the window
             if self.window and self.window.winfo_exists():
@@ -134,6 +138,54 @@ class LogViewerWindow:
                 
         except Exception as e:
             print(f"Error closing log viewer: {e}")
+    
+    def close_window(self):
+        """Public interface for closing window"""
+        self.close_window_safe()
+    
+    def start_gui_update_processor(self):
+        """Start the thread-safe GUI update processor"""
+        def process_gui_updates():
+            """Process queued GUI updates"""
+            if self._destroyed:
+                return
+            
+            try:
+                # Process up to 10 updates per cycle to prevent blocking
+                updates_processed = 0
+                while not self._gui_update_queue.empty() and updates_processed < 10:
+                    try:
+                        update_func = self._gui_update_queue.get_nowait()
+                        if callable(update_func):
+                            update_func()
+                        updates_processed += 1
+                    except queue.Empty:
+                        break
+                    except Exception as e:
+                        print(f"Error processing GUI update: {e}")
+                
+            except Exception as e:
+                print(f"Error in GUI update processor: {e}")
+            
+            finally:
+                # Schedule next processing
+                if not self._destroyed and self.window and self.window.winfo_exists():
+                    self._gui_processor_timer = self.window.after(100, process_gui_updates)
+        
+        # Start the processor
+        if not self._destroyed:
+            self._gui_processor_timer = self.window.after(100, process_gui_updates)
+    
+    def schedule_gui_update(self, update_func):
+        """Thread-safely schedule a GUI update"""
+        if self._destroyed:
+            return
+        
+        try:
+            self._gui_update_queue.put_nowait(update_func)
+        except queue.Full:
+            # Queue is full, skip this update
+            print("GUI update queue full, skipping update")
     
     def create_widgets(self):
         """Create the log viewer interface"""
@@ -198,7 +250,7 @@ class LogViewerWindow:
                                   values=["ALL", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
                                   width=10, state="readonly")
         level_combo.pack(side='left', padx=(0, 10))
-        level_combo.bind('<<ComboboxSelected>>', self.on_filter_change)
+        level_combo.bind('<<ComboboxSelected>>', self.on_filter_change_safe)
         
         # Component filter
         ttk.Label(row1_frame, text="Component:").pack(side='left', padx=(0, 5))
@@ -206,7 +258,7 @@ class LogViewerWindow:
         self.component_combo = ttk.Combobox(row1_frame, textvariable=self.component_var, 
                                            width=15, state="readonly")
         self.component_combo.pack(side='left', padx=(0, 10))
-        self.component_combo.bind('<<ComboboxSelected>>', self.on_filter_change)
+        self.component_combo.bind('<<ComboboxSelected>>', self.on_filter_change_safe)
         
         # Row 2: Search and options
         row2_frame = ttk.Frame(filter_frame)
@@ -217,7 +269,7 @@ class LogViewerWindow:
         self.search_var = tk.StringVar()
         search_entry = ttk.Entry(row2_frame, textvariable=self.search_var, width=20)
         search_entry.pack(side='left', padx=(0, 10))
-        search_entry.bind('<KeyRelease>', self.on_search_change)
+        search_entry.bind('<KeyRelease>', self.on_search_change_safe)
         
         # Options
         ttk.Checkbutton(row2_frame, text="Auto-scroll", 
@@ -225,17 +277,17 @@ class LogViewerWindow:
         
         ttk.Checkbutton(row2_frame, text="Auto-refresh", 
                        variable=self.auto_refresh_var,
-                       command=self.toggle_auto_refresh).pack(side='left', padx=(10, 0))
+                       command=self.toggle_auto_refresh_safe).pack(side='left', padx=(10, 0))
         
         # Action buttons
         action_frame = ttk.Frame(control_frame)
         action_frame.pack(side='right')
         
-        ttk.Button(action_frame, text="Refresh Now", command=self.refresh_logs).pack(side='left', padx=2)
-        ttk.Button(action_frame, text="Clear Filters", command=self.clear_filters).pack(side='left', padx=2)
-        ttk.Button(action_frame, text="Export", command=self.export_logs).pack(side='left', padx=2)
-        ttk.Button(action_frame, text="Clear Logs", command=self.clear_logs).pack(side='left', padx=2)
-        ttk.Button(action_frame, text="Close", command=self.close_window).pack(side='left', padx=2)
+        ttk.Button(action_frame, text="Refresh Now", command=self.refresh_logs_safe).pack(side='left', padx=2)
+        ttk.Button(action_frame, text="Clear Filters", command=self.clear_filters_safe).pack(side='left', padx=2)
+        ttk.Button(action_frame, text="Export", command=self.export_logs_safe).pack(side='left', padx=2)
+        ttk.Button(action_frame, text="Clear Logs", command=self.clear_logs_safe).pack(side='left', padx=2)
+        ttk.Button(action_frame, text="Close", command=self.close_window_safe).pack(side='left', padx=2)
     
     def create_log_display(self, parent):
         """Create the log display area"""
@@ -274,7 +326,7 @@ class LogViewerWindow:
         log_frame.grid_columnconfigure(0, weight=1)
         
         # Bind double-click to show details
-        self.log_tree.bind('<Double-1>', self.show_log_details)
+        self.log_tree.bind('<Double-1>', self.show_log_details_safe)
         
         # Configure row colors based on log level
         self.log_tree.tag_configure('ERROR', background='#ffcccc')
@@ -293,106 +345,137 @@ class LogViewerWindow:
         status_bar.pack(side='left', fill='x', expand=True)
         
         # Connection status
-        self.connection_status_label = ttk.Label(status_frame, text="", font=('Arial', 8))
+        self.connection_status_label = ttk.Label(status_frame, text="Mode", font=('Arial', 8))
         self.connection_status_label.pack(side='right', padx=(5, 0))
     
     def add_debug_features(self):
         """Add debug features for testing logging"""
-        if self.log_manager.debug_mode:
-            # Add a debug frame to the control panel
-            debug_frame = ttk.LabelFrame(self.window, text="Debug Controls", padding=5)
-            debug_frame.pack(side='bottom', fill='x', padx=10, pady=(5, 10))
-            
-            ttk.Button(debug_frame, text="Generate Test Logs", 
-                      command=self.generate_test_logs).pack(side='left', padx=2)
-            ttk.Button(debug_frame, text="Test All Levels", 
-                      command=self.test_all_log_levels).pack(side='left', padx=2)
-            ttk.Button(debug_frame, text="Log Statistics", 
-                      command=self.show_log_statistics).pack(side='left', padx=2)
+        # Add a debug frame to the control panel
+        debug_frame = ttk.LabelFrame(self.window, text="Debug Controls", padding=5)
+        debug_frame.pack(side='bottom', fill='x', padx=10, pady=(5, 10))
+        
+        ttk.Button(debug_frame, text="Generate Test Logs", 
+                  command=self.generate_test_logs_safe).pack(side='left', padx=2)
+        ttk.Button(debug_frame, text="Test All Levels", 
+                  command=self.test_all_log_levels_safe).pack(side='left', padx=2)
+        ttk.Button(debug_frame, text="Log Statistics", 
+                  command=self.show_log_statistics_safe).pack(side='left', padx=2)
     
+    # Thread-safe event handlers
     def on_new_log_entry(self, log_entry: LogEntry):
-        """Handle new log entries from the callback (thread-safe)"""
+        """Thread-safe handler for new log entries"""
         if self._destroyed:
             return
         
-        # Put the log entry in the queue for processing on the main thread
-        try:
-            self.log_update_queue.put_nowait(log_entry)
-        except queue.Full:
-            pass  # Queue is full, skip this entry
+        def process_new_entry():
+            try:
+                if self.auto_refresh_var.get() and self.entry_matches_filters(log_entry):
+                    self.add_log_entry_to_tree(log_entry)
+                    
+                    # Auto-scroll if enabled
+                    if self.auto_scroll_var.get():
+                        children = self.log_tree.get_children()
+                        if children:
+                            self.log_tree.see(children[-1])
+                    
+                    # Update status display
+                    self.update_status_display()
+            except Exception as e:
+                print(f"Error processing new log entry: {e}")
         
-        # Schedule processing on the main thread
-        if self.window and self.window.winfo_exists():
-            self.window.after_idle(self.process_log_queue)
+        self.schedule_gui_update(process_new_entry)
     
-    def process_log_queue(self):
-        """Process queued log entries on the main thread"""
+    def on_filter_change_safe(self, event=None):
+        """Thread-safe filter change handler"""
+        def refresh_with_delay():
+            self.schedule_gui_update(self.refresh_logs)
+        
+        # Small delay to prevent rapid refreshes
+        if not self._destroyed:
+            self.window.after(200, refresh_with_delay)
+    
+    def on_search_change_safe(self, event=None):
+        """Thread-safe search change handler with debounce"""
         if self._destroyed:
             return
         
-        try:
-            # Process all queued log entries
-            new_entries = []
-            while not self.log_update_queue.empty():
-                try:
-                    entry = self.log_update_queue.get_nowait()
-                    new_entries.append(entry)
-                except queue.Empty:
-                    break
-            
-            if new_entries and self.auto_refresh_var.get():
-                # Add new entries to the display if they match current filters
-                for entry in new_entries:
-                    if self.entry_matches_filters(entry):
-                        self.add_log_entry_to_tree(entry)
-                
-                # Auto-scroll if enabled
-                if self.auto_scroll_var.get():
-                    children = self.log_tree.get_children()
-                    if children:
-                        self.log_tree.see(children[-1])
-                
-                # Update status
-                self.update_status_display()
-                
-        except Exception as e:
-            print(f"Error processing log queue: {e}")
+        if self._search_timer:
+            self.window.after_cancel(self._search_timer)
+        
+        def delayed_refresh():
+            self.schedule_gui_update(self.refresh_logs)
+        
+        self._search_timer = self.window.after(800, delayed_refresh)  # Longer delay to prevent hanging
     
-    def entry_matches_filters(self, entry: LogEntry) -> bool:
-        """Check if a log entry matches current filters"""
-        # Level filter
-        level_filter = self.level_var.get()
-        if level_filter != "ALL" and entry.level != level_filter:
-            return False
-        
-        # Component filter
-        component_filter = self.component_var.get()
-        if component_filter != "ALL" and entry.component != component_filter:
-            return False
-        
-        # Search filter
-        search_term = self.search_var.get().lower()
-        if search_term:
-            if (search_term not in entry.message.lower() and 
-                search_term not in entry.component.lower()):
-                return False
-        
-        return True
+    def refresh_logs_safe(self):
+        """Thread-safe refresh logs wrapper"""
+        self.schedule_gui_update(self.refresh_logs)
     
-    def add_log_entry_to_tree(self, entry: LogEntry):
-        """Add a single log entry to the tree"""
-        time_str = self.format_time(entry.timestamp)
-        message = self.truncate_message(entry.message, 100)
+    def clear_filters_safe(self):
+        """Thread-safe clear filters"""
+        def clear_filters():
+            self.level_var.set("ALL")
+            self.component_var.set("ALL")
+            self.search_var.set("")
+            self.refresh_logs()
         
-        # Determine row tag for coloring
-        tag = entry.level if entry.level in ['ERROR', 'CRITICAL', 'WARNING', 'DEBUG', 'INFO'] else ''
-        
-        self.log_tree.insert('', 'end', 
-                            values=(time_str, entry.level, entry.component, message),
-                            tags=(tag,))
+        self.schedule_gui_update(clear_filters)
     
+    def clear_logs_safe(self):
+        """Thread-safe clear logs"""
+        def confirm_and_clear():
+            if messagebox.askyesno("Clear Logs", 
+                                  "Are you sure you want to clear all logs from memory?\n\n"
+                                  "This will remove all log entries from the current session."):
+                self.log_manager.clear_logs()
+                self.refresh_logs()
+        
+        self.schedule_gui_update(confirm_and_clear)
+    
+    def export_logs_safe(self):
+        """Thread-safe export logs"""
+        def export_logs():
+            try:
+                filename = filedialog.asksaveasfilename(
+                    parent=self.window,
+                    title="Export Logs",
+                    defaultextension=".txt",
+                    filetypes=[("Text files", "*.txt"), ("JSON files", "*.json"), ("CSV files", "*.csv")]
+                )
+                
+                if filename:
+                    logs = self.get_filtered_logs()
+                    filepath = Path(filename)
+                    
+                    # Use the log manager's export functionality
+                    self.log_manager.export_logs(filepath, logs)
+                    
+                    messagebox.showinfo("Export Complete", f"Exported {len(logs)} logs to {filename}")
+                    
+            except Exception as e:
+                messagebox.showerror("Export Error", f"Failed to export logs: {e}")
+        
+        self.schedule_gui_update(export_logs)
+    
+    def show_log_details_safe(self, event):
+        """Thread-safe log details display"""
+        def show_details():
+            self.show_log_details(event)
+        
+        self.schedule_gui_update(show_details)
+    
+    def toggle_auto_refresh_safe(self):
+        """Thread-safe auto-refresh toggle"""
+        if self.auto_refresh_var.get():
+            self.start_auto_refresh()
+            self.live_indicator.configure(text="● LIVE", foreground='green')
+        else:
+            self.stop_auto_refresh()
+            self.live_indicator.configure(text="⏸ PAUSED", foreground='orange')
+    
+    # Core functionality methods (called from GUI thread only)
     def refresh_logs(self):
-        """Refresh the log display with comprehensive error handling"""
+        """Refresh the log display (GUI thread only)"""
         if self._destroyed or not self.window or not self.window.winfo_exists():
             return
         
@@ -401,18 +484,21 @@ class LogViewerWindow:
             for item in self.log_tree.get_children():
                 self.log_tree.delete(item)
             
-            # Get filtered logs
+            # Get filtered logs (limit to prevent hanging)
             logs = self.get_filtered_logs()
             
             # Update component filter options
             self.update_component_filter()
             
-            # Add logs to tree
-            for log in logs:
+            # Add logs to tree (limit to prevent UI freeze)
+            max_display_logs = 1000  # Prevent UI freeze with too many logs
+            display_logs = logs[:max_display_logs]
+            
+            for log in display_logs:
                 self.add_log_entry_to_tree(log)
             
             # Auto-scroll to bottom if enabled
-            if self.auto_scroll_var.get() and logs:
+            if self.auto_scroll_var.get() and display_logs:
                 children = self.log_tree.get_children()
                 if children:
                     self.log_tree.see(children[-1])
@@ -424,15 +510,57 @@ class LogViewerWindow:
             # Update last log count
             self.last_log_count = self.log_manager.get_log_count()
             
+            if len(logs) > max_display_logs:
+                self.status_var.set(f"Showing {max_display_logs} of {len(logs)} filtered logs")
+            
         except Exception as e:
             print(f"Error refreshing logs: {e}")
             self.status_var.set(f"Error refreshing logs: {e}")
     
+    def entry_matches_filters(self, entry: LogEntry) -> bool:
+        """Check if a log entry matches current filters"""
+        try:
+            # Level filter
+            level_filter = self.level_var.get()
+            if level_filter != "ALL" and entry.level != level_filter:
+                return False
+            
+            # Component filter
+            component_filter = self.component_var.get()
+            if component_filter != "ALL" and entry.component != component_filter:
+                return False
+            
+            # Search filter
+            search_term = self.search_var.get().lower()
+            if search_term:
+                if (search_term not in entry.message.lower() and 
+                    search_term not in entry.component.lower()):
+                    return False
+            
+            return True
+        except Exception:
+            return True  # Default to showing entry if filter check fails
+    
+    def add_log_entry_to_tree(self, entry: LogEntry):
+        """Add a single log entry to the tree"""
+        try:
+            time_str = self.format_time(entry.timestamp)
+            message = self.truncate_message(entry.message, 100)
+            
+            # Determine row tag for coloring
+            tag = entry.level if entry.level in ['ERROR', 'CRITICAL', 'WARNING', 'DEBUG', 'INFO'] else ''
+            
+            self.log_tree.insert('', 'end', 
+                                values=(time_str, entry.level, entry.component, message),
+                                tags=(tag,))
+        except Exception as e:
+            print(f"Error adding log entry to tree: {e}")
+    
     def update_component_filter(self):
         """Update the component filter dropdown"""
         try:
-            # Get all components from recent logs
-            recent_logs = self.log_manager.get_recent_logs(limit=1000)
+            # Get all components from recent logs (limit to prevent hanging)
+            recent_logs = self.log_manager.get_recent_logs(limit=500)
             components = sorted(set(log.component for log in recent_logs if log.component))
             
             current_value = self.component_var.get()
@@ -529,12 +657,12 @@ class LogViewerWindow:
     def get_filtered_logs(self) -> List[LogEntry]:
         """Get logs with current filters applied"""
         try:
-            # Get recent logs with filters
+            # Get recent logs with filters (limit to prevent hanging)
             level_filter = self.level_var.get() if self.level_var.get() != "ALL" else None
             component_filter = self.component_var.get() if self.component_var.get() != "ALL" else None
             
             logs = self.log_manager.get_recent_logs(
-                limit=1000, 
+                limit=2000,  # Increased but still limited
                 level_filter=level_filter,
                 component_filter=component_filter
             )
@@ -549,69 +677,6 @@ class LogViewerWindow:
         except Exception as e:
             print(f"Error getting filtered logs: {e}")
             return []
-    
-    def on_filter_change(self, event=None):
-        """Handle filter changes"""
-        if not self._destroyed:
-            self.refresh_logs()
-    
-    def on_search_change(self, event=None):
-        """Handle search changes with debounce"""
-        if self._destroyed:
-            return
-        
-        if self._search_timer:
-            self.window.after_cancel(self._search_timer)
-        
-        self._search_timer = self.window.after(500, self.refresh_logs)
-    
-    def clear_filters(self):
-        """Clear all filters"""
-        if self._destroyed:
-            return
-        
-        self.level_var.set("ALL")
-        self.component_var.set("ALL")
-        self.search_var.set("")
-        self.refresh_logs()
-    
-    def clear_logs(self):
-        """Clear all logs from memory"""
-        if messagebox.askyesno("Clear Logs", 
-                              "Are you sure you want to clear all logs from memory?\n\n"
-                              "This will remove all log entries from the current session."):
-            self.log_manager.clear_logs()
-            self.refresh_logs()
-    
-    def toggle_auto_refresh(self):
-        """Toggle auto-refresh functionality"""
-        if self.auto_refresh_var.get():
-            self.start_auto_refresh()
-            self.live_indicator.configure(text="● LIVE", foreground='green')
-        else:
-            self.stop_auto_refresh()
-            self.live_indicator.configure(text="⏸ PAUSED", foreground='orange')
-    
-    def start_auto_refresh(self):
-        """Start auto-refresh timer"""
-        if not self._destroyed and self.window and self.window.winfo_exists():
-            try:
-                # Only refresh if there are new logs
-                current_count = self.log_manager.get_log_count()
-                if current_count != self.last_log_count and self.auto_refresh_var.get():
-                    self.refresh_logs()
-                
-                # Schedule next refresh
-                if self.auto_refresh_var.get():
-                    self._refresh_timer = self.window.after(self.refresh_interval, self.start_auto_refresh)
-            except Exception as e:
-                print(f"Error in auto-refresh: {e}")
-    
-    def stop_auto_refresh(self):
-        """Stop auto-refresh timer"""
-        if self._refresh_timer:
-            self.window.after_cancel(self._refresh_timer)
-            self._refresh_timer = None
     
     def show_log_details(self, event):
         """Show detailed log information"""
@@ -689,71 +754,99 @@ Message:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to show log details: {e}")
     
-    def export_logs(self):
-        """Export logs to file"""
-        if self._destroyed:
-            return
-        
-        try:
-            filename = filedialog.asksaveasfilename(
-                parent=self.window,
-                title="Export Logs",
-                defaultextension=".txt",
-                filetypes=[("Text files", "*.txt"), ("JSON files", "*.json"), ("CSV files", "*.csv")]
-            )
+    def start_auto_refresh(self):
+        """Start auto-refresh timer with thread safety"""
+        def auto_refresh():
+            if self._destroyed or not self.window or not self.window.winfo_exists():
+                return
             
-            if filename:
-                logs = self.get_filtered_logs()
-                filepath = Path(filename)
+            try:
+                # Only refresh if there are new logs and auto-refresh is enabled
+                current_count = self.log_manager.get_log_count()
+                if (current_count != self.last_log_count and 
+                    self.auto_refresh_var.get() and 
+                    not self._destroyed):
+                    
+                    self.schedule_gui_update(self.refresh_logs)
                 
-                # Use the log manager's export functionality
-                self.log_manager.export_logs(filepath, logs)
+                # Schedule next refresh
+                if self.auto_refresh_var.get() and not self._destroyed:
+                    self._refresh_timer = self.window.after(self.refresh_interval, auto_refresh)
+                    
+            except Exception as e:
+                print(f"Error in auto-refresh: {e}")
+        
+        if not self._destroyed:
+            auto_refresh()
+    
+    def stop_auto_refresh(self):
+        """Stop auto-refresh timer"""
+        if self._refresh_timer:
+            self.window.after_cancel(self._refresh_timer)
+            self._refresh_timer = None
+    
+    # Thread-safe debug methods
+    def generate_test_logs_safe(self):
+        """Thread-safe test log generation"""
+        def generate_logs():
+            try:
+                self.log_manager.test_logging()
+            except Exception as e:
+                print(f"Error generating test logs: {e}")
+        
+        # Run in background thread to prevent GUI blocking
+        threading.Thread(target=generate_logs, daemon=True, name="TestLogGeneration").start()
+    
+    def test_all_log_levels_safe(self):
+        """Thread-safe test all log levels - FIXED VERSION"""
+        def test_levels():
+            try:
+                components = ["Test", "GUI", "Database", "Connection", "Operation", "Export"]
+                levels = [
+                    LogLevel.DEBUG,     # Fixed: Use imported LogLevel, not self.log_manager.LogLevel
+                    LogLevel.INFO, 
+                    LogLevel.WARNING,
+                    LogLevel.ERROR,
+                    LogLevel.CRITICAL
+                ]
                 
-                messagebox.showinfo("Export Complete", f"Exported {len(logs)} logs to {filename}")
+                for i, component in enumerate(components):
+                    for j, level in enumerate(levels):
+                        message = f"Test {level.value} message from {component} component"
+                        details = {"test_number": i * len(levels) + j, "component": component, "level": level.value}
+                        self.log_manager.log(level, component, message, details)
+                        
+                        # Small delay to prevent overwhelming the system
+                        time.sleep(0.01)
+                        
+            except Exception as e:
+                print(f"Error testing log levels: {e}")
+                # Log the error using the correct LogLevel import
+                self.log_manager.log(LogLevel.ERROR, "TestLogLevels", f"Error in test: {e}")
+        
+        # Run in background thread
+        threading.Thread(target=test_levels, daemon=True, name="TestLogLevels").start()
+    
+    def show_log_statistics_safe(self):
+        """Thread-safe log statistics display"""
+        def show_stats():
+            try:
+                stats = self.log_manager.get_log_statistics()
                 
-        except Exception as e:
-            messagebox.showerror("Export Error", f"Failed to export logs: {e}")
-    
-    # Debug functions
-    def generate_test_logs(self):
-        """Generate test logs for debugging"""
-        self.log_manager.test_logging()
-    
-    def test_all_log_levels(self):
-        """Test all log levels with various components"""
-        components = ["Test", "GUI", "Database", "Connection", "Operation", "Export"]
-        levels = [
-            self.log_manager.LogLevel.DEBUG,
-            self.log_manager.LogLevel.INFO, 
-            self.log_manager.LogLevel.WARNING,
-            self.log_manager.LogLevel.ERROR,
-            self.log_manager.LogLevel.CRITICAL
-        ]
-        
-        for i, component in enumerate(components):
-            for j, level in enumerate(levels):
-                message = f"Test {level.value} message from {component} component"
-                details = {"test_number": i * len(levels) + j, "component": component, "level": level.value}
-                self.log_manager.log(level, component, message, details)
-    
-    def show_log_statistics(self):
-        """Show detailed log statistics"""
-        stats = self.log_manager.get_log_statistics()
-        
-        # Create statistics window
-        stats_window = tk.Toplevel(self.window)
-        stats_window.title("Log Statistics")
-        stats_window.geometry("500x400")
-        stats_window.transient(self.window)
-        
-        # Create text widget
-        from tkinter import scrolledtext
-        text_widget = scrolledtext.ScrolledText(stats_window, wrap=tk.WORD, font=('Consolas', 10))
-        text_widget.pack(fill='both', expand=True, padx=10, pady=10)
-        
-        # Format statistics
-        stats_text = f"""Log Statistics
-==============
+                # Create statistics window
+                stats_window = tk.Toplevel(self.window)
+                stats_window.title("Log Statistics")
+                stats_window.geometry("500x400")
+                stats_window.transient(self.window)
+                
+                # Create text widget
+                from tkinter import scrolledtext
+                text_widget = scrolledtext.ScrolledText(stats_window, wrap=tk.WORD, font=('Consolas', 10))
+                text_widget.pack(fill='both', expand=True, padx=10, pady=10)
+                
+                # Format statistics
+                stats_text = f"""Log Statistics (Thread-Safe Mode)
+=====================================
 
 Total Entries: {stats['total_logs']:,}
 Session ID: {stats.get('session_id', 'Unknown')}
@@ -768,23 +861,34 @@ Time Range:
 By Level:
 {'-' * 20}
 """
+                
+                for level, count in sorted(stats.get('by_level', {}).items()):
+                    percentage = (count / stats['total_logs']) * 100 if stats['total_logs'] > 0 else 0
+                    stats_text += f"{level:10}: {count:6,} ({percentage:5.1f}%)\n"
+                
+                stats_text += f"\nBy Component:\n{'-' * 20}\n"
+                
+                for component, count in sorted(stats.get('by_component', {}).items(), key=lambda x: x[1], reverse=True):
+                    percentage = (count / stats['total_logs']) * 100 if stats['total_logs'] > 0 else 0
+                    stats_text += f"{component:15}: {count:6,} ({percentage:5.1f}%)\n"
+                
+                text_widget.insert('1.0', stats_text)
+                text_widget.configure(state='disabled')
+                
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to show statistics: {e}")
         
-        for level, count in sorted(stats.get('by_level', {}).items()):
-            percentage = (count / stats['total_logs']) * 100 if stats['total_logs'] > 0 else 0
-            stats_text += f"{level:10}: {count:6,} ({percentage:5.1f}%)\n"
-        
-        stats_text += f"\nBy Component:\n{'-' * 20}\n"
-        
-        for component, count in sorted(stats.get('by_component', {}).items(), key=lambda x: x[1], reverse=True):
-            percentage = (count / stats['total_logs']) * 100 if stats['total_logs'] > 0 else 0
-            stats_text += f"{component:15}: {count:6,} ({percentage:5.1f}%)\n"
-        
-        text_widget.insert('1.0', stats_text)
-        text_widget.configure(state='disabled')
+        self.schedule_gui_update(show_stats)
+
+
+# Backward compatibility class that uses the thread-safe version
+class LogViewerWindow(LogViewerWindow):
+    """Backward compatibility wrapper for the thread-safe log viewer"""
+    pass
 
 
 class LogStatsWindow:
-    """Enhanced log statistics window"""
+    """Thread-safe log statistics window"""
     
     def __init__(self, parent, log_manager: LogManager):
         self.parent = parent
@@ -799,7 +903,7 @@ class LogStatsWindow:
     def create_window(self):
         """Create the statistics window"""
         self.window = tk.Toplevel(self.parent)
-        self.window.title("Log Statistics & Analysis")
+        self.window.title("Log Statistics & Analysis (Thread-Safe)")
         self.window.geometry("700x600")
         self.window.minsize(600, 500)
         
@@ -858,7 +962,7 @@ class LogStatsWindow:
         header_frame = ttk.Frame(main_container)
         header_frame.pack(fill='x', pady=(0, 10))
         
-        ttk.Label(header_frame, text="Log Statistics & Analysis", 
+        ttk.Label(header_frame, text="Log Statistics & Analysis (Thread-Safe)", 
                  font=('Arial', 16, 'bold')).pack(side='left')
         
         ttk.Button(header_frame, text="Refresh", command=self.update_stats).pack(side='right')
@@ -877,25 +981,38 @@ class LogStatsWindow:
         if self._destroyed:
             return
         
-        try:
-            stats = self.log_manager.get_log_statistics()
-            logs = self.log_manager.get_recent_logs(limit=1000)
-            
-            if not logs:
-                self.stats_text.delete('1.0', tk.END)
-                self.stats_text.insert('1.0', "No log entries available.")
-                return
-            
-            # Generate comprehensive statistics
-            stats_text = self.generate_comprehensive_stats(stats, logs)
-            
-            # Update display
-            self.stats_text.delete('1.0', tk.END)
-            self.stats_text.insert('1.0', stats_text)
-            
-        except Exception as e:
-            self.stats_text.delete('1.0', tk.END)
-            self.stats_text.insert('1.0', f"Error generating statistics: {e}")
+        def update_in_background():
+            """Update stats in background thread to prevent hanging"""
+            try:
+                stats = self.log_manager.get_log_statistics()
+                logs = self.log_manager.get_recent_logs(limit=1000)  # Limit to prevent hanging
+                
+                if not logs:
+                    stats_text = "No log entries available."
+                else:
+                    stats_text = self.generate_comprehensive_stats(stats, logs)
+                
+                # Schedule GUI update
+                def update_display():
+                    if not self._destroyed:
+                        self.stats_text.delete('1.0', tk.END)
+                        self.stats_text.insert('1.0', stats_text)
+                
+                if not self._destroyed and self.window and self.window.winfo_exists():
+                    self.window.after(0, update_display)
+                
+            except Exception as e:
+                error_text = f"Error generating statistics: {e}"
+                def show_error():
+                    if not self._destroyed:
+                        self.stats_text.delete('1.0', tk.END)
+                        self.stats_text.insert('1.0', error_text)
+                
+                if not self._destroyed and self.window and self.window.winfo_exists():
+                    self.window.after(0, show_error)
+        
+        # Run stats generation in background to prevent GUI blocking
+        threading.Thread(target=update_in_background, daemon=True, name="StatsUpdate").start()
     
     def generate_comprehensive_stats(self, stats: dict, logs: List[LogEntry]) -> str:
         """Generate comprehensive statistics report"""
@@ -928,17 +1045,18 @@ class LogStatsWindow:
         recent_errors = [log for log in recent_activity if log.level in ['ERROR', 'CRITICAL']]
         
         # Generate report
-        report = f"""Log Statistics & Analysis Report
-==============================
+        report = f"""Log Statistics & Analysis Report (Thread-Safe Mode)
+==================================================
 
 Session Information:
   Session ID: {stats.get('session_id', 'Unknown')}
   Current Log Level: {stats['current_level']}
   Debug Mode: {'Enabled' if stats['debug_mode'] else 'Disabled'}
   Console Logging: {'Enabled' if stats['console_enabled'] else 'Disabled'}
+  Thread-Safe Mode: Enabled
 
 Data Summary:
-  Total Entries: {total_logs:,}
+  Total Entries: {total_logs:,} (limited to recent 1000 for performance)
   Time Span: {duration_str}
   Oldest Entry: {oldest}
   Newest Entry: {newest}
@@ -948,14 +1066,19 @@ Level Distribution:
 """
         
         for level, count in sorted(by_level.items()):
-            percentage = (count / total_logs) * 100
+            percentage = (count / total_logs) * 100 if total_logs > 0 else 0
             report += f"  {level:10}: {count:6,} ({percentage:5.1f}%)\n"
         
         report += f"\nComponent Activity:\n{'-' * 30}\n"
         
-        for component, count in sorted(by_component.items(), key=lambda x: x[1], reverse=True):
-            percentage = (count / total_logs) * 100
+        # Limit component display to prevent huge output
+        sorted_components = sorted(by_component.items(), key=lambda x: x[1], reverse=True)[:20]
+        for component, count in sorted_components:
+            percentage = (count / total_logs) * 100 if total_logs > 0 else 0
             report += f"  {component:15}: {count:6,} ({percentage:5.1f}%)\n"
+        
+        if len(by_component) > 20:
+            report += f"  ... and {len(by_component) - 20} more components\n"
         
         report += f"\nError Analysis:\n{'-' * 30}\n"
         report += f"  Total Errors: {len(error_logs):,}\n"
@@ -985,5 +1108,6 @@ Level Distribution:
         report += f"  Overall Health: {health}\n"
         report += f"  Error Rate: {error_rate:.2f}%\n"
         report += f"  Warning Rate: {warning_rate:.2f}%\n"
+        report += f"  Thread Safety: Enabled\n"
         
         return report
