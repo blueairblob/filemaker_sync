@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 # FILE: gui/filemaker_gui.py
 """
-Enhanced FileMaker Sync GUI - COMPACT VERSION
-Compact layout with larger section fonts and no redundant titles
+Complete Working FileMaker Sync GUI with Debug Configuration
 """
 
 import tkinter as tk
@@ -16,37 +15,88 @@ import threading
 import subprocess
 
 # Import our modules
-from gui_logging import LogManager, LogLevel
+from gui_logging import LogManager, LogLevel, PerformanceLogger
 from gui_widgets import StatusCard, MigrationOverview, QuickActions, StatusBar
 from gui_operations import OperationManager, ConnectionTester, StatusManager
 from gui_logviewer import LogViewerWindow, LogStatsWindow
 
 class ConfigurationWindow:
-    """Configuration management window for TOML config"""
+    """Enhanced configuration management window with debug options"""
     
     def __init__(self, parent, config_file: str = 'config.toml', on_save_callback=None):
         self.parent = parent
         self.config_file = Path(config_file)
         self.on_save_callback = on_save_callback
+        self.window = None
+        self._destroyed = False
         
-        self.window = tk.Toplevel(parent)
-        self.window.title("Configuration Settings")
-        self.window.geometry("600x500")
-        self.window.transient(parent)
-        self.window.grab_set()
-        
+        self.create_window()
         self.create_widgets()
         self.load_config_values()
     
+    def create_window(self):
+        """Create the configuration window"""
+        self.window = tk.Toplevel(self.parent)
+        self.window.title("Configuration Settings")
+        self.window.geometry("650x600")
+        self.window.minsize(500, 500)
+        
+        # Set window management
+        self.window.protocol("WM_DELETE_WINDOW", self.close_window)
+        self.window.transient(self.parent)
+        
+        # Center on parent
+        self.center_on_parent()
+        
+        # Bring to front
+        self.window.lift()
+        self.window.focus_force()
+    
+    def center_on_parent(self):
+        """Center window on parent"""
+        try:
+            self.window.update_idletasks()
+            
+            parent_x = self.parent.winfo_rootx()
+            parent_y = self.parent.winfo_rooty()
+            parent_width = self.parent.winfo_width()
+            parent_height = self.parent.winfo_height()
+            
+            window_width = self.window.winfo_width()
+            window_height = self.window.winfo_height()
+            
+            x = parent_x + (parent_width - window_width) // 2
+            y = parent_y + (parent_height - window_height) // 2
+            
+            self.window.geometry(f"+{x}+{y}")
+        except:
+            pass
+    
+    def close_window(self):
+        """Close the window properly"""
+        if self._destroyed:
+            return
+        
+        self._destroyed = True
+        
+        try:
+            if self.window and self.window.winfo_exists():
+                self.window.destroy()
+        except:
+            pass
+    
     def create_widgets(self):
-        """Create configuration interface"""
+        """Create configuration interface with debug options"""
+        if self._destroyed:
+            return
+        
         main_frame = ttk.Frame(self.window)
         main_frame.pack(fill='both', expand=True, padx=10, pady=10)
         
         # Info label
         info_label = ttk.Label(main_frame, 
-                              text="Edit config.toml directly for advanced settings. This dialog shows key connection settings.",
-                              font=('Arial', 9), foreground='gray')
+                              text="Configure connection settings and application behavior.",
+                              font=('Arial', 9), foreground='gray', wraplength=600)
         info_label.pack(pady=(0, 10))
         
         # Create notebook for different config sections
@@ -55,31 +105,35 @@ class ConfigurationWindow:
         
         # Source Database tab
         source_frame = ttk.Frame(notebook)
-        notebook.add(source_frame, text="Source Database")
+        notebook.add(source_frame, text="FileMaker")
         self.create_source_tab(source_frame)
         
         # Target Database tab
         target_frame = ttk.Frame(notebook)
-        notebook.add(target_frame, text="Target Database")
+        notebook.add(target_frame, text="Supabase")
         self.create_target_tab(target_frame)
         
         # Export Settings tab
         export_frame = ttk.Frame(notebook)
-        notebook.add(export_frame, text="Export Settings")
+        notebook.add(export_frame, text="Export")
         self.create_export_tab(export_frame)
+        
+        # Debug & Logging tab
+        debug_frame = ttk.Frame(notebook)
+        notebook.add(debug_frame, text="Debug & Logging")
+        self.create_debug_tab(debug_frame)
         
         # Button frame
         button_frame = ttk.Frame(main_frame)
         button_frame.pack(fill='x')
         
-        ttk.Button(button_frame, text="Cancel", command=self.window.destroy).pack(side='right', padx=(5, 0))
-        ttk.Button(button_frame, text="Save to TOML", command=self.save_config).pack(side='right')
-        ttk.Button(button_frame, text="Open config.toml", command=self.open_config_file).pack(side='left')
+        ttk.Button(button_frame, text="Cancel", command=self.close_window).pack(side='right', padx=(5, 0))
+        ttk.Button(button_frame, text="Save", command=self.save_config).pack(side='right')
+        ttk.Button(button_frame, text="Open File", command=self.open_config_file).pack(side='left')
     
     def create_source_tab(self, parent):
         """Create source database configuration tab"""
-        # FileMaker settings
-        fm_frame = ttk.LabelFrame(parent, text="FileMaker Pro Settings", padding=10)
+        fm_frame = ttk.LabelFrame(parent, text="FileMaker Pro Connection", padding=10)
         fm_frame.pack(fill='x', padx=10, pady=10)
         
         ttk.Label(fm_frame, text="DSN Name:").grid(row=0, column=0, sticky='w', pady=2)
@@ -98,8 +152,7 @@ class ConfigurationWindow:
     
     def create_target_tab(self, parent):
         """Create target database configuration tab"""
-        # Supabase settings
-        sb_frame = ttk.LabelFrame(parent, text="Supabase Settings", padding=10)
+        sb_frame = ttk.LabelFrame(parent, text="Supabase Connection", padding=10)
         sb_frame.pack(fill='x', padx=10, pady=10)
         
         ttk.Label(sb_frame, text="Host:").grid(row=0, column=0, sticky='w', pady=2)
@@ -126,7 +179,6 @@ class ConfigurationWindow:
     
     def create_export_tab(self, parent):
         """Create export settings configuration tab"""
-        # Export settings
         exp_frame = ttk.LabelFrame(parent, text="Export Settings", padding=10)
         exp_frame.pack(fill='x', padx=10, pady=10)
         
@@ -138,7 +190,7 @@ class ConfigurationWindow:
         ttk.Entry(path_frame, textvariable=self.export_path_var, width=35).pack(side='left', fill='x', expand=True)
         ttk.Button(path_frame, text="Browse", command=self.browse_export_path, width=8).pack(side='right', padx=(5, 0))
         
-        ttk.Label(exp_frame, text="Prefix:").grid(row=1, column=0, sticky='w', pady=2)
+        ttk.Label(exp_frame, text="File Prefix:").grid(row=1, column=0, sticky='w', pady=2)
         self.export_prefix_var = tk.StringVar()
         ttk.Entry(exp_frame, textvariable=self.export_prefix_var, width=30).grid(row=1, column=1, padx=(10, 0), pady=2, sticky='ew')
         
@@ -153,6 +205,49 @@ class ConfigurationWindow:
         ttk.Checkbutton(format_frame, text="WebP", variable=self.webp_var).pack(side='left', padx=(10, 0))
         
         exp_frame.columnconfigure(1, weight=1)
+    
+    def create_debug_tab(self, parent):
+        """Create debug and logging configuration tab"""
+        # Logging Level Section
+        log_frame = ttk.LabelFrame(parent, text="Logging Configuration", padding=10)
+        log_frame.pack(fill='x', padx=10, pady=10)
+        
+        ttk.Label(log_frame, text="Log Level:").grid(row=0, column=0, sticky='w', pady=2)
+        self.log_level_var = tk.StringVar()
+        log_combo = ttk.Combobox(log_frame, textvariable=self.log_level_var, 
+                                values=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+                                width=15, state="readonly")
+        log_combo.grid(row=0, column=1, padx=(10, 0), pady=2, sticky='w')
+        
+        ttk.Label(log_frame, text="Console Output:").grid(row=1, column=0, sticky='w', pady=2)
+        self.console_logging_var = tk.BooleanVar()
+        ttk.Checkbutton(log_frame, text="Show logs in console", variable=self.console_logging_var).grid(row=1, column=1, padx=(10, 0), pady=2, sticky='w')
+        
+        ttk.Label(log_frame, text="Max Log Entries:").grid(row=2, column=0, sticky='w', pady=2)
+        self.max_log_entries_var = tk.StringVar()
+        ttk.Entry(log_frame, textvariable=self.max_log_entries_var, width=10).grid(row=2, column=1, padx=(10, 0), pady=2, sticky='w')
+        
+        # Debug Options Section
+        debug_frame = ttk.LabelFrame(parent, text="Debug Options", padding=10)
+        debug_frame.pack(fill='x', padx=10, pady=10)
+        
+        self.debug_mode_var = tk.BooleanVar()
+        ttk.Checkbutton(debug_frame, text="Enable Debug Mode", variable=self.debug_mode_var, 
+                       command=self.on_debug_mode_change).grid(row=0, column=0, sticky='w', pady=2)
+        
+        self.verbose_sql_var = tk.BooleanVar()
+        ttk.Checkbutton(debug_frame, text="Log SQL Queries", variable=self.verbose_sql_var).grid(row=1, column=0, sticky='w', pady=2)
+        
+        self.debug_connections_var = tk.BooleanVar()
+        ttk.Checkbutton(debug_frame, text="Debug Database Connections", variable=self.debug_connections_var).grid(row=2, column=0, sticky='w', pady=2)
+    
+    def on_debug_mode_change(self):
+        """Handle debug mode checkbox change"""
+        if self.debug_mode_var.get():
+            self.log_level_var.set("DEBUG")
+            self.console_logging_var.set(True)
+        else:
+            self.log_level_var.set("INFO")
     
     def load_config_values(self):
         """Load current configuration values from TOML file"""
@@ -181,7 +276,7 @@ class ConfigurationWindow:
                 
                 # Export settings
                 export = config.get('export', {})
-                self.export_path_var.set(export.get('path', ''))
+                self.export_path_var.set(export.get('path', './exports'))
                 self.export_prefix_var.set(export.get('prefix', 'rat'))
                 
                 # Image formats
@@ -189,8 +284,22 @@ class ConfigurationWindow:
                 self.jpg_var.set('jpg' in formats)
                 self.webp_var.set('webp' in formats)
                 
+                # Debug settings
+                debug_settings = config.get('debug', {})
+                self.log_level_var.set(debug_settings.get('log_level', 'INFO'))
+                self.console_logging_var.set(debug_settings.get('console_logging', False))
+                self.max_log_entries_var.set(str(debug_settings.get('max_log_entries', 1000)))
+                self.debug_mode_var.set(debug_settings.get('debug_mode', False))
+                self.verbose_sql_var.set(debug_settings.get('verbose_sql', False))
+                self.debug_connections_var.set(debug_settings.get('debug_connections', False))
+                
         except Exception as e:
             messagebox.showwarning("Config Load Error", f"Could not load config.toml: {e}")
+            # Set defaults
+            self.log_level_var.set("INFO")
+            self.console_logging_var.set(False)
+            self.max_log_entries_var.set("1000")
+            self.debug_mode_var.set(False)
     
     def browse_export_path(self):
         """Browse for export path"""
@@ -201,86 +310,67 @@ class ConfigurationWindow:
     def save_config(self):
         """Save configuration changes to TOML file"""
         try:
-            # Read existing config
-            import tomli
-            config = {}
-            if self.config_file.exists():
-                with open(self.config_file, 'rb') as f:
-                    config = tomli.load(f)
-            
-            # Update with new values
-            if 'database' not in config:
-                config['database'] = {}
-            if 'source' not in config['database']:
-                config['database']['source'] = {}
-            if 'target' not in config['database']:
-                config['database']['target'] = {}
-            if 'export' not in config:
-                config['export'] = {}
-            
-            # Update source
-            config['database']['source'].update({
-                'dsn': self.fm_dsn_var.get(),
-                'user': self.fm_user_var.get(),
-                'pwd': self.fm_pwd_var.get()
-            })
-            
-            # Update target
-            db_type = config['database']['target'].get('db', 'supabase')
-            if db_type not in config['database']['target']:
-                config['database']['target'][db_type] = {}
-            
-            config['database']['target'].update({
-                'host': self.sb_host_var.get(),
-                'dsn': self.sb_db_var.get()
-            })
-            config['database']['target'][db_type].update({
-                'user': self.sb_user_var.get(),
-                'pwd': self.sb_pwd_var.get(),
-                'port': self.sb_port_var.get()
-            })
-            
-            # Update export
+            # Build image formats list
             formats = []
             if self.jpg_var.get():
                 formats.append('jpg')
             if self.webp_var.get():
                 formats.append('webp')
             
-            config['export'].update({
-                'path': self.export_path_var.get(),
-                'prefix': self.export_prefix_var.get(),
-                'image_formats_supported': formats
-            })
+            # Enhanced TOML configuration with debug settings
+            config_content = f"""# FileMaker Sync Configuration
+# Updated: {datetime.now().isoformat()}
+
+[database.source]
+dsn = "{self.fm_dsn_var.get()}"
+user = "{self.fm_user_var.get()}"
+pwd = "{self.fm_pwd_var.get()}"
+host = "127.0.0.1"
+port = ""
+type = "odbc"
+name = ["fmp", "FileMaker Pro"]
+schema = ["FileMaker_Tables", "FileMaker_Fields", "FileMaker_BaseTableFields"]
+
+[database.target]
+dsn = "{self.sb_db_var.get()}"
+db = "supabase"
+dt = "%Y%m%d %H:%M:%S"
+type = "url"
+host = "{self.sb_host_var.get()}"
+schema = ["rat_migration", "rat"]
+mig_schema = 0
+tgt_schema = 1
+user = "migration_user"
+
+[database.target.supabase]
+name = ["supabase", "Supabase"]
+user = "{self.sb_user_var.get()}"
+pwd = "{self.sb_pwd_var.get()}"
+port = "{self.sb_port_var.get()}"
+
+[export]
+path = "{self.export_path_var.get()}"
+prefix = "{self.export_prefix_var.get()}"
+image_formats_supported = {formats}
+image_path = "images"
+
+[debug]
+log_level = "{self.log_level_var.get()}"
+console_logging = {str(self.console_logging_var.get()).lower()}
+max_log_entries = {self.max_log_entries_var.get()}
+debug_mode = {str(self.debug_mode_var.get()).lower()}
+verbose_sql = {str(self.verbose_sql_var.get()).lower()}
+debug_connections = {str(self.debug_connections_var.get()).lower()}
+"""
             
-            # Write back to TOML file
-            try:
-                import tomli_w
-                with open(self.config_file, 'wb') as f:
-                    tomli_w.dump(config, f)
-            except ImportError:
-                # Fallback: write as text (less robust but works)
-                with open(self.config_file, 'w') as f:
-                    f.write("# Configuration updated via GUI\n")
-                    f.write(f"# Updated: {datetime.now().isoformat()}\n\n")
-                    # Write basic structure - user should edit manually for complex configs
-                    f.write("[database.source]\n")
-                    f.write(f'dsn = "{self.fm_dsn_var.get()}"\n')
-                    f.write(f'user = "{self.fm_user_var.get()}"\n')
-                    f.write(f'pwd = "{self.fm_pwd_var.get()}"\n\n')
-                    f.write("[database.target]\n")
-                    f.write(f'host = "{self.sb_host_var.get()}"\n')
-                    f.write(f'dsn = "{self.sb_db_var.get()}"\n\n')
-                    f.write(f"[database.target.supabase]\n")
-                    f.write(f'user = "{self.sb_user_var.get()}"\n')
-                    f.write(f'pwd = "{self.sb_pwd_var.get()}"\n')
-                    f.write(f'port = "{self.sb_port_var.get()}"\n\n')
+            with open(self.config_file, 'w') as f:
+                f.write(config_content)
             
             if self.on_save_callback:
                 self.on_save_callback()
             
-            messagebox.showinfo("Success", "Configuration saved to config.toml!")
-            self.window.destroy()
+            messagebox.showinfo("Success", "Configuration saved successfully!\n\nRestart the application for debug settings to take full effect.")
+            self.close_window()
             
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save configuration: {e}")
@@ -297,25 +387,27 @@ class ConfigurationWindow:
         except Exception as e:
             messagebox.showerror("Error", f"Could not open config file: {e}")
 
+
 class FileMakerSyncGUI:
-    """Enhanced FileMaker Sync GUI - COMPACT VERSION"""
+    """FileMaker Sync GUI with configurable debug support"""
     
     def __init__(self, root):
         self.root = root
         self.root.title("FileMaker Sync Dashboard")
-        self.root.geometry("1000x650")  # Slightly smaller due to compact layout
+        self.root.geometry("1000x650")
         self.root.minsize(800, 550)
         
-        # Initialize core systems
-        self.log_manager = LogManager()
+        # Load configuration first
+        self.config = self.load_configuration()
+        
+        # Initialize core systems with configuration
+        self.log_manager = LogManager(config=self.config)
         self.operation_manager = OperationManager(self.log_manager)
         self.connection_tester = ConnectionTester(self.operation_manager)
         self.status_manager = StatusManager(self.operation_manager)
         
-        # Windows
-        self.log_viewer_window = None
-        self.log_stats_window = None
-        self.config_window = None
+        # Child window references
+        self.child_windows = {}
         
         # Initialize GUI
         self.create_widgets()
@@ -328,8 +420,46 @@ class FileMakerSyncGUI:
         # Log startup
         self.log_manager.log(LogLevel.INFO, "Application", "FileMaker Sync Dashboard started")
     
+    def load_configuration(self) -> dict:
+        """Load configuration from TOML file with defaults"""
+        config_file = Path('config.toml')
+        default_config = {
+            'debug': {
+                'log_level': 'INFO',
+                'console_logging': False,
+                'max_log_entries': 1000,
+                'debug_mode': False,
+                'verbose_sql': False,
+                'debug_connections': False
+            }
+        }
+        
+        if not config_file.exists():
+            return default_config
+        
+        try:
+            import tomli
+            with open(config_file, 'rb') as f:
+                config = tomli.load(f)
+            
+            # Merge with defaults
+            merged_config = default_config.copy()
+            if 'debug' in config:
+                merged_config['debug'].update(config['debug'])
+            
+            # Include other config sections
+            for key, value in config.items():
+                if key != 'debug':
+                    merged_config[key] = value
+            
+            return merged_config
+            
+        except Exception as e:
+            print(f"Error loading config: {e}, using defaults")
+            return default_config
+    
     def create_widgets(self):
-        """Create the main dashboard layout - COMPACT VERSION"""
+        """Create the main dashboard layout"""
         # Configure root
         self.root.configure(bg='#f0f0f0')
         
@@ -362,25 +492,27 @@ class FileMakerSyncGUI:
                                font=('Arial', 18, 'bold'))
         title_label.pack(side='left')
         
-        subtitle_label = ttk.Label(header_frame, 
-                                  text="Monitor and manage your FileMaker to Supabase migration",
-                                  font=('Arial', 9))
+        subtitle_text = "Monitor and manage your FileMaker to Supabase migration"
+        if self.config.get('debug', {}).get('debug_mode', False):
+            log_level = self.config.get('debug', {}).get('log_level', 'INFO')
+            subtitle_text += f" | Log Level: {log_level}"
+        
+        subtitle_label = ttk.Label(header_frame, text=subtitle_text, font=('Arial', 9))
         subtitle_label.pack(side='left', padx=(20, 0))
         
-        # Activity log button (clock icon)
+        # Activity log button
         activity_button = ttk.Button(header_frame, text="🕒", width=3, 
                                     command=self.open_log_viewer)
         activity_button.pack(side='right', padx=(0, 10))
         
-        # Add tooltip-like label for the button
         ttk.Label(header_frame, text="Activity Log", font=('Arial', 8)).pack(side='right')
     
     def create_connection_status(self, parent):
-        """Create connection status section - COMPACT"""
+        """Create connection status section"""
         conn_frame = ttk.Frame(parent)
         conn_frame.pack(fill='x', pady=(0, 15))
         
-        # LARGER SECTION FONTS - Use LabelFrame with bigger font
+        # Configure style for larger fonts
         style = ttk.Style()
         style.configure('Large.TLabelframe.Label', font=('Arial', 12, 'bold'))
         
@@ -401,7 +533,7 @@ class FileMakerSyncGUI:
         self.target_status_card.pack(fill='x')
     
     def create_main_content(self, parent):
-        """Create main content area - SUPER COMPACT VERSION"""
+        """Create main content area"""
         content_frame = ttk.Frame(parent)
         content_frame.pack(fill='both', expand=True)
         
@@ -409,7 +541,7 @@ class FileMakerSyncGUI:
         style = ttk.Style()
         style.configure('Large.TLabelframe.Label', font=('Arial', 12, 'bold'))
         
-        # Migration Overview - MINIMAL padding
+        # Migration Overview
         migration_frame = ttk.LabelFrame(content_frame, text="Migration Overview", 
                                         style='Large.TLabelframe', padding=5)
         migration_frame.pack(fill='both', expand=True, pady=(0, 8))
@@ -417,7 +549,7 @@ class FileMakerSyncGUI:
         self.migration_overview = MigrationOverview(migration_frame)
         self.migration_overview.pack(fill='both', expand=True)
         
-        # Quick Actions - MINIMAL padding
+        # Quick Actions
         actions_frame = ttk.LabelFrame(content_frame, text="Quick Actions", 
                                       style='Large.TLabelframe', padding=5)
         actions_frame.pack(fill='x')
@@ -481,7 +613,6 @@ class FileMakerSyncGUI:
     
     def on_new_log_entry(self, log_entry):
         """Handle new log entries"""
-        # Update status if it's an error
         if log_entry.level in ['ERROR', 'CRITICAL']:
             self.root.after(0, self.update_status_indicator)
     
@@ -492,7 +623,6 @@ class FileMakerSyncGUI:
                 self.quick_actions.show_progress(operation.replace('_', ' ').title())
             elif status == 'complete':
                 self.quick_actions.hide_progress()
-                # Refresh status after operation
                 self.root.after(1000, self.refresh_migration_status)
         
         self.root.after(0, update_ui)
@@ -516,8 +646,6 @@ class FileMakerSyncGUI:
     def on_connection_test_complete(self, connection_type, status):
         """Handle connection test completion"""
         def update_ui():
-            self.log_manager.log(LogLevel.INFO, "GUI", f"Connection test complete: {connection_type} = {status}")
-            
             if connection_type == 'filemaker':
                 self.fm_status_card.update_status(status['connected'], status['message'])
             elif connection_type == 'target':
@@ -594,60 +722,70 @@ class FileMakerSyncGUI:
         
         self.status_bar.update_health(error_count)
     
-    # Menu actions
+    # Child window management methods
     def open_configuration(self):
-        """Open configuration window"""
-        if self.config_window is None:
-            self.config_window = ConfigurationWindow(self.root, 'config.toml', self.on_config_saved)
-        else:
-            self.config_window.window.lift()
+        """Open configuration window with proper management"""
+        # Close existing config window if open
+        if 'config' in self.child_windows:
+            try:
+                self.child_windows['config'].close_window()
+            except:
+                pass
+            del self.child_windows['config']
+        
+        # Create new config window
+        self.child_windows['config'] = ConfigurationWindow(
+            self.root, 'config.toml', self.on_config_saved
+        )
     
     def on_config_saved(self):
         """Handle configuration save"""
-        self.config_window = None
+        if 'config' in self.child_windows:
+            del self.child_windows['config']
+        
         self.log_manager.log(LogLevel.INFO, "Config", "Configuration updated via GUI")
         # Test connections after config save
         self.root.after(1000, self.test_all_connections)
     
     def open_log_viewer(self):
-        """Open log viewer window"""
-        if self.log_viewer_window is None:
-            self.log_viewer_window = LogViewerWindow(self.root, self.log_manager)
-            # FIXED: Clean up reference when window is closed
-            def on_close():
-                self.log_viewer_window = None
-            # Store the original close method
-            original_close = self.log_viewer_window.close_window
-            def enhanced_close():
-                original_close()
-                on_close()
-            self.log_viewer_window.close_window = enhanced_close
-        else:
+        """Open log viewer window with proper management"""
+        # Close existing log viewer if open
+        if 'log_viewer' in self.child_windows:
             try:
-                self.log_viewer_window.window.lift()
-                self.log_viewer_window.window.focus_force()
+                self.child_windows['log_viewer'].close_window()
             except:
-                # Window was destroyed, create new one
-                self.log_viewer_window = None
-                self.open_log_viewer()
+                pass
+            del self.child_windows['log_viewer']
+        
+        # Create new log viewer
+        try:
+            self.child_windows['log_viewer'] = LogViewerWindow(self.root, self.log_manager)
+        except Exception as e:
+            self.log_manager.log(LogLevel.ERROR, "GUI", f"Failed to open log viewer: {e}")
+            messagebox.showerror("Error", f"Failed to open log viewer: {e}")
     
     def open_log_stats(self):
-        """Open log statistics window"""
-        if self.log_stats_window is None:
-            self.log_stats_window = LogStatsWindow(self.root, self.log_manager)
-            # Clean up reference when window is closed
-            def on_close():
-                self.log_stats_window = None
-            self.log_stats_window.window.protocol("WM_DELETE_WINDOW", on_close)
-        else:
-            self.log_stats_window.window.lift()
+        """Open log statistics window with proper management"""
+        # Close existing stats window if open
+        if 'log_stats' in self.child_windows:
+            try:
+                self.child_windows['log_stats'].close_window()
+            except:
+                pass
+            del self.child_windows['log_stats']
+        
+        # Create new stats window
+        try:
+            self.child_windows['log_stats'] = LogStatsWindow(self.root, self.log_manager)
+        except Exception as e:
+            self.log_manager.log(LogLevel.ERROR, "GUI", f"Failed to open log stats: {e}")
+            messagebox.showerror("Error", f"Failed to open log statistics: {e}")
     
     def run_diagnostics(self):
         """Run system diagnostics"""
         self.log_manager.log(LogLevel.INFO, "Diagnostics", "Starting system diagnostics from GUI")
         
         def run_diag():
-            # Simple diagnostic check
             results = {
                 'timestamp': datetime.now().isoformat(),
                 'config_file_exists': Path('config.toml').exists(),
@@ -665,6 +803,7 @@ class FileMakerSyncGUI:
         diag_window.title("System Diagnostics")
         diag_window.geometry("500x400")
         diag_window.transient(self.root)
+        diag_window.grab_set()
         
         # Create scrollable text widget
         from tkinter import scrolledtext
@@ -745,22 +884,37 @@ Built with Python and tkinter.
     def auto_refresh(self):
         """Automatically refresh status every 30 seconds"""
         self.update_status_indicator()
-        self.root.after(30000, self.auto_refresh)  # 30 seconds
+        self.root.after(30000, self.auto_refresh)
     
     def on_closing(self):
         """Handle application close"""
         if self.operation_manager.is_operation_running:
             if messagebox.askokcancel("Quit", 
                                     "An operation is running. Do you want to stop it and quit?"):
-                self.log_manager.log(LogLevel.INFO, "Application", "Application closed by user")
-                self.root.destroy()
+                self.cleanup_and_exit()
         else:
-            self.log_manager.log(LogLevel.INFO, "Application", "Application closed normally")
-            self.root.destroy()
+            self.cleanup_and_exit()
+    
+    def cleanup_and_exit(self):
+        """Clean up resources and exit"""
+        self.log_manager.log(LogLevel.INFO, "Application", "Application closing")
+        
+        # Close all child windows
+        for window_name, window_obj in list(self.child_windows.items()):
+            try:
+                window_obj.close_window()
+            except:
+                pass
+        
+        self.child_windows.clear()
+        
+        # Destroy main window
+        self.root.destroy()
 
 
 def main():
     """Main entry point"""
+    # Create root window
     root = tk.Tk()
     
     # Set window icon if available
@@ -782,7 +936,17 @@ def main():
     root.geometry(f"+{x}+{y}")
     
     # Start the GUI
-    root.mainloop()
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        print("Application interrupted by user")
+    except Exception as e:
+        print(f"Application error: {e}")
+    finally:
+        try:
+            root.destroy()
+        except:
+            pass
 
 
 if __name__ == "__main__":
