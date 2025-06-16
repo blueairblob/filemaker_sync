@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # FILE: gui/filemaker_gui.py
 """
-FileMaker Sync GUI Application
+FileMaker Sync GUI Application - Updated with Stop Action and Dashboard Update
 """
 
 import tkinter as tk
@@ -23,7 +23,7 @@ from gui_operations import OperationManager, ConnectionTester, StatusManager
 from gui_logviewer import LogViewerWindow, LogStatsWindow
 
 class FileMakerSyncGUI:
-    """FileMaker Sync GUI that prevents hanging"""
+    """FileMaker Sync GUI with always-visible footer and enhanced controls"""
     
     def __init__(self, root):
         self.root = root
@@ -138,32 +138,39 @@ class FileMakerSyncGUI:
             self.log_manager.log(LogLevel.WARNING, "GUI", "GUI update queue full, skipping update")
     
     def create_widgets(self):
-        """Create the main dashboard layout"""
+        """Create the main dashboard layout with always-visible footer"""
         # Configure root
         self.root.configure(bg='#f0f0f0')
         
         # Create menu bar
         self.create_menu_bar()
         
-        # Main container
+        # Main container with explicit layout management for always-visible footer
         main_container = ttk.Frame(self.root)
         main_container.pack(fill='both', expand=True, padx=10, pady=10)
         
-        # Header
-        self.create_header(main_container)
+        # Content frame (everything except status bar)
+        content_frame = ttk.Frame(main_container)
+        content_frame.pack(fill='both', expand=True, pady=(0, 5))
+        
+        # Header (removed Activity Log button)
+        self.create_header(content_frame)
         
         # Connection status row
-        self.create_connection_status(main_container)
+        self.create_connection_status(content_frame)
         
         # Main content area
-        self.create_main_content(main_container)
+        self.create_main_content(content_frame)
         
-        # Status bar
+        # Status bar - ALWAYS VISIBLE AT BOTTOM
         self.status_bar = StatusBar(main_container, self.log_manager.session_id)
-        self.status_bar.pack(side='bottom', fill='x', pady=(10, 0))
+        self.status_bar.pack(side='bottom', fill='x', pady=0)
+        
+        # Ensure status bar stays at bottom by preventing other widgets from expanding into it
+        main_container.pack_propagate(False)
     
     def create_header(self, parent):
-        """Create header section"""
+        """Create header section - REMOVED Activity Log button"""
         header_frame = ttk.Frame(parent)
         header_frame.pack(fill='x', pady=(0, 15))
         
@@ -174,17 +181,12 @@ class FileMakerSyncGUI:
         subtitle_text = "Monitor and manage your FileMaker to Supabase migration"
         if self.config.get('debug', {}).get('debug_mode', False):
             log_level = self.config.get('debug', {}).get('log_level', 'INFO')
-            #subtitle_text += f" | Log Level: {log_level} | Thread-Safe Mode"
+            # Removed debug info from subtitle for cleaner look
         
         subtitle_label = ttk.Label(header_frame, text=subtitle_text, font=('Arial', 9))
         subtitle_label.pack(side='left', padx=(20, 0))
         
-        # Activity log button
-        activity_button = ttk.Button(header_frame, text="🕒", width=3, 
-                                    command=self.safe_open_log_viewer)
-        activity_button.pack(side='right', padx=(0, 10))
-        
-        ttk.Label(header_frame, text="Activity Log", font=('Arial', 8)).pack(side='right')
+        # REMOVED: Activity log button - user can access via Quick Actions "View Logs"
     
     def create_connection_status(self, parent):
         """Create connection status section"""
@@ -220,7 +222,7 @@ class FileMakerSyncGUI:
         style = ttk.Style()
         style.configure('Large.TLabelframe.Label', font=('Arial', 12, 'bold'))
         
-        # Migration Overview
+        # Migration Overview (removed internal refresh button)
         migration_frame = ttk.LabelFrame(content_frame, text="Migration Overview", 
                                         style='Large.TLabelframe', padding=5)
         migration_frame.pack(fill='both', expand=True, pady=(0, 8))
@@ -228,7 +230,7 @@ class FileMakerSyncGUI:
         self.migration_overview = MigrationOverview(migration_frame)
         self.migration_overview.pack(fill='both', expand=True)
         
-        # Quick Actions
+        # Quick Actions (with new buttons)
         actions_frame = ttk.LabelFrame(content_frame, text="Quick Actions", 
                                       style='Large.TLabelframe', padding=5)
         actions_frame.pack(fill='x')
@@ -265,15 +267,12 @@ class FileMakerSyncGUI:
         help_menu.add_command(label="About", command=self.safe_show_about)
     
     def setup_bindings(self):
-        """Set up event bindings with thread safety"""
+        """Set up event bindings with thread safety - UPDATED FOR NEW BUTTONS"""
         # Connection test buttons
         self.fm_status_card.test_button.configure(command=self.safe_test_filemaker_connection)
         self.target_status_card.test_button.configure(command=self.safe_test_target_connection)
         
-        # Refresh button
-        self.migration_overview.refresh_button.configure(command=self.safe_refresh_migration_status)
-        
-        # Quick action buttons
+        # Quick action buttons - UPDATED
         actions = self.quick_actions.action_buttons
         actions['Full Sync'].configure(command=lambda: self.safe_run_operation('full_sync'))
         actions['Incremental Sync'].configure(command=lambda: self.safe_run_operation('incremental_sync'))
@@ -281,6 +280,8 @@ class FileMakerSyncGUI:
         actions['Export Images'].configure(command=lambda: self.safe_run_operation('export_images'))
         actions['Test Connections'].configure(command=self.safe_test_all_connections)
         actions['View Logs'].configure(command=self.safe_open_log_viewer)
+        actions['Update Dashboard'].configure(command=self.safe_refresh_migration_status)  # NEW: Moved from refresh button
+        actions['Stop Action'].configure(command=self.safe_stop_current_operation)  # NEW: Stop action button
     
     def setup_callbacks(self):
         """Set up callbacks for real-time updates with thread safety"""
@@ -344,6 +345,37 @@ class FileMakerSyncGUI:
         
         threading.Thread(target=test_operation, daemon=True, name="All-Tests-Trigger").start()
     
+    def safe_stop_current_operation(self):
+        """Thread-safe operation stopper - NEW METHOD"""
+        def stop_operation():
+            try:
+                if self.operation_manager.is_operation_running:
+                    self.log_manager.log(LogLevel.WARNING, "GUI", "User requested to stop current operation")
+                    
+                    def confirm_and_stop():
+                        if messagebox.askyesno("Stop Operation", 
+                                             "Are you sure you want to stop the current operation?\n\n"
+                                             "This may leave the migration in an incomplete state."):
+                            success = self.operation_manager.cancel_current_operation()
+                            if success:
+                                self.log_manager.log(LogLevel.INFO, "GUI", "Operation stopped by user")
+                                # Hide progress immediately
+                                self.quick_actions.hide_progress()
+                            else:
+                                messagebox.showwarning("Stop Failed", 
+                                                     "Could not stop the operation. It may have already completed.")
+                    
+                    self.schedule_gui_update(confirm_and_stop)
+                else:
+                    def show_no_operation():
+                        messagebox.showinfo("No Operation", "No operation is currently running.")
+                    self.schedule_gui_update(show_no_operation)
+                    
+            except Exception as e:
+                self.log_manager.log(LogLevel.ERROR, "GUI", f"Error stopping operation: {e}")
+        
+        threading.Thread(target=stop_operation, daemon=True, name="Stop-Operation").start()
+    
     def on_connection_test_complete_safe(self, connection_type, status):
         """Thread-safe connection test completion handler"""
         def update_connection_ui():
@@ -375,7 +407,7 @@ class FileMakerSyncGUI:
                 if self.operation_manager.is_operation_running:
                     def show_warning():
                         messagebox.showwarning("Operation Running", 
-                                             "Another operation is already running. Please wait.")
+                                             "Another operation is already running. Please wait or use 'Stop Action' to cancel it.")
                     self.schedule_gui_update(show_warning)
                     return
                 
@@ -393,15 +425,15 @@ class FileMakerSyncGUI:
         threading.Thread(target=run_operation, daemon=True, name=f"Operation-{operation}").start()
     
     def safe_refresh_migration_status(self):
-        """Thread-safe migration status refresh"""
+        """Thread-safe migration status refresh - MOVED FROM REFRESH BUTTON"""
         def refresh_operation():
             try:
-                self.log_manager.log(LogLevel.INFO, "GUI", "Refreshing migration status from GUI")
+                self.log_manager.log(LogLevel.INFO, "GUI", "Updating dashboard from GUI")
                 self.status_manager.refresh_migration_status(self.on_status_complete_safe)
             except Exception as e:
-                self.log_manager.log(LogLevel.ERROR, "GUI", f"Error refreshing status: {e}")
+                self.log_manager.log(LogLevel.ERROR, "GUI", f"Error updating dashboard: {e}")
         
-        threading.Thread(target=refresh_operation, daemon=True, name="Status-Refresh-Trigger").start()
+        threading.Thread(target=refresh_operation, daemon=True, name="Dashboard-Update").start()
     
     def on_status_complete_safe(self, success, data):
         """Thread-safe status refresh completion handler"""
@@ -424,7 +456,7 @@ class FileMakerSyncGUI:
                     
                     self.update_connection_displays()
                 else:
-                    self.log_manager.log(LogLevel.ERROR, "GUI", f"Failed to refresh status: {data}")
+                    self.log_manager.log(LogLevel.ERROR, "GUI", f"Failed to update dashboard: {data}")
                     
             except Exception as e:
                 self.log_manager.log(LogLevel.ERROR, "GUI", f"Error updating status UI: {e}")
@@ -612,6 +644,12 @@ Log Manager:
 • Debug Mode: {self.log_manager.debug_mode}
 • Total Logs: {self.log_manager.get_log_count():,}
 
+GUI Enhancements:
+• Always-visible footer: Enabled
+• Stop Action button: Available
+• Dashboard Update: Available in Quick Actions
+• Thread-safe operations: Enabled
+
 For detailed logs, check Tools → View Activity Logs
 """
             
@@ -649,7 +687,7 @@ For detailed logs, check Tools → View Activity Logs
         threading.Thread(target=open_folder, daemon=True, name="Open-Export").start()
     
     def safe_open_log_folder(self):
-        """log folder opener"""
+        """Log folder opener"""
         def open_folder():
             try:
                 log_path = self.log_manager.log_dir
@@ -674,7 +712,7 @@ For detailed logs, check Tools → View Activity Logs
         def show_about():
             try:
                 about_text = """FileMaker Sync Dashboard
-Version 2.0.0
+Version 2.0.0 - Enhanced Edition
 
 A comprehensive tool for migrating and synchronizing data 
 from FileMaker Pro databases to Supabase.
@@ -686,9 +724,12 @@ Features:
 • Export capabilities (DDL, DML, Images)
 • Professional dashboard interface
 • Thread-safe operation for stability
+• Always-visible status footer
+• Stop Action capability
+• Integrated dashboard updates
 
 Built with Python and tkinter.
-Enhanced with comprehensive thread safety.
+Enhanced with comprehensive thread safety and user controls.
 """
                 messagebox.showinfo("About FileMaker Sync", about_text)
             except Exception as e:

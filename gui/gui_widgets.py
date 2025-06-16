@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # FILE: gui/gui_widgets.py
 """
-GUI Widgets Module - Improved UI with Compact Messages and Details Buttons
+GUI Widgets Module - Updated with Stop Action and Dashboard Update
 Custom widgets for the FileMaker Sync Dashboard
 """
 
@@ -127,21 +127,14 @@ class StatusCard(ttk.Frame):
         ttk.Button(button_frame, text="Close", command=detail_window.destroy).pack(side='right')
 
 class MigrationOverview(ttk.Frame):
-    """Widget showing migration progress overview - COMPACT VERSION"""
+    """Widget showing migration progress overview - COMPACT VERSION WITHOUT REFRESH BUTTON"""
     
     def __init__(self, parent, **kwargs):
         super().__init__(parent, **kwargs)
         self.create_widgets()
     
     def create_widgets(self):
-        # Header with refresh button only - COMPACT
-        header_frame = ttk.Frame(self)
-        header_frame.pack(fill='x', padx=2, pady=2)
-        
-        self.refresh_button = ttk.Button(header_frame, text="↻ Refresh", width=10)
-        self.refresh_button.pack(side='right')
-        
-        # Summary stats - COMPACT spacing
+        # Summary stats - COMPACT spacing (no header with refresh button)
         stats_frame = ttk.Frame(self)
         stats_frame.pack(fill='x', padx=2, pady=2)
         
@@ -256,7 +249,7 @@ class MigrationOverview(ttk.Frame):
             print(f"Error updating overview: {e}")
 
 class QuickActions(ttk.Frame):
-    """Widget for quick action buttons - NO INTERNAL TITLE"""
+    """Widget for quick action buttons - UPDATED WITH STOP ACTION AND UPDATE DASHBOARD"""
     
     def __init__(self, parent, **kwargs):
         super().__init__(parent, **kwargs)
@@ -269,7 +262,7 @@ class QuickActions(ttk.Frame):
         button_container = ttk.Frame(self)
         button_container.pack(fill='x', pady=5)
         
-        # Action buttons
+        # Action buttons - UPDATED LIST
         self.action_buttons = {}
         button_configs = [
             ('Full Sync', 'both_required'),
@@ -277,7 +270,9 @@ class QuickActions(ttk.Frame):
             ('Export to Files', 'source_only'),
             ('Export Images', 'source_only'),
             ('Test Connections', 'none'),
-            ('View Logs', 'none')
+            ('View Logs', 'none'),
+            ('Update Dashboard', 'none'),  # NEW: Moved from refresh button
+            ('Stop Action', 'none')        # NEW: Stop current action
         ]
         
         # Create buttons in rows
@@ -291,6 +286,10 @@ class QuickActions(ttk.Frame):
                 button1 = ttk.Button(row_frame, text=text, width=18)
                 button1.pack(side='left', padx=(0, 5), fill='x', expand=True)
                 self.action_buttons[text] = button1
+                
+                # Special styling for Stop Action button
+                if text == 'Stop Action':
+                    button1.configure(state='disabled')  # Initially disabled
             
             # Second button in row (if exists)
             if i + 1 < len(button_configs):
@@ -298,6 +297,10 @@ class QuickActions(ttk.Frame):
                 button2 = ttk.Button(row_frame, text=text, width=18)
                 button2.pack(side='right', padx=(5, 0), fill='x', expand=True)
                 self.action_buttons[text] = button2
+                
+                # Special styling for Stop Action button
+                if text == 'Stop Action':
+                    button2.configure(state='disabled')  # Initially disabled
         
         # Progress indicator
         self.progress_frame = ttk.Frame(self)
@@ -313,15 +316,23 @@ class QuickActions(ttk.Frame):
         self.progress_frame.pack_forget()
     
     def show_progress(self, operation: str):
-        """Show progress for an operation"""
+        """Show progress for an operation and enable Stop Action button"""
         self.progress_label.configure(text=f"Running: {operation}")
         self.progress_bar.start()
         self.progress_frame.pack(fill='x', pady=(10, 0))
+        
+        # Enable Stop Action button when operation is running
+        if 'Stop Action' in self.action_buttons:
+            self.action_buttons['Stop Action'].configure(state='normal')
     
     def hide_progress(self):
-        """Hide progress indicator"""
+        """Hide progress indicator and disable Stop Action button"""
         self.progress_bar.stop()
         self.progress_frame.pack_forget()
+        
+        # Disable Stop Action button when no operation is running
+        if 'Stop Action' in self.action_buttons:
+            self.action_buttons['Stop Action'].configure(state='disabled')
     
     def update_button_states(self, fm_connected: bool, target_connected: bool):
         """Update button states based on connections"""
@@ -331,36 +342,43 @@ class QuickActions(ttk.Frame):
             'Export to Files': 'normal' if fm_connected else 'disabled',
             'Export Images': 'normal' if fm_connected else 'disabled',
             'Test Connections': 'normal',
-            'View Logs': 'normal'
+            'View Logs': 'normal',
+            'Update Dashboard': 'normal',
+            # Stop Action state is managed by show_progress/hide_progress
         }
         
         for button_text, state in states.items():
             if button_text in self.action_buttons:
-                self.action_buttons[button_text].configure(state=state)
+                # Don't override Stop Action state management
+                if button_text != 'Stop Action':
+                    self.action_buttons[button_text].configure(state=state)
 
 class StatusBar(ttk.Frame):
-    """Status bar widget for the bottom of the application"""
+    """Status bar widget for the bottom of the application - ALWAYS VISIBLE"""
     
     def __init__(self, parent, session_id: str, **kwargs):
         super().__init__(parent, **kwargs)
         self.create_widgets(session_id)
     
     def create_widgets(self, session_id: str):
+        # Make status bar have a distinct background to ensure visibility
+        self.configure(relief='sunken', borderwidth=1)
+        
         # System health indicator
         self.health_label = ttk.Label(self, text="● System Healthy", foreground='green')
-        self.health_label.pack(side='left', padx=5)
+        self.health_label.pack(side='left', padx=5, pady=2)
         
         # Error count indicator
         self.error_count_label = ttk.Label(self, text="0 errors")
-        self.error_count_label.pack(side='left', padx=5)
+        self.error_count_label.pack(side='left', padx=5, pady=2)
         
         # Session info
         self.session_label = ttk.Label(self, text=f"Session: {session_id}")
-        self.session_label.pack(side='left', padx=10)
+        self.session_label.pack(side='left', padx=10, pady=2)
         
         # Last update time
         self.last_update_label = ttk.Label(self, text="")
-        self.last_update_label.pack(side='right', padx=5)
+        self.last_update_label.pack(side='right', padx=5, pady=2)
     
     def update_health(self, error_count: int):
         """Update health indicator based on error count"""
