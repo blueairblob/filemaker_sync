@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # FILE: gui/gui_logviewer.py
 """
-Enhanced GUI Log Viewer Module with Sortable Table and Fixed Auto-Features
+Enhanced GUI Log Viewer Module with Latest Entry Always in Focus
+Ensures the newest log entry is always visible and selected when logs are updated
 """
 
 import tkinter as tk
@@ -18,13 +19,14 @@ import time
 from gui_logging import LogManager, LogEntry, LogLevel
 
 class SortableTreeview(ttk.Treeview):
-    """Enhanced Treeview with sortable columns"""
+    """Enhanced Treeview with sortable columns and latest entry focus"""
     
     def __init__(self, parent, **kwargs):
         super().__init__(parent, **kwargs)
         self.sort_column = None
         self.sort_reverse = False
-        self.original_data = []  # Store original data for sorting
+        self.original_data = []
+        self.latest_entry_focus = True  # Flag to control latest entry focus
         
         # Bind header clicks for sorting
         self.bind('<Button-1>', self.on_header_click)
@@ -85,21 +87,86 @@ class SortableTreeview(ttk.Treeview):
             # Update header to show sort direction
             self._update_column_headers()
             
+            # Focus on latest entry if sorting by time
+            if column == 'Time' and self.latest_entry_focus:
+                self.focus_latest_entry()
+            
         except Exception as e:
             print(f"Error sorting by column {column}: {e}")
+    
+    def focus_latest_entry(self):
+        """Focus on the latest entry based on current sort"""
+        try:
+            children = self.get_children()
+            if not children:
+                return
+            
+            # Determine which is the "latest" based on current sort
+            if self.sort_column == 'Time':
+                # If sorting by time descending (newest first), focus on first item
+                # If sorting by time ascending (oldest first), focus on last item
+                latest_item = children[0] if self.sort_reverse else children[-1]
+            else:
+                # For other sorts, focus on the last item added
+                latest_item = children[-1]
+            
+            # Clear current selection and focus on latest
+            self.selection_remove(self.selection())
+            self.selection_set(latest_item)
+            self.focus(latest_item)
+            self.see(latest_item)
+            
+        except Exception as e:
+            print(f"Error focusing latest entry: {e}")
+    
+    def add_entry_and_focus(self, values, tags=None):
+        """Add entry and immediately focus on it if it's the latest"""
+        try:
+            # Insert the new entry
+            item = self.insert('', 'end', values=values, tags=tags or ())
+            
+            # If auto-focus is enabled and we're not sorting or sorting by time descending
+            if self.latest_entry_focus:
+                if not self.sort_column or (self.sort_column == 'Time' and self.sort_reverse):
+                    # Re-sort to get correct position
+                    if self.sort_column:
+                        self.sort_by_column(self.sort_column)
+                    else:
+                        # Default behavior - focus on the newly added item
+                        self.selection_remove(self.selection())
+                        self.selection_set(item)
+                        self.focus(item)
+                        self.see(item)
+            
+            return item
+            
+        except Exception as e:
+            print(f"Error adding entry and focusing: {e}")
+            return None
     
     def _parse_time_for_sort(self, time_str: str) -> datetime:
         """Parse time string for sorting"""
         try:
             # Try to parse as HH:MM:SS format first
-            if ':' in time_str and len(time_str) <= 8:
-                # Convert HH:MM:SS to full datetime for sorting
+            if ':' in time_str and len(time_str) <= 12:
+                # Convert HH:MM:SS.mmm to full datetime for sorting
                 today = datetime.now().date()
                 time_parts = time_str.split(':')
                 hour = int(time_parts[0])
                 minute = int(time_parts[1])
-                second = int(time_parts[2]) if len(time_parts) > 2 else 0
-                return datetime.combine(today, datetime.min.time().replace(hour=hour, minute=minute, second=second))
+                
+                # Handle seconds with milliseconds
+                second_part = time_parts[2] if len(time_parts) > 2 else "0"
+                if '.' in second_part:
+                    second = int(float(second_part))
+                    microsecond = int((float(second_part) % 1) * 1000000)
+                else:
+                    second = int(second_part)
+                    microsecond = 0
+                
+                return datetime.combine(today, datetime.min.time().replace(
+                    hour=hour, minute=minute, second=second, microsecond=microsecond
+                ))
             else:
                 # Try to parse as ISO format
                 return datetime.fromisoformat(time_str.replace('Z', '+00:00'))
@@ -122,7 +189,7 @@ class SortableTreeview(ttk.Treeview):
                 self.heading(col, text=clean_heading)
 
 class LogViewerWindow:
-    """Enhanced thread-safe log viewer with working auto-features and sorting"""
+    """Enhanced thread-safe log viewer with latest entry always in focus"""
     
     def __init__(self, parent, log_manager: LogManager):
         self.parent = parent
@@ -142,11 +209,13 @@ class LogViewerWindow:
         # Auto-scroll and refresh settings with working variables
         self.auto_scroll_var = tk.BooleanVar(value=True)
         self.auto_refresh_var = tk.BooleanVar(value=True)
-        self.refresh_interval = 2000  # 2 seconds for more responsive updates
+        self.auto_focus_latest_var = tk.BooleanVar(value=True)  # NEW: Control latest entry focus
+        self.refresh_interval = 2000  # 2 seconds for responsive updates
         
         # Current log count to detect new logs
         self.last_log_count = 0
         self.last_refresh_time = 0
+        self.last_displayed_log_id = None  # Track last displayed log for focus
         
         # Sort settings - default to newest first (Time descending)
         self.default_sort_column = 'Time'
@@ -311,7 +380,7 @@ class LogViewerWindow:
         # Control panel
         self.create_control_panel(main_container)
         
-        # Enhanced log display with sorting
+        # Enhanced log display with sorting and focus
         self.create_enhanced_log_display(main_container)
         
         # Status bar
@@ -380,7 +449,7 @@ class LogViewerWindow:
         search_entry.pack(side='left', padx=(0, 10))
         search_entry.bind('<KeyRelease>', self.on_search_change_safe)
         
-        # Auto options with improved functionality
+        # Auto options with enhanced functionality
         auto_frame = ttk.Frame(row2_frame)
         auto_frame.pack(side='left', padx=(10, 0))
         
@@ -394,18 +463,25 @@ class LogViewerWindow:
                                              command=self.toggle_auto_refresh_safe)
         self.auto_refresh_cb.pack(side='left', padx=(10, 0))
         
+        # NEW: Auto-focus latest checkbox
+        self.auto_focus_cb = ttk.Checkbutton(auto_frame, text="Focus latest", 
+                                           variable=self.auto_focus_latest_var,
+                                           command=self.on_auto_focus_toggle)
+        self.auto_focus_cb.pack(side='left', padx=(10, 0))
+        
         # Action buttons
         action_frame = ttk.Frame(control_frame)
         action_frame.pack(side='right')
         
         ttk.Button(action_frame, text="Refresh Now", command=self.refresh_logs_safe).pack(side='left', padx=2)
+        ttk.Button(action_frame, text="Focus Latest", command=self.focus_latest_safe).pack(side='left', padx=2)  # NEW
         ttk.Button(action_frame, text="Clear Filters", command=self.clear_filters_safe).pack(side='left', padx=2)
         ttk.Button(action_frame, text="Export", command=self.export_logs_safe).pack(side='left', padx=2)
         ttk.Button(action_frame, text="Clear Logs", command=self.clear_logs_safe).pack(side='left', padx=2)
         ttk.Button(action_frame, text="Close", command=self.close_window_safe).pack(side='left', padx=2)
     
     def create_enhanced_log_display(self, parent):
-        """Create the enhanced log display area with sorting"""
+        """Create the enhanced log display area with sorting and focus"""
         log_frame = ttk.Frame(parent)
         log_frame.pack(fill='both', expand=True)
         
@@ -480,9 +556,25 @@ class LogViewerWindow:
         ttk.Button(debug_frame, text="Log Statistics", 
                   command=self.show_log_statistics_safe).pack(side='left', padx=2)
     
+    # NEW: Auto-focus toggle handler
+    def on_auto_focus_toggle(self):
+        """Handle auto-focus latest toggle"""
+        self.log_tree.latest_entry_focus = self.auto_focus_latest_var.get()
+        if self.auto_focus_latest_var.get():
+            # Immediately focus on latest when enabled
+            self.schedule_gui_update(self.log_tree.focus_latest_entry)
+    
+    # NEW: Manual focus latest method
+    def focus_latest_safe(self):
+        """Thread-safe manual focus on latest entry"""
+        def focus_latest():
+            self.log_tree.focus_latest_entry()
+        
+        self.schedule_gui_update(focus_latest)
+    
     # Thread-safe event handlers
     def on_new_log_entry(self, log_entry: LogEntry):
-        """Thread-safe handler for new log entries - ENHANCED"""
+        """Thread-safe handler for new log entries - ENHANCED WITH FOCUS"""
         if self._destroyed:
             return
         
@@ -496,15 +588,7 @@ class LogViewerWindow:
                 
                 # If auto-refresh is enabled, add the new entry
                 if self.auto_refresh_var.get() and self.entry_matches_filters(log_entry):
-                    self.add_log_entry_to_tree(log_entry)
-                    
-                    # Apply current sort after adding
-                    if hasattr(self.log_tree, 'sort_column') and self.log_tree.sort_column:
-                        self.log_tree.sort_by_column(self.log_tree.sort_column)
-                    
-                    # Auto-scroll if enabled
-                    if self.auto_scroll_var.get():
-                        self.auto_scroll_to_latest()
+                    self.add_single_log_entry(log_entry, focus_if_latest=True)
                     
                     # Update status display
                     self.update_status_display()
@@ -513,6 +597,32 @@ class LogViewerWindow:
                 print(f"Error processing new log entry: {e}")
         
         self.schedule_gui_update(process_new_entry)
+    
+    def add_single_log_entry(self, entry: LogEntry, focus_if_latest: bool = False):
+        """Add a single log entry with optional focus on latest"""
+        try:
+            time_str = self.format_time(entry.timestamp)
+            message = self.truncate_message(entry.message, 100)
+            
+            # Determine row tag for coloring
+            tag = entry.level if entry.level in ['ERROR', 'CRITICAL', 'WARNING', 'DEBUG', 'INFO'] else ''
+            
+            # Use the enhanced add method that handles focus
+            if focus_if_latest and self.auto_focus_latest_var.get():
+                self.log_tree.add_entry_and_focus(
+                    values=(time_str, entry.level, entry.component, message),
+                    tags=(tag,)
+                )
+            else:
+                self.log_tree.insert('', 'end', 
+                                    values=(time_str, entry.level, entry.component, message),
+                                    tags=(tag,))
+            
+            # Track this as the last displayed log
+            self.last_displayed_log_id = entry.timestamp
+            
+        except Exception as e:
+            print(f"Error adding single log entry: {e}")
     
     def on_auto_scroll_toggle(self):
         """Handle auto-scroll toggle"""
@@ -527,14 +637,8 @@ class LogViewerWindow:
             if not children:
                 return
             
-            # Scroll to first item (which should be latest with Time descending sort)
-            if self.log_tree.sort_column == 'Time' and self.log_tree.sort_reverse:
-                self.log_tree.see(children[0])
-                self.log_tree.selection_set(children[0])
-            else:
-                # For other sorts, scroll to last item
-                self.log_tree.see(children[-1])
-                self.log_tree.selection_set(children[-1])
+            # Use the enhanced focus method
+            self.log_tree.focus_latest_entry()
                 
         except Exception as e:
             print(f"Error auto-scrolling: {e}")
@@ -559,7 +663,7 @@ class LogViewerWindow:
         def delayed_refresh():
             self.schedule_gui_update(self.refresh_logs)
         
-        self._search_timer = self.window.after(500, delayed_refresh)  # Faster response
+        self._search_timer = self.window.after(500, delayed_refresh)
     
     def refresh_logs_safe(self):
         """Thread-safe refresh logs wrapper"""
@@ -629,13 +733,14 @@ class LogViewerWindow:
     
     # Core functionality methods (called from GUI thread only)
     def refresh_logs(self):
-        """Refresh the log display with proper sorting (GUI thread only)"""
+        """Refresh the log display with proper sorting and focus (GUI thread only)"""
         if self._destroyed or not self.window or not self.window.winfo_exists():
             return
         
         try:
-            # Store current selection
+            # Store current selection for restoration if needed
             current_selection = self.log_tree.selection()
+            current_focused = self.log_tree.focus()
             
             # Clear existing items
             for item in self.log_tree.get_children():
@@ -655,11 +760,14 @@ class LogViewerWindow:
                 self.add_log_entry_to_tree(log)
             
             # Apply default sort (newest first)
-            if hasattr(self.log_tree, 'sort_column'):
-                self.log_tree.sort_by_column(self.log_tree.sort_column or self.default_sort_column)
+            if hasattr(self.log_tree, 'sort_column') and self.log_tree.sort_column:
+                self.log_tree.sort_by_column(self.log_tree.sort_column)
             
-            # Auto-scroll if enabled
-            if self.auto_scroll_var.get() and display_logs:
+            # Focus on latest entry if enabled
+            if self.auto_focus_latest_var.get() and display_logs:
+                self.log_tree.focus_latest_entry()
+            elif self.auto_scroll_var.get() and display_logs:
+                # Fallback to auto-scroll behavior
                 self.auto_scroll_to_latest()
             
             # Update status and statistics
@@ -765,6 +873,8 @@ class LogViewerWindow:
                 auto_status.append("Auto-refresh ON")
             if self.auto_scroll_var.get():
                 auto_status.append("Auto-scroll ON")
+            if self.auto_focus_latest_var.get():
+                auto_status.append("Focus-latest ON")
             
             if auto_status:
                 status_parts.append(f"Auto: {', '.join(auto_status)}")
@@ -819,7 +929,7 @@ class LogViewerWindow:
         """Format timestamp for display with better formatting"""
         try:
             dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-            # Show more detailed time format
+            # Show more detailed time format with milliseconds
             return dt.strftime("%H:%M:%S.%f")[:-3]  # Include milliseconds
         except:
             return timestamp[-12:] if len(timestamp) >= 12 else timestamp
@@ -909,8 +1019,8 @@ class LogViewerWindow:
             text_widget.pack(fill='both', expand=True, pady=(0, 10))
             
             # Format log details
-            details_text = f"""Log Entry Details (Enhanced Viewer)
-========================================
+            details_text = f"""Log Entry Details (Enhanced Viewer with Latest Focus)
+=====================================================
 
 Timestamp: {log_entry.timestamp}
 Level: {log_entry.level}
@@ -939,7 +1049,7 @@ Message:
             messagebox.showerror("Error", f"Failed to show log details: {e}")
     
     def start_auto_refresh(self):
-        """Start auto-refresh timer with enhanced functionality"""
+        """Start auto-refresh timer with enhanced functionality and latest focus"""
         def auto_refresh():
             if self._destroyed or not self.window or not self.window.winfo_exists():
                 return
@@ -950,8 +1060,14 @@ Message:
                 if self.auto_refresh_var.get():
                     # Always refresh if enabled, but at different rates based on activity
                     if current_count != self.last_log_count:
-                        # New logs detected - refresh immediately
-                        self.schedule_gui_update(self.refresh_logs)
+                        # New logs detected - refresh and focus on latest
+                        def refresh_and_focus():
+                            self.refresh_logs()
+                            # Ensure latest entry is focused after refresh
+                            if self.auto_focus_latest_var.get():
+                                self.log_tree.focus_latest_entry()
+                        
+                        self.schedule_gui_update(refresh_and_focus)
                     else:
                         # No new logs - just update statistics
                         self.schedule_gui_update(self.update_statistics_display)
@@ -983,6 +1099,9 @@ Message:
         def generate_logs():
             try:
                 self.log_manager.test_logging()
+                # After generating test logs, focus on latest if enabled
+                if self.auto_focus_latest_var.get():
+                    self.schedule_gui_update(self.log_tree.focus_latest_entry)
             except Exception as e:
                 print(f"Error generating test logs: {e}")
         
@@ -998,12 +1117,16 @@ Message:
                 
                 for i, component in enumerate(components):
                     for j, level in enumerate(levels):
-                        message = f"Test {level.value} message from {component} component (Enhanced viewer test)"
-                        details = {"test_number": i * len(levels) + j, "component": component, "level": level.value, "viewer": "enhanced"}
+                        message = f"Test {level.value} message from {component} component (Enhanced viewer with latest focus)"
+                        details = {"test_number": i * len(levels) + j, "component": component, "level": level.value, "viewer": "enhanced_with_focus"}
                         self.log_manager.log(level, component, message, details)
                         
                         # Small delay to prevent overwhelming the system
                         time.sleep(0.01)
+                
+                # Focus on latest after generating all test logs
+                if self.auto_focus_latest_var.get():
+                    self.schedule_gui_update(self.log_tree.focus_latest_entry)
                         
             except Exception as e:
                 print(f"Error testing log levels: {e}")
@@ -1020,7 +1143,7 @@ Message:
                 
                 # Create statistics window
                 stats_window = tk.Toplevel(self.window)
-                stats_window.title("Enhanced Log Statistics")
+                stats_window.title("Enhanced Log Statistics with Latest Focus")
                 stats_window.geometry("600x500")
                 stats_window.transient(self.window)
                 
@@ -1030,8 +1153,8 @@ Message:
                 text_widget.pack(fill='both', expand=True, padx=10, pady=10)
                 
                 # Format statistics
-                stats_text = f"""Enhanced Log Statistics
-=========================
+                stats_text = f"""Enhanced Log Statistics with Latest Entry Focus
+====================================================
 
 Total Entries: {stats['total_logs']:,}
 Session ID: {stats.get('session_id', 'Unknown')}
@@ -1039,12 +1162,14 @@ Current Level: {stats['current_level']}
 Console Enabled: {stats['console_enabled']}
 Debug Mode: {stats['debug_mode']}
 
-Enhanced Viewer Features:
-  - Sortable columns (click headers)
-  - Working auto-refresh ({self.refresh_interval/1000}s interval)
-  - Working auto-scroll to latest
-  - Real-time statistics updates
-  - Improved time formatting
+Latest Entry Focus Features:
+  - ✓ Always focus on newest log entry
+  - ✓ Sortable columns (click headers)
+  - ✓ Working auto-refresh ({self.refresh_interval/1000}s interval)
+  - ✓ Configurable auto-scroll and auto-focus
+  - ✓ Real-time statistics updates
+  - ✓ Enhanced time formatting with milliseconds
+  - ✓ Manual "Focus Latest" button
 
 Time Range:
   Oldest: {stats.get('oldest_entry', 'N/A')}
@@ -1068,6 +1193,7 @@ By Level:
                 stats_text += f"\nCurrent Viewer Settings:\n{'-' * 25}\n"
                 stats_text += f"Auto-refresh: {'ON' if self.auto_refresh_var.get() else 'OFF'}\n"
                 stats_text += f"Auto-scroll: {'ON' if self.auto_scroll_var.get() else 'OFF'}\n"
+                stats_text += f"Focus latest: {'ON' if self.auto_focus_latest_var.get() else 'OFF'}\n"
                 stats_text += f"Current sort: {getattr(self.log_tree, 'sort_column', 'Time')} {'↓' if getattr(self.log_tree, 'sort_reverse', True) else '↑'}\n"
                 stats_text += f"Refresh interval: {self.refresh_interval/1000}s\n"
                 
@@ -1085,7 +1211,7 @@ By Level:
         self.schedule_gui_update(show_stats)
 
 
-# Backward compatibility wrapper
+# Backward compatibility wrapper remains the same
 class LogStatsWindow:
     """Enhanced log statistics window"""
     
@@ -1102,7 +1228,7 @@ class LogStatsWindow:
     def create_window(self):
         """Create the statistics window"""
         self.window = tk.Toplevel(self.parent)
-        self.window.title("Enhanced Log Statistics & Analysis")
+        self.window.title("Enhanced Log Statistics & Analysis with Latest Focus")
         self.window.geometry("700x600")
         self.window.minsize(600, 500)
         
@@ -1161,7 +1287,7 @@ class LogStatsWindow:
         header_frame = ttk.Frame(main_container)
         header_frame.pack(fill='x', pady=(0, 10))
         
-        ttk.Label(header_frame, text="Enhanced Log Statistics & Analysis", 
+        ttk.Label(header_frame, text="Enhanced Log Statistics & Analysis with Latest Focus", 
                  font=('Arial', 16, 'bold')).pack(side='left')
         
         ttk.Button(header_frame, text="Refresh", command=self.update_stats).pack(side='right')
@@ -1240,15 +1366,15 @@ class LogStatsWindow:
         warning_logs = [log for log in logs if log.level == 'WARNING']
         
         # Generate comprehensive report
-        report = f"""Enhanced Log Statistics & Analysis Report
-============================================
+        report = f"""Enhanced Log Statistics & Analysis Report with Latest Focus
+==============================================================
 
 Session Information:
   Session ID: {stats.get('session_id', 'Unknown')}
   Current Log Level: {stats['current_level']}
   Debug Mode: {'Enabled' if stats['debug_mode'] else 'Disabled'}
   Console Logging: {'Enabled' if stats['console_enabled'] else 'Disabled'}
-  Enhanced Viewer: Active with sortable columns and auto-features
+  Enhanced Viewer: Active with latest entry focus
 
 Data Summary:
   Total Entries: {total_logs:,} (recent entries for performance)
@@ -1256,12 +1382,14 @@ Data Summary:
   Oldest Entry: {oldest}
   Newest Entry: {newest}
 
-Enhanced Features Status:
+Latest Entry Focus Features:
+  ✓ Always focus on newest log entry when updated
   ✓ Sortable columns (click headers to sort)
   ✓ Working auto-refresh with adaptive intervals
-  ✓ Working auto-scroll to latest entries
+  ✓ Configurable auto-scroll and auto-focus behavior
   ✓ Real-time statistics updates
-  ✓ Improved time formatting with milliseconds
+  ✓ Enhanced time formatting with milliseconds
+  ✓ Manual "Focus Latest" button for immediate access
   ✓ Thread-safe operations
 
 Level Distribution:
@@ -1313,7 +1441,8 @@ Level Distribution:
         report += f"  Overall Health: {health}\n"
         report += f"  Error Rate: {error_rate:.2f}%\n"
         report += f"  Warning Rate: {warning_rate:.2f}%\n"
-        report += f"  Enhanced Viewer: Fully Operational\n"
+        report += f"  Enhanced Viewer: Fully Operational with Latest Focus\n"
         report += f"  Thread Safety: Enabled\n"
+        report += f"  Latest Entry Focus: Always Active\n"
         
         return report
