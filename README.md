@@ -54,7 +54,7 @@ py3\Scripts\activate
 pip install -r requirements.txt
 
 # Run GUI application
-python filemaker_gui.py
+python gui/filemaker_gui.py
 
 # Or use command line
 python filemaker_extract.py --help
