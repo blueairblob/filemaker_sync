@@ -1,0 +1,9 @@
+# Assumes Git Bash environment
+deactivate 2> /dev/null
+. ./py312/Scripts/activate
+
+export PYTHON=/c/dev/RAT_Trains_Project/Migration/scripts/py312/scripts/python.exe
+export PYTHONPATH=/c/dev/RAT_Trains_Project/Migration/scripts/py312/Lib/site-packages
+export PATH=/c/dev/RAT_Trains_Project/python/Migration/scripts/py312/Scripts:$PATH
+export DEBUG=0
+#filemaker_extract.py -t ratcatalogue --fn-exp False --db-exp True --check-ddl

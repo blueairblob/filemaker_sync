@@ -1,0 +1,17 @@
+Tab Navigation:
+
+Image no. > Category L > Accession no. > Country L  > Organisation/image type L > Parent folder > Organisation/area L > Route/Company L > Start location >  End location > Circa > Location L > Date Taken > Gauge L > Imprecise Date > Collection L > Condition L > Photographer L > Valuation > Entry date > Image stem > Owners ref. > Print sales? Y/N > Internet use ? Y/N >  CD/DVD Number > High resolution copy > Publication use? > B&W image No. >  B&W cd /dvd number > Description
+
+
+Lookups:
+Category L
+Country L
+Organisation/image type L
+Organisation/area L
+Route/Company L
+Location L
+Gauge L
+ Collection L
+Condition L
+Photographer L
+Valuation L £0.50
