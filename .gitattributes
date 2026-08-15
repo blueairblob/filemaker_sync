@@ -1,0 +1,8 @@
+* text=auto
+*.sql text
+*.py text
+*.png binary
+*.PNG binary
+*.docx binary
+*.xlsx binary
+*.fmpur binary
