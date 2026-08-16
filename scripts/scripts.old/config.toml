@@ -55,5 +55,5 @@
     port = '54322'                # Or not local then 6543 for supabase in the cloud
 
 #user = 'postgres.kmoehqdowgdupzdxtbei'
-#pwd = 'N1ceBigdatabase!'
+#pwd = '<Ref. ./.env or KeePass>!'
     

@@ -222,7 +222,7 @@ For the "Git Bash" terminal: Add to settings.json (Ctrl+Shift+P):
 
   ```
   Project : Rat
-  Password: N1ceBigdatabase!
+  Password: <Ref. ./.env or KeePass>!
   ```
 
   Project URL: `https://kmoehqdowgdupzdxtbei.supabase.co`
@@ -284,7 +284,7 @@ There are 2 Supabase Clients:
 `1) in C:\dev\RAT_Trains_Project\Migration`
 
   ```powershell
-    # user: rat  pwd: N1ceBigdatabase!
+    # user: rat  pwd: <Ref. ./.env or KeePass>!
     supabase login
     supabase link --project-ref kmoehqdowgdupzdxtbei
 
@@ -426,7 +426,7 @@ In MySQL: tables:
      cd C:\dev\RAT_Trains_Project\Migration\
      supabase login
      supabase link --project-ref kmoehqdowgdupzdxtbei
-     <PWD> = N1ceBigdatabase!
+     <PWD> = <Ref. ./.env or KeePass>!
      supabase start
      supabase status
      ...
