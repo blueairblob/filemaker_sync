@@ -85,8 +85,14 @@ class OperationManager:
             except Exception as e:
                 self.log_manager.log(LogLevel.ERROR, "OperationManager", f"Error in callback: {e}")
     
-    def run_python_command(self, cmd_args: List[str], description: str, timeout: Optional[int] = None) -> Dict[str, Any]:
-        """Run Python command with proper timeout and thread safety"""
+    def run_python_command(self, cmd_args: List[str], description: str, timeout: Optional[int] = None,
+                           script: str = 'filemaker_extract_refactored.py') -> Dict[str, Any]:
+        """Run Python command with proper timeout and thread safety
+
+        Args:
+            script: target script to execute. Defaults to the extract engine;
+                    pass 'db_dml_loader.py' to run the normalise/load stage.
+        """
         if timeout is None:
             timeout = self.connection_timeout if 'info-only' in cmd_args else self.command_timeout
         
@@ -99,14 +105,14 @@ class OperationManager:
                 return {'success': False, 'error': 'Shutdown requested'}
             
             # Check if script exists
-            script_path = Path('filemaker_extract_refactored.py')
+            script_path = Path(script)
             if not script_path.exists():
-                error_msg = 'filemaker_extract_refactored.py not found'
+                error_msg = f'{script} not found'
                 self.log_manager.log(LogLevel.ERROR, "Command", error_msg)
                 return {'success': False, 'error': error_msg}
             
             # Build command
-            full_command = [sys.executable, 'filemaker_extract_refactored.py'] + cmd_args
+            full_command = [sys.executable, script] + cmd_args
             self.log_manager.log(LogLevel.DEBUG, "Command", f"Executing: {' '.join(full_command)}")
             
             with PerformanceLogger(self.log_manager, "Command", description):
@@ -214,6 +220,17 @@ class OperationManager:
             self.log_manager.log(LogLevel.ERROR, "Command", f"Error extracting JSON: {e}")
             return None
     
+    def _load_export_path(self) -> str:
+        """Read export.path from config.toml (the same file the scripts read)."""
+        try:
+            import tomli
+            cfg = tomli.loads(Path('config.toml').read_text(encoding='utf-8'))
+            return str(cfg['export']['path'])
+        except Exception as e:
+            self.log_manager.log(LogLevel.WARNING, "Operation",
+                                 f"Could not read export.path from config.toml ({e}); defaulting to 'exports'")
+            return 'exports'
+
     def run_operation_async(self, operation: str, on_complete: Optional[Callable] = None) -> bool:
         """Run operation asynchronously"""
         # Check if already running
@@ -226,13 +243,18 @@ class OperationManager:
             self._current_operation = operation
         
         # Operation commands
+        # 'load_to_target' runs the second-stage normaliser (db_dml_loader.py) in
+        # dml_files mode against the export directory produced by 'Export to Files'.
+        export_path = self._load_export_path()
         operation_commands = {
             'full_sync': ['--db-exp', '--ddl', '--dml'],
             'incremental_sync': ['--db-exp', '--dml'],
             'export_files': ['--fn-exp', '--ddl', '--dml'],
             'export_images': ['--get-images'],
             'test_connections': ['--info-only'],
-            'migration_status': ['--migration-status', '--json']
+            'migration_status': ['--migration-status', '--json'],
+            'load_to_target': ['--mode', 'dml_files', '--export-path', export_path,
+                               '--user-id', 'migration-gui']
         }
         
         if operation not in operation_commands:
@@ -260,14 +282,17 @@ class OperationManager:
                 self.log_manager.log(LogLevel.INFO, "Operation", f"Executing: {operation}")
                 
                 # Choose timeout based on operation type
-                if operation in ['full_sync', 'export_files']:
+                if operation == 'load_to_target':
+                    timeout = 3600  # up to 1 hour: full normalise/load of the catalogue
+                elif operation in ['full_sync', 'export_files']:
                     timeout = 300  # 5 minutes for long operations
                 elif operation == 'export_images':
                     timeout = 600  # 10 minutes for image export
                 else:
                     timeout = 60   # 1 minute for quick operations
                 
-                command_result = self.run_python_command(cmd, f"{operation.replace('_', ' ').title()}", timeout)
+                script = 'db_dml_loader.py' if operation == 'load_to_target' else 'filemaker_extract_refactored.py'
+                command_result = self.run_python_command(cmd, f"{operation.replace('_', ' ').title()}", timeout, script=script)
                 
                 if command_result['success']:
                     self.log_manager.log(LogLevel.INFO, "Operation", f"✓ {operation} completed successfully")

@@ -276,6 +276,7 @@ class FileMakerSyncGUI:
         actions = self.quick_actions.action_buttons
         actions['Full Sync'].configure(command=lambda: self.safe_run_operation('full_sync'))
         actions['Incremental Sync'].configure(command=lambda: self.safe_run_operation('incremental_sync'))
+        actions['Load to Target'].configure(command=lambda: self.safe_run_operation('load_to_target'))
         actions['Export to Files'].configure(command=lambda: self.safe_run_operation('export_files'))
         actions['Export Images'].configure(command=lambda: self.safe_run_operation('export_images'))
         actions['Test Connections'].configure(command=self.safe_test_all_connections)

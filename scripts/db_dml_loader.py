@@ -542,8 +542,9 @@ def migrate_catalog_metadata(df):
         collection_id = collection_id[0]['id'] if collection_id else None
         photographer_id = photographer_id[0]['id'] if photographer_id else None
         
+        if catalog_id is None:
+            continue  # skip: no catalog row matched this image_no (would orphan / violate FK)
         metadata_data.append({
-            'id': row['image_no'],  # Using image_no as ID for simplicity
             'catalog_id': catalog_id,
             'organisation_id': organisation_id,
             'location_id': location_id,
@@ -551,7 +552,7 @@ def migrate_catalog_metadata(df):
             'collection_id': collection_id,
             'photographer_id': photographer_id
         })
-    batch_upsert(f'{tgt_schema}.catalog_metadata', metadata_data, id_column='id')
+    batch_upsert(f'{tgt_schema}.catalog_metadata', metadata_data, id_column='catalog_id')
     logger.info(f"Completed catalog metadata migration. Migrated {len(df)} metadata entries")
 
 def migrate_usage(df):
@@ -561,14 +562,15 @@ def migrate_usage(df):
     for _, row in df.iterrows():
         catalog_id = supabase.table('catalog').select('id').eq('image_no', row['image_no']).execute().data
         catalog_id = catalog_id[0]['id'] if catalog_id else None
+        if catalog_id is None:
+            continue  # skip: no catalog row matched this image_no (usage has no standalone id)
         usage_data.append({
-            'id': row['image_no'],  # Using image_no as ID for simplicity
             'catalog_id': catalog_id,
             'prints_allowed': row['prints_allowed'] == 'yes',
             'internet_use': row['internet_use'] == 'yes',
             'publications_use': row['publications_use'] == 'yes'
         })
-    batch_upsert(f'{tgt_schema}.usage', usage_data, id_column='id')
+    batch_upsert(f'{tgt_schema}.usage', usage_data, id_column='catalog_id')
     logger.info(f"Completed usage data migration. Migrated {len(df)} usage entries")
     
 def migrate_collection(df):

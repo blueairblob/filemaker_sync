@@ -1,0 +1,214 @@
+diff --git a/gui/filemaker_gui.py b/gui/filemaker_gui.py
+index 8c3d786..3abb6c3 100644
+--- a/gui/filemaker_gui.py
++++ b/gui/filemaker_gui.py
+@@ -276,6 +276,7 @@ class FileMakerSyncGUI:
+         actions = self.quick_actions.action_buttons
+         actions['Full Sync'].configure(command=lambda: self.safe_run_operation('full_sync'))
+         actions['Incremental Sync'].configure(command=lambda: self.safe_run_operation('incremental_sync'))
++        actions['Load to Target'].configure(command=lambda: self.safe_run_operation('load_to_target'))
+         actions['Export to Files'].configure(command=lambda: self.safe_run_operation('export_files'))
+         actions['Export Images'].configure(command=lambda: self.safe_run_operation('export_images'))
+         actions['Test Connections'].configure(command=self.safe_test_all_connections)
+diff --git a/gui/gui_operations.py b/gui/gui_operations.py
+index 9750c31..e47da49 100644
+--- a/gui/gui_operations.py
++++ b/gui/gui_operations.py
+@@ -85,8 +85,14 @@ class OperationManager:
+             except Exception as e:
+                 self.log_manager.log(LogLevel.ERROR, "OperationManager", f"Error in callback: {e}")
+     
+-    def run_python_command(self, cmd_args: List[str], description: str, timeout: Optional[int] = None) -> Dict[str, Any]:
+-        """Run Python command with proper timeout and thread safety"""
++    def run_python_command(self, cmd_args: List[str], description: str, timeout: Optional[int] = None,
++                           script: str = 'filemaker_extract_refactored.py') -> Dict[str, Any]:
++        """Run Python command with proper timeout and thread safety
++
++        Args:
++            script: target script to execute. Defaults to the extract engine;
++                    pass 'db_dml_loader.py' to run the normalise/load stage.
++        """
+         if timeout is None:
+             timeout = self.connection_timeout if 'info-only' in cmd_args else self.command_timeout
+         
+@@ -99,14 +105,14 @@ class OperationManager:
+                 return {'success': False, 'error': 'Shutdown requested'}
+             
+             # Check if script exists
+-            script_path = Path('filemaker_extract_refactored.py')
++            script_path = Path(script)
+             if not script_path.exists():
+-                error_msg = 'filemaker_extract_refactored.py not found'
++                error_msg = f'{script} not found'
+                 self.log_manager.log(LogLevel.ERROR, "Command", error_msg)
+                 return {'success': False, 'error': error_msg}
+             
+             # Build command
+-            full_command = [sys.executable, 'filemaker_extract_refactored.py'] + cmd_args
++            full_command = [sys.executable, script] + cmd_args
+             self.log_manager.log(LogLevel.DEBUG, "Command", f"Executing: {' '.join(full_command)}")
+             
+             with PerformanceLogger(self.log_manager, "Command", description):
+@@ -214,6 +220,17 @@ class OperationManager:
+             self.log_manager.log(LogLevel.ERROR, "Command", f"Error extracting JSON: {e}")
+             return None
+     
++    def _load_export_path(self) -> str:
++        """Read export.path from config.toml (the same file the scripts read)."""
++        try:
++            import tomli
++            cfg = tomli.loads(Path('config.toml').read_text(encoding='utf-8'))
++            return str(cfg['export']['path'])
++        except Exception as e:
++            self.log_manager.log(LogLevel.WARNING, "Operation",
++                                 f"Could not read export.path from config.toml ({e}); defaulting to 'exports'")
++            return 'exports'
++
+     def run_operation_async(self, operation: str, on_complete: Optional[Callable] = None) -> bool:
+         """Run operation asynchronously"""
+         # Check if already running
+@@ -226,13 +243,18 @@ class OperationManager:
+             self._current_operation = operation
+         
+         # Operation commands
++        # 'load_to_target' runs the second-stage normaliser (db_dml_loader.py) in
++        # dml_files mode against the export directory produced by 'Export to Files'.
++        export_path = self._load_export_path()
+         operation_commands = {
+             'full_sync': ['--db-exp', '--ddl', '--dml'],
+             'incremental_sync': ['--db-exp', '--dml'],
+             'export_files': ['--fn-exp', '--ddl', '--dml'],
+             'export_images': ['--get-images'],
+             'test_connections': ['--info-only'],
+-            'migration_status': ['--migration-status', '--json']
++            'migration_status': ['--migration-status', '--json'],
++            'load_to_target': ['--mode', 'dml_files', '--export-path', export_path,
++                               '--user-id', 'migration-gui']
+         }
+         
+         if operation not in operation_commands:
+@@ -260,14 +282,17 @@ class OperationManager:
+                 self.log_manager.log(LogLevel.INFO, "Operation", f"Executing: {operation}")
+                 
+                 # Choose timeout based on operation type
+-                if operation in ['full_sync', 'export_files']:
++                if operation == 'load_to_target':
++                    timeout = 3600  # up to 1 hour: full normalise/load of the catalogue
++                elif operation in ['full_sync', 'export_files']:
+                     timeout = 300  # 5 minutes for long operations
+                 elif operation == 'export_images':
+                     timeout = 600  # 10 minutes for image export
+                 else:
+                     timeout = 60   # 1 minute for quick operations
+                 
+-                command_result = self.run_python_command(cmd, f"{operation.replace('_', ' ').title()}", timeout)
++                script = 'db_dml_loader.py' if operation == 'load_to_target' else 'filemaker_extract_refactored.py'
++                command_result = self.run_python_command(cmd, f"{operation.replace('_', ' ').title()}", timeout, script=script)
+                 
+                 if command_result['success']:
+                     self.log_manager.log(LogLevel.INFO, "Operation", f"✓ {operation} completed successfully")
+diff --git a/gui/gui_widgets.py b/gui/gui_widgets.py
+index 643704a..1894180 100644
+--- a/gui/gui_widgets.py
++++ b/gui/gui_widgets.py
+@@ -267,6 +267,7 @@ class QuickActions(ttk.Frame):
+         button_configs = [
+             ('Full Sync', 'both_required'),
+             ('Incremental Sync', 'both_required'),
++            ('Load to Target', 'target_only'),
+             ('Export to Files', 'source_only'),
+             ('Export Images', 'source_only'),
+             ('Test Connections', 'none'),
+@@ -339,6 +340,7 @@ class QuickActions(ttk.Frame):
+         states = {
+             'Full Sync': 'normal' if fm_connected and target_connected else 'disabled',
+             'Incremental Sync': 'normal' if fm_connected and target_connected else 'disabled',
++            'Load to Target': 'normal' if target_connected else 'disabled',
+             'Export to Files': 'normal' if fm_connected else 'disabled',
+             'Export Images': 'normal' if fm_connected else 'disabled',
+             'Test Connections': 'normal',
+diff --git a/scripts/db_dml_loader.py b/scripts/db_dml_loader.py
+index 72ff342..ceed311 100644
+--- a/scripts/db_dml_loader.py
++++ b/scripts/db_dml_loader.py
+@@ -542,8 +542,9 @@ def migrate_catalog_metadata(df):
+         collection_id = collection_id[0]['id'] if collection_id else None
+         photographer_id = photographer_id[0]['id'] if photographer_id else None
+         
++        if catalog_id is None:
++            continue  # skip: no catalog row matched this image_no (would orphan / violate FK)
+         metadata_data.append({
+-            'id': row['image_no'],  # Using image_no as ID for simplicity
+             'catalog_id': catalog_id,
+             'organisation_id': organisation_id,
+             'location_id': location_id,
+@@ -551,7 +552,7 @@ def migrate_catalog_metadata(df):
+             'collection_id': collection_id,
+             'photographer_id': photographer_id
+         })
+-    batch_upsert(f'{tgt_schema}.catalog_metadata', metadata_data, id_column='id')
++    batch_upsert(f'{tgt_schema}.catalog_metadata', metadata_data, id_column='catalog_id')
+     logger.info(f"Completed catalog metadata migration. Migrated {len(df)} metadata entries")
+ 
+ def migrate_usage(df):
+@@ -561,14 +562,15 @@ def migrate_usage(df):
+     for _, row in df.iterrows():
+         catalog_id = supabase.table('catalog').select('id').eq('image_no', row['image_no']).execute().data
+         catalog_id = catalog_id[0]['id'] if catalog_id else None
++        if catalog_id is None:
++            continue  # skip: no catalog row matched this image_no (usage has no standalone id)
+         usage_data.append({
+-            'id': row['image_no'],  # Using image_no as ID for simplicity
+             'catalog_id': catalog_id,
+             'prints_allowed': row['prints_allowed'] == 'yes',
+             'internet_use': row['internet_use'] == 'yes',
+             'publications_use': row['publications_use'] == 'yes'
+         })
+-    batch_upsert(f'{tgt_schema}.usage', usage_data, id_column='id')
++    batch_upsert(f'{tgt_schema}.usage', usage_data, id_column='catalog_id')
+     logger.info(f"Completed usage data migration. Migrated {len(df)} usage entries")
+     
+ def migrate_collection(df):
+diff --git a/supabase/schema/fix_rat_constraints.sql b/supabase/schema/fix_rat_constraints.sql
+new file mode 100644
+index 0000000..2984796
+--- /dev/null
++++ b/supabase/schema/fix_rat_constraints.sql
+@@ -0,0 +1,37 @@
++-- fix_rat_constraints.sql
++-- Prerequisite DDL for the db_dml_loader.py catalog_metadata / usage fixes.
++-- Run against the live `rat` schema BEFORE re-running the loader.
++-- Safe to run more than once (guarded / IF [NOT] EXISTS).
++
++-- ---------------------------------------------------------------------------
++-- Fix 1: make catalog_metadata idempotent (1:1 with catalog)
++-- The loader now upserts with ON CONFLICT (catalog_id). That conflict target
++-- only works if catalog_id carries a UNIQUE constraint. usage.catalog_id and
++-- picture_metadata.catalog_id already have one; catalog_metadata does not.
++--
++-- PRE-CHECK — if this returns any rows, dedupe them first or the ALTER fails:
++--   SELECT catalog_id, count(*)
++--   FROM rat.catalog_metadata
++--   GROUP BY catalog_id
++--   HAVING count(*) > 1;
++-- ---------------------------------------------------------------------------
++DO $$
++BEGIN
++  IF NOT EXISTS (
++    SELECT 1 FROM pg_constraint
++    WHERE conname = 'catalog_metadata_catalog_id_key'
++      AND conrelid = 'rat.catalog_metadata'::regclass
++  ) THEN
++    ALTER TABLE rat.catalog_metadata
++      ADD CONSTRAINT catalog_metadata_catalog_id_key UNIQUE (catalog_id);
++  END IF;
++END $$;
++
++-- ---------------------------------------------------------------------------
++-- Fix 2: remove the duplicate foreign key on picture_metadata.
++-- The live schema has two identical FKs on catalog_id:
++--   picture_metadata_catalog_id_fkey  and  picture_metadata_catalog_id_fkey1
++-- Keep the first, drop the accidental duplicate.
++-- ---------------------------------------------------------------------------
++ALTER TABLE rat.picture_metadata
++  DROP CONSTRAINT IF EXISTS picture_metadata_catalog_id_fkey1;

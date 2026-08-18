@@ -267,6 +267,7 @@ class QuickActions(ttk.Frame):
         button_configs = [
             ('Full Sync', 'both_required'),
             ('Incremental Sync', 'both_required'),
+            ('Load to Target', 'target_only'),
             ('Export to Files', 'source_only'),
             ('Export Images', 'source_only'),
             ('Test Connections', 'none'),
@@ -339,6 +340,7 @@ class QuickActions(ttk.Frame):
         states = {
             'Full Sync': 'normal' if fm_connected and target_connected else 'disabled',
             'Incremental Sync': 'normal' if fm_connected and target_connected else 'disabled',
+            'Load to Target': 'normal' if target_connected else 'disabled',
             'Export to Files': 'normal' if fm_connected else 'disabled',
             'Export Images': 'normal' if fm_connected else 'disabled',
             'Test Connections': 'normal',
