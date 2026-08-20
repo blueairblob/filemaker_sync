@@ -32,6 +32,23 @@ from datetime import datetime
 import re
 from pathlib import Path
 import tomli
+try:
+    from env_secrets import resolve_secret, url_quote
+except ImportError:                       # self-contained fallback (identical behaviour)
+    import os as _os
+    from urllib.parse import quote_plus as _qp
+    def resolve_secret(env_key, cfg_val=None, cli_val=None, default=""):
+        if cli_val is not None:
+            return cli_val
+        try:
+            from dotenv import load_dotenv; load_dotenv()
+        except ModuleNotFoundError:
+            pass
+        _v = _os.environ.get(env_key)
+        return _v if _v else (cfg_val if cfg_val is not None else default)
+    def url_quote(value):
+        return _qp(str(value or ""))
+
 from PIL import Image
 from io import BytesIO
 from tqdm import tqdm
@@ -212,11 +229,11 @@ def get_db_connect(db, dsn=True):
         
         try:
             if dbt_type == 'mysql':
-                url=f"mysql+pymysql://{db[db_type]['user']}:{db[db_type]['pwd']}@{db['host']}:{db[db_type]['port']}/{dsn_str}"
+                url=f"mysql+pymysql://{db[db_type]['user']}:{url_quote(resolve_secret('RAT_TARGET_PWD', db[db_type].get('pwd','')))}@{db['host']}:{db[db_type]['port']}/{dsn_str}"
                 engine = create_engine(url)
                 
             elif dbt_type == 'supabase':
-                url=f"postgresql://{db[db_type]['user']}:{db[db_type]['pwd']}@{db['host']}:{db[db_type]['port']}/{dsn_str}"
+                url=f"postgresql://{db[db_type]['user']}:{url_quote(resolve_secret('RAT_TARGET_PWD', db[db_type].get('pwd','')))}@{db['host']}:{db[db_type]['port']}/{dsn_str}"
                 logger.debug(f"Db connect url: {url}")
                 engine = create_engine(url)
             else:
@@ -230,7 +247,7 @@ def get_db_connect(db, dsn=True):
     else:
         try:
             logger.info(f"Connecting to {db['name'][1]}.")
-            conn_str = f"DSN={db['dsn']};UID={db['user']};PWD={db['pwd']};CHARSET='UTF-8';ansi=True"
+            conn_str = f"DSN={db['dsn']};UID={db['user']};PWD={resolve_secret('RAT_SOURCE_PWD', db.get('pwd',''))};CHARSET='UTF-8';ansi=True"
             cn = pyodbc.connect(conn_str)
 
             # SQLAlchemy:

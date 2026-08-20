@@ -61,6 +61,23 @@ import io
 from collections import OrderedDict
 from sqlalchemy.exc import IntegrityError
 from psycopg2.errors import UniqueViolation, ForeignKeyViolation
+try:
+    from env_secrets import resolve_secret, url_quote
+except ImportError:                       # self-contained fallback (identical behaviour)
+    import os as _os
+    from urllib.parse import quote_plus as _qp
+    def resolve_secret(env_key, cfg_val=None, cli_val=None, default=""):
+        if cli_val is not None:
+            return cli_val
+        try:
+            from dotenv import load_dotenv; load_dotenv()
+        except ModuleNotFoundError:
+            pass
+        _v = _os.environ.get(env_key)
+        return _v if _v else (cfg_val if cfg_val is not None else default)
+    def url_quote(value):
+        return _qp(str(value or ""))
+
 
 
 # Global variables
@@ -239,7 +256,8 @@ def read_dml_extracts(export_path):
 def get_db_engine(config):
     db_type = config['database']['target']['db']
     db_config = config['database']['target'][db_type]
-    db_url = f"postgresql://{db_config['user']}:{db_config['pwd']}@{config['database']['target']['host']}:{db_config['port']}/{config['database']['target']['dsn']}"
+    pwd = resolve_secret('RAT_TARGET_PWD', db_config.get('pwd', ''))
+    db_url = f"postgresql://{db_config['user']}:{url_quote(pwd)}@{config['database']['target']['host']}:{db_config['port']}/{config['database']['target']['dsn']}"
     return create_engine(db_url)
   
 def get_table(table_name, schema = 'public'):

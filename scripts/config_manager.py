@@ -9,6 +9,23 @@ import logging
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
+try:
+    from env_secrets import resolve_secret, url_quote
+except ImportError:                       # self-contained fallback (identical behaviour)
+    import os as _os
+    from urllib.parse import quote_plus as _qp
+    def resolve_secret(env_key, cfg_val=None, cli_val=None, default=""):
+        if cli_val is not None:
+            return cli_val
+        try:
+            from dotenv import load_dotenv; load_dotenv()
+        except ModuleNotFoundError:
+            pass
+        _v = _os.environ.get(env_key)
+        return _v if _v else (cfg_val if cfg_val is not None else default)
+    def url_quote(value):
+        return _qp(str(value or ""))
+
 
 
 @dataclass
@@ -89,7 +106,7 @@ class ConfigManager:
                 host=source_config.get('host', '127.0.0.1'),
                 dsn=source_config['dsn'],
                 user=source_config['user'],
-                pwd=source_config['pwd'],
+                pwd=resolve_secret('RAT_SOURCE_PWD', source_config.get('pwd', '')),
                 port=source_config.get('port', ''),
                 type=source_config['type'],
                 name=source_config['name'],
@@ -104,7 +121,7 @@ class ConfigManager:
                 host=target_config['host'],
                 dsn=target_config['dsn'],
                 user=target_config[db_type]['user'],
-                pwd=target_config[db_type]['pwd'],
+                pwd=resolve_secret('RAT_TARGET_PWD', target_config[db_type].get('pwd', '')),
                 port=target_config[db_type]['port'],
                 type=target_config['type'],
                 name=target_config[db_type]['name'],
@@ -158,9 +175,9 @@ class ConfigManager:
         dsn_str = config.target_db.dsn if use_dsn else ''
         
         if config.db_type == 'mysql':
-            return f"mysql+pymysql://{config.target_db.user}:{config.target_db.pwd}@{config.target_db.host}:{config.target_db.port}/{dsn_str}"
+            return f"mysql+pymysql://{config.target_db.user}:{url_quote(config.target_db.pwd)}@{config.target_db.host}:{config.target_db.port}/{dsn_str}"
         elif config.db_type == 'supabase':
-            return f"postgresql://{config.target_db.user}:{config.target_db.pwd}@{config.target_db.host}:{config.target_db.port}/{dsn_str}"
+            return f"postgresql://{config.target_db.user}:{url_quote(config.target_db.pwd)}@{config.target_db.host}:{config.target_db.port}/{dsn_str}"
         else:
             raise ValueError(f"Unsupported database type: {config.db_type}")
     

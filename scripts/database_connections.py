@@ -12,6 +12,23 @@ from contextlib import contextmanager
 import logging
 from typing import Optional, Tuple, List, Dict, Any
 from config_manager import ConfigManager, AppConfig
+try:
+    from env_secrets import resolve_secret, url_quote
+except ImportError:                       # self-contained fallback (identical behaviour)
+    import os as _os
+    from urllib.parse import quote_plus as _qp
+    def resolve_secret(env_key, cfg_val=None, cli_val=None, default=""):
+        if cli_val is not None:
+            return cli_val
+        try:
+            from dotenv import load_dotenv; load_dotenv()
+        except ModuleNotFoundError:
+            pass
+        _v = _os.environ.get(env_key)
+        return _v if _v else (cfg_val if cfg_val is not None else default)
+    def url_quote(value):
+        return _qp(str(value or ""))
+
 
 
 class DatabaseConnectionError(Exception):
@@ -137,10 +154,10 @@ class TargetDatabaseConnection:
         try:
             if self.config.db_type == 'mysql':
                 dsn_str = self.config.target_db.dsn if use_dsn else ''
-                url = f"mysql+pymysql://{self.config.target_db.user}:{self.config.target_db.pwd}@{self.config.target_db.host}:{self.config.target_db.port}/{dsn_str}"
+                url = f"mysql+pymysql://{self.config.target_db.user}:{url_quote(self.config.target_db.pwd)}@{self.config.target_db.host}:{self.config.target_db.port}/{dsn_str}"
             elif self.config.db_type == 'supabase':
                 dsn_str = self.config.target_db.dsn if use_dsn else ''
-                url = f"postgresql://{self.config.target_db.user}:{self.config.target_db.pwd}@{self.config.target_db.host}:{self.config.target_db.port}/{dsn_str}"
+                url = f"postgresql://{self.config.target_db.user}:{url_quote(self.config.target_db.pwd)}@{self.config.target_db.host}:{self.config.target_db.port}/{dsn_str}"
             else:
                 raise ValueError(f"Unsupported database type: {self.config.db_type}")
             
