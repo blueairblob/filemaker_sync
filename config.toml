@@ -25,7 +25,7 @@ user = "migration_user"
 [database.target.supabase]
 name = ["supabase", "Supabase"]
 user = "postgres.kmoehqdowgdupzdxtbei"
-pwd = "<Ref. ./.env or KeePass>!"
+pwd = "Ref .env or KeePass"
 port = "5432"
 
 [export]
