@@ -1,0 +1,60 @@
+diff --git a/scripts/db_dml_loader.py b/scripts/db_dml_loader.py
+index cefcf83..a21a199 100644
+--- a/scripts/db_dml_loader.py
++++ b/scripts/db_dml_loader.py
+@@ -387,7 +387,8 @@ def batch_upsert(table_name, data, id_column='id'):
+             #     index_elements=[id_column],
+             #     set_={c.key: c for c in stmt.excluded if c.key != id_column}
+             # )
+-            stmt = stmt.on_conflict_do_nothing(index_elements=[id_column])
++            index_elements = list(id_column) if isinstance(id_column, (list, tuple)) else [id_column]
++            stmt = stmt.on_conflict_do_nothing(index_elements=index_elements)
+             
+             try:
+                 result = supabase.execute(stmt)
+@@ -607,7 +608,7 @@ def migrate_collection(df):
+         })
+     
+     # Perform batch upsert
+-    batch_upsert(f'{tgt_schema}.collection', collection_data, id_column='id')
++    batch_upsert(f'{tgt_schema}.collection', collection_data, id_column='name')
+     logger.info(f"Completed collection migration. Migrated {len(collection_data)} collections")
+     
+ def migrate_photographer(df):
+@@ -628,7 +629,7 @@ def migrate_photographer(df):
+     
+     photographer_data = [{'name': photographer} for photographer in unique_photographers]
+     
+-    batch_upsert(f'{tgt_schema}.photographer', photographer_data)
++    batch_upsert(f'{tgt_schema}.photographer', photographer_data, id_column='name')
+     logger.info(f"Completed photographer migration. Migrated {len(photographer_data)} photographers")
+ 
+ def migrate_builder(df):
+@@ -642,7 +643,7 @@ def migrate_builder(df):
+             'name': row['builder'],
+             'location': row['builder_location'] if 'builder_location' in row else None
+         })
+-    batch_upsert(f'{tgt_schema}.builder', builder_data)
++    batch_upsert(f'{tgt_schema}.builder', builder_data, id_column='name')
+     logger.info(f"Completed builder migration. Migrated {len(builder_data)} builders")
+ 
+ def migrate_catalog_builder(df):
+@@ -659,7 +660,7 @@ def migrate_catalog_builder(df):
+                 'builder_id': builder_id[0]['builder_id'],
+                 'builder_order': 1  # Assuming single builder per catalog, adjust if needed
+             })
+-    batch_upsert(f'{tgt_schema}.catalog_builder', catalog_builder_data)
++    batch_upsert(f'{tgt_schema}.catalog_builder', catalog_builder_data, id_column=['catalog_id', 'builder_id', 'builder_order'])
+     logger.info(f"Completed catalog_builder migration. Migrated {len(catalog_builder_data)} catalog-builder relationships")
+ 
+ def migrate_picture_metadata(df):
+@@ -680,6 +681,9 @@ def migrate_picture_metadata(df):
+             'ai_description': None,  # Add if available in your data
+             'tags': None  # Add if available in your data
+         })
++    # TODO(idempotency): switch to id_column='catalog_id' once picture_metadata is
++    # de-duplicated on catalog_id and a UNIQUE(catalog_id) constraint is added.
++    # Deferred: ~354 extra rows (duplicate/orphan catalog_id) — report-only for now.
+     batch_upsert(f'{tgt_schema}.picture_metadata', metadata_data)
+     logger.info(f"Completed picture_metadata migration. Migrated {len(metadata_data)} picture metadata entries")
+ 
