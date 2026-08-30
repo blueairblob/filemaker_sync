@@ -16,6 +16,7 @@ colorama>=0.4.6
 # Database drivers
 PyMySQL>=1.1.0
 psycopg2-binary>=2.9.9
+python-dotenv>=1.0.0
 
 # Core Python libraries (usually included but listed for completeness)
 greenlet>=3.0.0
@@ -40,4 +41,3 @@ pytz
 six
 typing-extensions
 tzdata
-psycopg2
