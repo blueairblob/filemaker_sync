@@ -3,7 +3,7 @@
 """
 DML to Supabase Migration Script
 
-This script automates the process of migrating data from DML exports to a Supabase database.
+This script automates the process of migrating data from DML exports scripts OR from a local database migration schema.
 It handles multiple export files, performs batch processing, supports resuming interrupted migrations,
 and populates audit columns.
 
@@ -42,11 +42,14 @@ Date: [Current Date]
 Version: 1.0
 """
 
+import sys
+import os
+os.system('chcp 65001')  # Set console to UTF-8
 from pathlib import Path
 import re
-import os
 import tomli
 import pandas as pd
+from PIL import Image
 #from supabase import create_client, Client
 from sqlalchemy import create_engine, MetaData, Table, select, insert, inspect, text
 from sqlalchemy.orm import sessionmaker
@@ -60,7 +63,10 @@ from tqdm import tqdm
 import io
 from collections import OrderedDict
 from sqlalchemy.exc import IntegrityError
-from psycopg2.errors import UniqueViolation, ForeignKeyViolation
+from psycopg2.errors import UniqueViolation, ForeignKeyViolation, StringDataRightTruncation
+from psycopg2.errors import StringDataRightTruncation, Error as PGError
+
+# --- shared secret resolution (env/.env first, config fallback) ---------------
 try:
     from env_secrets import resolve_secret, url_quote
 except ImportError:                       # self-contained fallback (identical behaviour)
@@ -78,8 +84,7 @@ except ImportError:                       # self-contained fallback (identical b
     def url_quote(value):
         return _qp(str(value or ""))
 
-
-
+        
 # Global variables
 user_id = None
 debug = False
@@ -90,10 +95,44 @@ config = None
 
 
 # Set up logging
-def setup_logging(debug_mode):
-    log_level = logging.DEBUG if debug_mode else logging.INFO
-    logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s')
-    return logging.getLogger(__name__)
+def setup_logging(debug_mode=False):
+    """Set up logging with proper Unicode handling."""
+    # Create logs directory if it doesn't exist
+    log_dir = Path('./logs')
+    log_dir.mkdir(exist_ok=True)
+
+    # Get current date for log file name
+    timestamp = datetime.now().strftime("%Y%m%d")
+    log_file = log_dir / f'db_dml_loader_{timestamp}.log'
+
+    # Create logger
+    logger = logging.getLogger('db_dml_loader')
+    logger.setLevel(logging.DEBUG if debug_mode else logging.INFO)
+
+    # Create formatters and add it to handlers
+    log_format = '%(asctime)s,%(msecs)03d %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s'
+    date_format = '%Y-%m-%d:%H:%M:%S'
+    formatter = logging.Formatter(log_format, date_format)
+
+    # Set up file handler with UTF-8 encoding
+    file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    # Set up console handler with UTF-8 encoding if in debug mode
+    if debug_mode:
+        import sys
+        # Force UTF-8 encoding for stdout if on Windows
+        if sys.platform == 'win32':
+            import codecs
+            sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer)
+            sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer)
+        
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+
+    return logger, log_file
   
 def get_args():
     """Parse command line arguments."""
@@ -103,6 +142,7 @@ def get_args():
     parser.add_argument("--batch-size", type=int, default=1000, help="Batch size for inserts")
     parser.add_argument("--user-id", help="User ID for audit columns")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument("--upload-images", action="store_true", help="Upload images to Supabase storage")
     return parser.parse_args()
 
 def load_config():
@@ -115,7 +155,14 @@ def load_config():
         raise FileNotFoundError(f"Config file not found: {cfg_pth}/{cfg_fn}")
     except tomli.TOMLDecodeError as e:
         raise ValueError(f"Error parsing TOML file: {e}")
-                  
+
+def format_pg_error(e):
+    """Format PostgreSQL error details for log entries."""
+    try:
+        return f"Database error: {e.orig.diag.message_primary}"
+    except AttributeError:
+        return f"Error: {str(e)}"
+                
 def clear_existing_reject_file(file_path):
     """Delete the existing reject file if it exists."""
     reject_file_path = f"{file_path}.reject"
@@ -294,8 +341,9 @@ def read_data_from_migration_schema(table_name):
         result = connection.execute(select(table))
         columns = result.keys()
         first_row = result.fetchone()
-        print(f"Columns: {columns}")
-        print(f"First row: {first_row}")
+        # if debug: 
+        #     print(f"{table_name}: Columns: {columns}")
+        #     print(f"{table_name}: First row: {first_row}")
         data = []
         for row in result:
             row_dict = {}
@@ -339,92 +387,196 @@ def create_table_if_not_exists(table_name, schema):
         return False
     return True
 
-def batch_upsert(table_name, data, id_column='id'):
-    """Perform batch upsert operations, resuming from the last migrated ID."""
+def clean_string_data(value):
+    """Clean string data by removing leading/trailing whitespace."""
+    if isinstance(value, str):
+        return value.strip()
+    return value
+
+def clean_record_data(record):
+    """Clean all string values in a record dictionary."""
+    return {k: clean_string_data(v) for k, v in record.items()}
+          
+def batch_upsert(table_name, data, uniq_columns=['id'], return_after_batch=False, quiet=True, batch_data={}):
+    """
+    Perform batch upsert operations with bulk insert optimization while maintaining compatibility
+    with existing error handling and logging.
+    """
     global user_id, batch_size
     
-    if debug: logger.info(f"Starting batch upsert for table: {table_name}")
+    success_cnt = 0
     
     # Table comes with schema
     tab = table_name.split('.')
-    schema = tab[0]
+    tgt_schema = tab[0]
     table_name = tab[1]
-    # Check table exists
-    if not create_table_if_not_exists(table_name, schema):
-        return
-    
-    target_table = get_table(table_name, schema)
-
-    total_affected = 0
-    error_counts = {
-        'unique_violations': 0,
-        'foreign_key_violations': 0,
-        'other_integrity_errors': 0,
-        'other_errors': 0
-    }
-
-    # Check Resume: Only works with provided PK integers
-    # last_id = get_last_migrated_id(table_name)
-    # if last_id:
-    #    data = [record for record in data if record[id_column] > last_id]
-
     current_time = datetime.now(timezone.utc).isoformat()
-    data_len = len(data)
-    #if data_len < batch_size:
-    #    batch_size = data_len
-    for i in tqdm(range(0, data_len, batch_size), desc=f"Upserting {data_len} to {table_name} (max batch {batch_size})"): 
-        batch = data[i:i+batch_size]
-        # Each batch gets audit data
-        for record in batch:
-            record['created_by'] = user_id
-            record['created_date'] = current_time
-            record['modified_by'] = user_id
-            record['modified_date'] = current_time
     
-        try:
-            stmt = pg_insert(target_table).values(batch)
-            # stmt = stmt.on_conflict_do_update(
-            #     index_elements=[id_column],
-            #     set_={c.key: c for c in stmt.excluded if c.key != id_column}
-            # )
-            index_elements = list(id_column) if isinstance(id_column, (list, tuple)) else [id_column]
-            stmt = stmt.on_conflict_do_nothing(index_elements=index_elements)
+    try:
+        data_len = len(data) 
+        if return_after_batch:
+            # This is done at the callee level for efficiency
+            batches = [data]
+            tgt_table_obj = batch_data[table_name]['table_obj']
+            columns_info = batch_data[table_name]['columns_info']
+            error_counts = batch_data[table_name]['error_counts']
+            error_records = batch_data[table_name]['error_records'] 
+        else:
+            # This is a one-off task so we can get our data here
+            tgt_table_obj = get_table(table_name, tgt_schema)
+            
+            # Get column size constraints from table
+            columns_info = {c.name: c.type.length for c in tgt_table_obj.columns 
+                              if hasattr(c.type, 'length')}
+          
+            # Check table exists
+            if not create_table_if_not_exists(table_name, tgt_schema):
+                return False
+
+            error_counts = {
+                'unique_violations': 0,
+                'foreign_key_violations': 0,
+                'other_integrity_errors': 0,
+                'other_errors': 0,
+                'truncation_errors': 0
+            }
+
+            error_records = []
+            batches = [data[y:y + batch_size] for y in range(0, data_len, batch_size)]
+        
+        # Per batch
+        for batch in tqdm(batches, desc=f"Upserting {data_len} to {table_name}", disable=quiet): 
+            # Clean data in the batch
+            cleaned_batch = [clean_record_data(record) for record in batch]
+            
+            # Check data length
+            len_err = False     
+            for record in cleaned_batch:                        
+                # Check data lengths before insert
+                for col, max_length in columns_info.items():
+                    if (col in record and 
+                        record[col] is not None and  
+                        max_length is not None and  
+                        isinstance(record[col], str) and  
+                        len(record[col]) > max_length):
+                        len_err = True
+                        logger.error(f"{table_name}: Data too long for column '{col}' in {table_name}. Ref.: {uniq_columns}")
+                        logger.error(f"{table_name}: Value (raw): '{batch[col]}'")
+                        logger.error(f"{table_name}: Value (repr): {repr(batch[col])}")
+                        logger.error(f"{table_name}: Length: {len(batch[col])} > Maximum: {max_length}")
+            if len_err:
+                return False if return_after_batch else sys.exit(1)
+            
+            # Add audit data
+            for record in cleaned_batch:
+                record['created_by'] = user_id
+                record['created_date'] = current_time
+                record['modified_by'] = user_id
+                record['modified_date'] = current_time
             
             try:
+                # Try bulk insert first
+                stmt = pg_insert(tgt_table_obj).values(cleaned_batch)
+                if uniq_columns != ['id']:
+                    stmt = stmt.on_conflict_do_nothing(index_elements=uniq_columns)
+                
                 result = supabase.execute(stmt)
                 supabase.commit()
-                total_affected += result.rowcount
-            except IntegrityError as e:
-                  supabase.rollback()
-                  if isinstance(e.orig, UniqueViolation):
-                      error_counts['unique_violations'] += 1
-                  elif isinstance(e.orig, ForeignKeyViolation):
-                      error_counts['foreign_key_violations'] += 1
-                  else:
-                      error_counts['other_integrity_errors'] += 1
-                  logger.warning(f"IntegrityError in {table_name}: {str(e)}")
+                success_cnt += len(cleaned_batch)
+                
+            except (IntegrityError, StringDataRightTruncation) as e:
+                supabase.rollback()
+                logger.debug(f"{table_name}: Bulk insert failed, falling back to individual inserts")
+                
+                # Fall back to individual inserts
+                for record in cleaned_batch:
+                    try:
+                        stmt = pg_insert(tgt_table_obj).values(record)
+                        if uniq_columns != ['id']:
+                            stmt = stmt.on_conflict_do_nothing(index_elements=uniq_columns)
+                        
+                        result = supabase.execute(stmt)
+                        supabase.commit()
+                        success_cnt += 1
+                        
+                    except IntegrityError as e:
+                        supabase.rollback()
+                        err_msg = format_pg_error(e)
+                        error_detail = {
+                            'record': record,
+                            'error_type': 'integrity_error',
+                            'error_message': err_msg
+                        }
+                        
+                        if isinstance(e.orig, UniqueViolation):
+                            error_counts['unique_violations'] += 1
+                            error_detail['specific_type'] = 'unique_violation'
+                            if uniq_columns == ['id']:
+                                error_detail['ignore'] = True
+                        elif isinstance(e.orig, ForeignKeyViolation):
+                            error_counts['foreign_key_violations'] += 1
+                            error_detail['specific_type'] = 'foreign_key_violation'
+                            logger.warning(f"{table_name}: Foreign key violation: {err_msg}")
+                            logger.debug(f"Constraint: {e.orig.diag.constraint_name}")
+                        else:
+                            error_counts['other_integrity_errors'] += 1
+                            error_detail['specific_type'] = 'other_integrity_error'
+                            logger.warning(f"{table_name}: Other integrity error: {err_msg}")
+                        
+                        if error_detail != {}:
+                            error_records.append(error_detail)
+                            
+                    except StringDataRightTruncation as e:
+                        supabase.rollback()
+                        error_counts['truncation_errors'] += 1
+                        err_msg = format_pg_error(e)
+                        logger.warning(f"{table_name}: Data truncation: {err_msg}")
+                        logger.debug(f"Column: {e.orig.diag.column_name}, Length: {e.orig.diag.message_detail}")
+                        
+                    except Exception as e:
+                        supabase.rollback()
+                        error_msg = format_pg_error(e)
+                        logger.error(f"{table_name}: Error upserting record: {error_msg}")
+                        
+                        if 'violates row-level security policy' in str(e):
+                            logger.error(f"{table_name}: This error is likely due to Row Level Security (RLS) policies. "
+                                      "Ensure you're using a service role key with necessary permissions.")
+                        
+                        error_records.append({
+                            'record': record,
+                            'error_type': 'other_error',
+                            'error_message': error_msg
+                        })
+                        
+                        # Check for repeated errors
+                        if len(error_records) > 1:
+                            if any(er.get('error_message') == error_msg for er in error_records[:-1]):
+                                logger.error(f"{table_name}: Same error encountered after rollback - exiting")
+                                sys.exit(1)
+            
             except Exception as e:
                 supabase.rollback()
-                error_counts['other_errors'] += 1
-                logger.error(f"Unexpected error in {table_name}: {str(e)}")
-
-            logger.info(f"{table_name}: Upsert complete. Affected rows: {total_affected}")
-            logger.info(f"Error counts for {table_name}: {error_counts}")
-                  
-            # if batch:
-            #     update_migration_log(table_name, batch[-1][id_column])
-            
-            if debug:
-                logger.debug(f"Upserted batch for {table_name}. Affected rows: {len(batch)}")
-        except Exception as e:
-            logger.error(f"Error upserting batch to rat.{table_name}: {str(e)}")
-            if 'violates row-level security policy' in str(e):
-                logger.error("This error is likely due to Row Level Security (RLS) policies. "
-                              "Ensure you're using a service role key with necessary permissions.")
-            supabase.rollback()
-            raise
-  
-    if debug: logger.info(f"Completed batch upsert for table: {tgt_schema}.{table_name}")
+                error_msg = format_pg_error(e)
+                logger.error(f"{table_name}: Error in batch operation: {error_msg}")
+                if 'violates row-level security policy' in str(e):
+                    logger.error(f"{table_name}: RLS policy violation. Check service role permissions.")
+                return False
+        
+        # Summary logging
+        error_cnt = len([r for r in error_records if not r.get('ignore', False)])
+        if success_cnt > 0:
+            if debug: 
+                logger.info(f"{table_name}: Successfully inserted {success_cnt} records")
+        if error_cnt > 0:
+            logger.info(f"{table_name}: Failed to insert {error_cnt} records")
+        
+        return error_cnt == 0
+        
+    except Exception as e:
+        logger.error(f"{table_name}: Error in batch_insert function: {str(e)}")
+        logger.exception(f"{table_name}: Exception details:")
+        sys.exit(1)
+    
 
 def get_country_id(tab, data, ref_data = ''):
     stmt = select(tab.c.id).where(tab.c.name == data)
@@ -436,29 +588,405 @@ def get_country_id(tab, data, ref_data = ''):
       def_name = 'unknown'
       if ref_data != '':
           ref_data = f" \"{ref_data}\":"
-      logger.warning(f"{tab.name}:{ref_data} No country_id found for country: {data} defaulting to {def_name}")
+      logger.warning(f"{tab.name}:{ref_data} No id found in \"{tab.name}\" table. \"{data}\" returned, so defaulting to \"{def_name}\"")
       stmt = select(tab.c.id).where(tab.c.name == def_name)
       result = supabase.execute(stmt).first()
       id = result[0] if result is not None else None
       
     return id
+  
+def add_location(location_name: str, country_name: str = 'unknown', check_exists: bool = False) -> bool:
+    """ Add a single location record to the database. """
+    tgt_table = 'location'
+    logger.info(f"{tgt_table}: Adding missing location: \"{location_name}\"")
 
+    try:
+        # Check if location already exists
+        if check_exists:
+            Location = get_table(tgt_table, tgt_schema)
+            stmt = select(Location.c.id).where(Location.c.name == location_name)
+            result = supabase.execute(stmt).first()
+            if result:
+                logger.info(f"{tgt_table}: Location {location_name} already exists")
+                return True
+
+        # Get the country table and ID
+        Country = get_table('country', tgt_schema)
+        country_id = get_country_id(Country, country_name, location_name)
+        
+        if not country_id:
+            logger.error(f"{tgt_table}: Failed to add location {location_name}: Country {country_name} not found")
+            return False
+
+        # Create location data
+        location_data = [{
+            'name': location_name,
+            'country_id': country_id
+        }]
+
+        # Attempt to insert/update
+        batch_upsert(f"{tgt_schema}.{tgt_table}", location_data, uniq_columns=['name'], quiet=True)
+        if debug: logger.info(f"{tgt_table}: Successfully added location: \"{location_name}\"")
+            
+        return True
+
+    except Exception as e:
+        logger.error(f"{tgt_table}: Error adding location {location_name}: {str(e)}")
+        logger.exception(f"{tgt_table}: Exception details:")
+        return False
+      
+def add_builder(builder_code: str, builder_name: str = None, location_name: str = 'unknown'):
+    """ Add a single builder record to the database. """
+    tgt_table = 'builder'
+    logger.info(f"{tgt_table}: Adding missing builder: {builder_code}")
+    
+    # Clean up data. Assume code is always upper case
+    builder_code = builder_code.upper()
+    
+    try:
+        # Check if builder already exists
+        Builder = get_table(tgt_table, tgt_schema)
+        stmt = select(Builder.c.id).where(Builder.c.code == builder_code)
+        result = supabase.execute(stmt).first()
+        if result:
+            #logger.info(f"{tgt_table}: Builder {builder_code} already exists")
+            return True
+
+        # Get the location ID
+        Location = get_table('location', tgt_schema)
+        location_id = get_location_id(Location, location_name, builder_code)
+        
+        if not location_id:
+            logger.error(f"{tgt_table}: Failed to add builder {builder_code}: Location {location_name} not found")
+            return False
+
+        # If builder_name not provided, use code as name
+        if not builder_name:
+            builder_name = builder_code
+
+        # Create builder data
+        builder_data = [{
+            'code': builder_code,
+            'name': builder_name,
+            'location_id': location_id
+        }]
+
+        # Attempt to insert/update
+        batch_upsert(f"{tgt_schema}.{tgt_table}", builder_data, uniq_columns=['code'], quiet=True)
+        logger.info(f"{tgt_table}: Successfully added builder: {builder_code}")
+            
+        # Look up new builder id
+        try:
+            def_builder_code = builder_code if builder_code not in null_data_lst else 'UNK'  # Default builder code
+            stmt = select(Builder.c.id).where(Builder.c.code == def_builder_code)
+            result = supabase.execute(stmt).first()
+            id = result[0] if result is not None else None
+        except Exception as e:
+            id = -1
+        
+        return id
+
+    except Exception as e:
+        logger.error(f"{tgt_table}: Error adding builder {builder_code}: {str(e)}")
+        logger.exception(f"{tgt_table}: Exception details:")
+        return False
+      
+def get_location_id(tab, data, ref_data = ''):
+    data = stripy(data)
+    stmt = select(tab.c.id).where(tab.c.name == data)
+    #print(stmt.compile(compile_kwargs={"literal_binds": True}))
+    result = supabase.execute(stmt).first()
+    id = result[0] if result is not None else None
+    
+    if id is None:
+        def_name = 'unknown'
+        if ref_data != '':
+            ref_data = f" Ref. \"{ref_data}\": "
+        logger.warning(f"{tab.name}:{ref_data}No id found in table \"{tab.name}\" for \"{data}\", so will add it to location table")
+        # Add location if we're just missing it
+        if data != None:
+            if add_location(data):
+              def_name = data
+          
+        # Look up new location id
+        stmt = select(tab.c.id).where(tab.c.name == def_name)
+        result = supabase.execute(stmt).first()
+        id = result[0] if result is not None else None
+      
+    return id
+  
+def get_builder_id(tab, builder_code, builder_name='', ref_data=''):
+    """Get builder ID by code, creating the builder if it doesn't exist."""
+    
+    if builder_code != None:
+        # Assume all codes are upper case
+        builder_code = stripy(builder_code.upper())
+    
+        stmt = select(tab.c.id).where(tab.c.code == builder_code)
+        result = supabase.execute(stmt).first()
+        id = result[0] if result is not None else None
+    else:
+      id = None
+      
+    if id is None:
+        def_builder_code = builder_code if builder_code not in null_data_lst else 'UNK'  # Default builder code
+        def_builder_name = builder_name if builder_name not in null_data_lst else 'unknown'  # Default builder code
+        
+        if def_builder_code == 'UNK':
+            stmt = select(tab.c.id).where(tab.c.code == def_builder_code)
+            result = supabase.execute(stmt).first()
+            id = result[0] if result is not None else None
+        else:
+            # Add builder if builder code missing
+            if ref_data != '':
+                ref_data = f" Ref. \"{ref_data}\": "
+            logger.warning(f"{tab.name}:{ref_data}No id found for \"{tab.name}\": code=\"{def_builder_code}\" name=\"{def_builder_name}\" so will add it to builder table")
+            id = add_builder(def_builder_code, def_builder_name)
+      
+    return id
+  
+
+def get_entity_id(table_name: str, search_field: str, search_value: str) -> str:
+    """
+    Generic function to get an entity's ID based on a search field and value.
+    
+    Args:
+        table_name: Name of the table to search
+        search_field: Field to search on (e.g., 'name', 'image_no')
+        search_value: Value to search for
+        schema: Database schema name (defaults to target schema)
+    
+    Returns:
+        The ID if found, else None
+    """
+    try:
+        if search_value is None:
+            return None
+          
+        search_value = stripy(search_value)
+            
+        # Get table reference
+        Table = get_table(table_name, tgt_schema)
+        
+        # Build and execute query
+        stmt = select(Table.c.id).where(getattr(Table.c, search_field) == search_value)
+        result = supabase.execute(stmt).first()
+        
+        return result[0] if result else None
+        
+    except Exception as e:
+        logger.error(f"Error getting {table_name} ID for {search_field}='{search_value}': {str(e)}")
+        return None
+      
+def create_lookup_indexes():
+    """Create necessary indexes for lookup tables if they don't exist."""
+    indexes = [
+        ('catalog', 'image_no'),
+        ('organisation', 'name'),
+        ('location', 'name'),
+        ('route', 'name'),
+        ('collection', 'name'),
+        ('photographer', 'name'),
+        ('builder', 'code')
+    ]
+    
+    for table, column in indexes:
+        index_name = f"idx_{table}_{column}"
+        try:
+            # Check if index exists
+            check_sql = f"""
+                SELECT 1
+                FROM pg_indexes
+                WHERE schemaname = '{tgt_schema}'
+                AND tablename = '{table}'
+                AND indexname = '{index_name}'
+            """
+            result = supabase.execute(text(check_sql)).first()
+            
+            if not result:
+                # Create index if it doesn't exist
+                create_sql = f"""
+                    CREATE INDEX IF NOT EXISTS {index_name}
+                    ON {tgt_schema}.{table} ({column})
+                """
+                supabase.execute(text(create_sql))
+                supabase.commit()
+                logger.info(f"Created index {index_name} on {tgt_schema}.{table}({column})")
+        except Exception as e:
+            logger.warning(f"Error creating index on {table}.{column}: {str(e)}")
+
+def create_lookup_cache(table_name, lookup_column):
+    """Create a lookup dictionary for a table."""
+    try:
+        sql = f"""
+            SELECT id, {lookup_column}
+            FROM {tgt_schema}.{table_name}
+        """
+        result = supabase.execute(text(sql))
+        
+        # Create dictionary with stripped values
+        cache = {
+            stripy(row[1]): row[0]
+            for row in result
+            if row[1] is not None
+        }
+        
+        logger.info(f"Created lookup cache for {table_name}: {len(cache)} entries")
+        return cache
+    except Exception as e:
+        logger.error(f"Error creating lookup cache for {table_name}: {str(e)}")
+        return {}
+
+def get_entity_id_from_cache(cache, value):
+    """Get entity ID from cache, handling None values."""
+    if value is None:
+        return None
+    return cache.get(stripy(value))
+
+def create_lookup_index_cache():
+  
+    global lookup_caches
+    # First, ensure we have proper indexes
+    create_lookup_indexes()
+    
+    # Create lookup caches
+    lookup_caches = {
+        'catalog': create_lookup_cache('catalog', 'image_no'),
+        'organisation': create_lookup_cache('organisation', 'name'),
+        'location': create_lookup_cache('location', 'name'),
+        'route': create_lookup_cache('route', 'name'),
+        'collection': create_lookup_cache('collection', 'name'),
+        'photographer': create_lookup_cache('photographer', 'name'),
+        'builder': create_lookup_cache('builder', 'code')
+    }
+    
+def update_picture_catalog_ids(metadata_records):
+    """Update catalog_ids using existing lookup cache."""
+    for record in metadata_records:
+        image_no = Path(record['file_name']).stem
+        record['catalog_id'] = lookup_caches['catalog'].get(stripy(image_no))
+
+def process_image_folder():
+    """Process all images in a folder and return metadata records."""
+    metadata_records = []
+    folder_path = Path(f"{config['export']['path']}/{config['export']['image_path']}/webp").resolve()
+    # Get all image files (adjust extensions as needed)
+    image_files = []
+    #'.jpg', '.jpeg', '.png', '.gif'
+    #for ext in ['.webp']:
+    ext = '.webp'
+    image_files.extend(folder_path.glob(f'*{ext}'))
+    
+    for img_path in image_files:
+        try:
+            # Open image and get basic info
+            with Image.open(img_path) as img:
+                # Get filename without extension
+                image_no = img_path.stem
+                
+                metadata = {
+                    'catalog_id': None,  # Will need to look this up based on image_no
+                    'file_name': img_path.name,
+                    'file_location': None,
+                    'file_type': img.format.lower(),
+                    'file_size': os.path.getsize(img_path),
+                    'width': img.width,
+                    'height': img.height,
+                    'resolution': f"{img.info.get('dpi', (None, None))[0]}",
+                    'colour_space': img.mode
+                }
+                
+                # Map PIL color modes to your valid colour_space values
+                colour_space_mapping = {
+                    'RGB': 'sRGB',
+                    'RGBA': 'sRGB',
+                    'CMYK': 'CMYK',
+                    'L': 'Grayscale',
+                    'LAB': 'LAB'
+                }
+                metadata['colour_space'] = colour_space_mapping.get(img.mode)
+                
+                # Determine colour_mode
+                if img.mode in ['L', 'LA']:
+                    metadata['colour_mode'] = 'grayscale'
+                else:
+                    metadata['colour_mode'] = 'colour'
+                
+                metadata_records.append(metadata)
+                
+        except Exception as e:
+            logger.error(f"Error processing image {img_path}: {str(e)}")
+            continue
+            
+    return metadata_records
+  
+def upload_images_to_supabase(storage_bucket="rat", storage_folder="images"):
+    """Upload webp images to Supabase storage."""
+    logger.info("Starting Supabase storage upload")
+    
+    # Get path to webp images from config
+    folder_path = Path(f"{config['export']['path']}/{config['export']['image_path']}/webp").resolve()
+    
+    # Get image files
+    image_files = list(folder_path.glob('*.webp'))
+    uploaded_count = 0
+    error_count = 0
+    
+    for img_path in tqdm(image_files, desc="Uploading images"):
+        try:
+            # Get file name from path
+            file_name = img_path.name
+            
+            # Read file content
+            with open(img_path, 'rb') as f:
+                file_content = f.read()
+            
+            # Upload to Supabase storage
+            storage_path = f"{storage_folder}/{file_name}"
+            
+            # Use engine since we already have the SQLAlchemy connection
+            with engine.connect() as conn:
+                response = conn.execute(
+                    text("""
+                    SELECT storage.upload($1, $2, $3, $4)
+                    """),
+                    {
+                        "bucket": storage_bucket,
+                        "path": storage_path,
+                        "file": file_content,
+                        "content_type": "image/webp"
+                    }
+                )
+                
+            uploaded_count += 1
+            if debug:
+                logger.debug(f"Uploaded {file_name}")
+                
+        except Exception as e:
+            error_count += 1
+            logger.error(f"Error uploading {file_name}: {str(e)}")
+            continue
+    
+    logger.info(f"Supabase storage upload completed. Successfully uploaded {uploaded_count} images, {error_count} errors.")
+      
 # ---------- Target Schema Migration Functions ---------- 
 
 def migrate_country(df):
     """Migrate country data to Supabase."""
-    logger.info("Starting country migration")
-    countries = df['country'].dropna().unique()
+    tgt_table = 'country'
+    logger.info(f"{tgt_table}: Starting migration")
+    countries = df[tgt_table].dropna().unique()
     # Add unknown to handle missing info
-    countries = list(df['country'].dropna().unique()) + ["unknown"]
+    countries = list(df[tgt_table].dropna().unique()) + ["unknown"]
     country_data = [{'name': country} for country in countries]
-    batch_upsert(f"{tgt_schema}.country", country_data, id_column='name')
-    logger.info(f"Completed country migration. Migrated {len(countries)} countries")
+    batch_upsert(f"{tgt_schema}.{tgt_table}", country_data, uniq_columns=['name'])
+    logger.info(f"{tgt_table}: Completed country migration. Migrated {len(countries)} countries")
 
 def migrate_organisation(df):
     """Migrate organisation data to Supabase."""
-    logger.info("Starting organisation migration")
-    organisations = df[['organisation', 'country', 'organisation_type']].dropna(subset=['organisation']).drop_duplicates()
+    tgt_table = 'organisation'
+    logger.info(f"{tgt_table}: Starting migration")
+    organisations = df[[tgt_table, 'country', 'organisation_type']].dropna(subset=['organisation']).drop_duplicates()
     org_data = OrderedDict()
     Country = get_table('country', tgt_schema)
     for _, row in organisations.iterrows():
@@ -475,21 +1003,18 @@ def migrate_organisation(df):
                 }  
                 #print(f"{country_id} : organisation = {row['organisation']} : organisation_type = {row['organisation_type']}")
         except Exception as e:
-            logger.error(f"Error processing organisation: {str(e)}")
+            logger.error(f"{tgt_table}: Error processing organisation: {str(e)}")
 
-    try:
-        # Convert the OrderedDict values to a list
-        org_data_lst = list(org_data.values())
-        batch_upsert(f"{tgt_schema}.organisation", org_data_lst, id_column='name')
-        logger.info(f"Completed organisation migration. Migrated {len(org_data_lst)} organisations")
-    except Exception as e:
-        logger.error(f"Error during batch upsert of organisations: {str(e)}")
-        
+
+    # Convert the OrderedDict values to a list
+    org_data_lst = list(org_data.values())
+    batch_upsert(f"{tgt_schema}.{tgt_table}", org_data_lst, uniq_columns=['name'])
+    logger.info(f"{tgt_table}: Completed migration. Migrated {len(org_data_lst)} organisations")
 
 def migrate_location(df):
     """Migrate location data to Supabase."""
     tgt_table = 'location'
-    logger.info("Starting location migration")
+    logger.info(f"{tgt_table}: Starting migration")
     locations = df[[tgt_table, 'country']].dropna(subset=[tgt_table]).drop_duplicates()
     location_data = OrderedDict()
     Country = get_table('country', tgt_schema)
@@ -509,88 +1034,121 @@ def migrate_location(df):
     
     # Convert the OrderedDict values to a list
     location_data_lst = list(location_data.values())
-    batch_upsert(f"{tgt_schema}.{tgt_table}", location_data_lst, id_column='name')
-    logger.info(f"Completed {tgt_table} migration. Migrated {len(locations)} locations")
+    batch_upsert(f"{tgt_schema}.{tgt_table}", location_data_lst, uniq_columns=['name'])
+    logger.info(f"{tgt_table}: Completed migration. Migrated {len(locations)} locations")
 
 def migrate_route(df):
     """Migrate route data to Supabase."""
     tgt_table = 'route'
-    logger.info(f"Starting {tgt_table} migration")
+    logger.info(f"{tgt_table}: Starting migration")
     routes = df[[tgt_table, 'start_location', 'end_location']].dropna(subset=['route']).drop_duplicates()
-    route_data = []
+    route_data = OrderedDict()
+    Location = get_table('location', tgt_schema)
     for _, row in routes.iterrows():
+        route = row['route']
         # Get FKs
-        start_location_id = supabase.from_(f"{tgt_schema}.location").select('id').eq('name', row['start_location']).execute().data
-        end_location_id = supabase.table(f"{tgt_schema}.location").select('id').eq('name', row['end_location']).execute().data
-        start_location_id = start_location_id[0]['id'] if start_location_id else None
-        end_location_id = end_location_id[0]['id'] if end_location_id else None
-        route_data.append({
-            'id': row['route'],  # Using name as ID for simplicity
-            'name': row['route'],
+        start_location_id = get_location_id(Location, row['start_location'], route)
+        end_location_id = get_location_id(Location, row['end_location'], route)
+        route_data[route] = {
+            'name': route,
             'start_location_id': start_location_id,
             'end_location_id': end_location_id
-        })
-    batch_upsert(f"{tgt_schema}.route", route_data, id_column='name')
-    logger.info(f"Completed route migration. Migrated {len(routes)} routes")
+        }
+    route_data_lst = list(route_data.values())
+    batch_upsert(f"{tgt_schema}.{tgt_table}", route_data_lst, uniq_columns=['name'])
+    logger.info(f"{tgt_table}: Completed migration. Migrated {len(routes)} routes")
 
-def migrate_catalog(df, batch_size, user_id):
+def migrate_catalog(df):
     """Migrate catalog data to Supabase."""
-    logger.info("Starting catalog migration")
-    catalog_data = df.to_dict('records')
-    for record in catalog_data:
-        record['id'] = record['image_no']  # Use image_no as the ID
-    batch_upsert(f"{tgt_schema}.catalog", catalog_data, id_column='image_no')
-    logger.info(f"Completed catalog migration. Migrated {len(df)} catalog entries")
+    tgt_table = 'catalog'
+    logger.info(f"{tgt_table}: Starting migration")
+    # Get the target table structure
+    Catalog = get_table('catalog', tgt_schema)
+    # Get list of valid column names from the SQLAlchemy Table object
+    valid_columns = [c.name for c in Catalog.columns] 
+    #logger.debug(f"{tgt_table}: Valid columns in target schema: {valid_columns}")
+    catalog_data = OrderedDict()
+    
+    for _, row in df.iterrows():
+        try:
+            image_no = stripy(row['image_no']) 
+            # Create data dictionary with only valid columns
+            record = {
+                col: row[col] 
+                for col in valid_columns 
+                if col in row and col not in ['id', 'created_date']  # Exclude auto-generated columns
+            }          
+            catalog_data[image_no] = record    
+        except Exception as e:
+            logger.error(f"{tgt_table}: Error processing catalog entry {row.get('image_no', 'unknown')}: {str(e)}")
+            logger.exception(f"{tgt_table}: Exception details:")
+    
+    try:
+        catalog_data_lst = list(catalog_data.values())
+        batch_upsert(f"{tgt_schema}.{tgt_table}", catalog_data_lst, uniq_columns=['image_no'], quiet=False)
+        logger.info(f"{tgt_table}: Completed catalog migration. Migrated {len(catalog_data_lst)} entries")
+    except Exception as e:
+        logger.error(f"Error during batch upsert of catalog entries: {str(e)}")
+        logger.exception("Exception details:")
 
 def migrate_catalog_metadata(df):
-    """Migrate catalog metadata to Supabase."""
-    logger.info("Starting catalog metadata migration")
+    """Migrate catalog metadata to Supabase with optimized lookups."""
+    
+    global lookup_caches
+    
+    tgt_table = 'catalog_metadata'
+    logger.info(f"{tgt_table}: Starting metadata migration")
+
     metadata_data = []
-    for _, row in df.iterrows():
-        catalog_id = supabase.table('catalog').select('id').eq('image_no', row['image_no']).execute().data
-        organisation_id = supabase.table('organisation').select('id').eq('name', row['organisation']).execute().data
-        location_id = supabase.table('location').select('id').eq('name', row['location']).execute().data
-        route_id = supabase.table('route').select('id').eq('name', row['route']).execute().data
-        collection_id = supabase.table('collection').select('id').eq('name', row['collection']).execute().data
-        photographer_id = supabase.table('photographer').select('id').eq('name', row['photographer']).execute().data
-        
-        catalog_id = catalog_id[0]['id'] if catalog_id else None
-        organisation_id = organisation_id[0]['id'] if organisation_id else None
-        location_id = location_id[0]['id'] if location_id else None
-        route_id = route_id[0]['id'] if route_id else None
-        collection_id = collection_id[0]['id'] if collection_id else None
-        photographer_id = photographer_id[0]['id'] if photographer_id else None
-        
-        if catalog_id is None:
-            continue  # skip: no catalog row matched this image_no (would orphan / violate FK)
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Processing metadata"):
         metadata_data.append({
-            'catalog_id': catalog_id,
-            'organisation_id': organisation_id,
-            'location_id': location_id,
-            'route_id': route_id,
-            'collection_id': collection_id,
-            'photographer_id': photographer_id
+            'catalog_id': lookup_caches['catalog'].get(stripy(row['image_no'])),
+            'organisation_id': lookup_caches['organisation'].get(stripy(row['organisation'])),
+            'location_id': lookup_caches['location'].get(stripy(row['location'])),
+            'route_id': lookup_caches['route'].get(stripy(row['route'])),
+            'collection_id': lookup_caches['collection'].get(stripy(row['collection'])),
+            'photographer_id': lookup_caches['photographer'].get(stripy(row['photographer']))
         })
-    batch_upsert(f'{tgt_schema}.catalog_metadata', metadata_data, id_column='catalog_id')
+    #uniq_columns=['catalog_id', 'collection_id', 'photographer_id' ,'organisation_id', 'location_id', 'route_id']
+    batch_upsert(f'{tgt_schema}.catalog_metadata', metadata_data, uniq_columns=['catalog_id'])
     logger.info(f"Completed catalog metadata migration. Migrated {len(df)} metadata entries")
+
 
 def migrate_usage(df):
     """Migrate usage data to Supabase."""
-    logger.info("Starting usage data migration")
+    tgt_table = 'usage'
+    batch_size = 10000
+    total_processed = 0
     usage_data = []
-    for _, row in df.iterrows():
-        catalog_id = supabase.table('catalog').select('id').eq('image_no', row['image_no']).execute().data
-        catalog_id = catalog_id[0]['id'] if catalog_id else None
-        if catalog_id is None:
-            continue  # skip: no catalog row matched this image_no (usage has no standalone id)
+    
+    logger.info(f"{tgt_table}: Starting data migration")
+    
+    for _, row in tqdm(df.iterrows(), total=len(df), desc=f"Processing {tgt_table}", disable=True):
+        catalog_id = lookup_caches['catalog'].get(stripy(row['image_no']))
+        if catalog_id == None:
+            logger.warning(f"{tgt_table}: Cannot obtain catalog_id for \"{row['image_no']}\"? Skipping.")
+            continue
+
         usage_data.append({
             'catalog_id': catalog_id,
             'prints_allowed': row['prints_allowed'] == 'yes',
             'internet_use': row['internet_use'] == 'yes',
             'publications_use': row['publications_use'] == 'yes'
         })
-    batch_upsert(f'{tgt_schema}.usage', usage_data, id_column='catalog_id')
-    logger.info(f"Completed usage data migration. Migrated {len(df)} usage entries")
+        
+        # When we reach batch_size, process the batch
+        if len(usage_data) >= batch_size:
+            batch_upsert(f'{tgt_schema}.usage', usage_data, uniq_columns=['catalog_id'])
+            total_processed += len(usage_data)
+            #if debug: logger.debug(f"{tgt_table}: Processed {total_processed} records")
+            usage_data = []  # Clear the batch
+            
+    # Process any remaining records
+    if usage_data:
+        batch_upsert(f'{tgt_schema}.usage', usage_data)
+        total_processed += len(usage_data)
+        
+    logger.info(f"{tgt_table}: Completed usage data migration. Migrated {total_processed} usage entries")
     
 def migrate_collection(df):
     """Migrate collection data to Supabase."""
@@ -608,7 +1166,7 @@ def migrate_collection(df):
         })
     
     # Perform batch upsert
-    batch_upsert(f'{tgt_schema}.collection', collection_data, id_column='name')
+    batch_upsert(f'{tgt_schema}.collection', collection_data, uniq_columns=['name'])
     logger.info(f"Completed collection migration. Migrated {len(collection_data)} collections")
     
 def migrate_photographer(df):
@@ -617,7 +1175,7 @@ def migrate_photographer(df):
     # Debug: Print all unique values in the 'photographer' column
     unique_photographers = df['photographer'].dropna().unique()
     
-    if debug: 
+    if debug and False: 
       logger.info(f"Unique photographers found: {unique_photographers}")
     
       # Count occurrences of each photographer
@@ -629,63 +1187,214 @@ def migrate_photographer(df):
     
     photographer_data = [{'name': photographer} for photographer in unique_photographers]
     
-    batch_upsert(f'{tgt_schema}.photographer', photographer_data, id_column='name')
+    batch_upsert(f'{tgt_schema}.photographer', photographer_data, uniq_columns=['name'])
     logger.info(f"Completed photographer migration. Migrated {len(photographer_data)} photographers")
 
 def migrate_builder(df):
-    logger.info("Starting builder migration")
+    tgt_table = 'builder'
+    logger.info(f"{tgt_table}: Starting builder migration")
     # Assuming 'builder' and 'builder_location' columns exist in the DataFrame
-    builders = df[['builder', 'builder_location']].dropna(subset=['builder']).drop_duplicates()
-    builder_data = []
+    builders = df[['Builder code', 'Builder name', 'Location']].dropna(subset=['Builder code']).drop_duplicates()
+    builder_data = OrderedDict()
+    Location = get_table('location', tgt_schema)
+    # Fetch the location null value
+    location_nvl = get_location_id(Location, 'unknown')
     for _, row in builders.iterrows():
-        builder_data.append({
-            'code': row['builder'][:20],  # Assuming 'code' is derived from 'builder' name
-            'name': row['builder'],
-            'location': row['builder_location'] if 'builder_location' in row else None
-        })
-    batch_upsert(f'{tgt_schema}.builder', builder_data, id_column='name')
-    logger.info(f"Completed builder migration. Migrated {len(builder_data)} builders")
+        builder_code = row['Builder code']
+        builder_name = row['Builder name']
+        if row['Location'] != None:
+            location_id = get_location_id(Location, row['Location'], f"migrate_{tgt_table}: {builder_code}")
+        else:
+            location_id = location_nvl
+          
+        builder_data[builder_name] = {
+            'code': builder_code,
+            'name': builder_name,
+            'location_id': location_id
+        }
+        
+    builder_data_lst = list(builder_data.values())
+    batch_upsert(f"{tgt_schema}.{tgt_table}", builder_data_lst, uniq_columns=['code']) 
+    logger.info(f"Completed {tgt_table} migration. Migrated {len(builder_data)} builders")
+
+def stripy(txt):
+    return txt.strip() if txt is not None else txt
 
 def migrate_catalog_builder(df):
-    logger.info("Starting catalog_builder migration")
-    # Assuming 'image_no' and 'builder' columns exist in the DataFrame
-    catalog_builders = df[['image_no', 'builder']].dropna(subset=['image_no', 'builder'])
+    """
+    Populate catalog_builder table
+    """
+    tgt_table = 'catalog_builder'
+    logger.info(f"{tgt_table}: Starting migration")
+    
+    catalog_builders = df[['image_no', 'Builder code', 'Builder code2', 'Builder code3', 
+                          'Works number', 'Works number2', 'Works number3', 
+                          'Year built', 'Year built2', 'Year built3', 
+                          'Plant code', 'Plant code2', 'Plant code3',
+                          'Builder name1', 'Builder name2', 'Builder name3']].dropna(subset=['image_no'])
+    
+    uniq_columns = ['id']
+    
     catalog_builder_data = []
-    for _, row in catalog_builders.iterrows():
-        catalog_id = supabase.table('catalog').select('catalog_id').eq('image_no', row['image_no']).execute().data
-        builder_id = supabase.table('builder').select('builder_id').eq('name', row['builder']).execute().data
-        if catalog_id and builder_id:
-            catalog_builder_data.append({
-                'catalog_id': catalog_id[0]['catalog_id'],
-                'builder_id': builder_id[0]['builder_id'],
-                'builder_order': 1  # Assuming single builder per catalog, adjust if needed
-            })
-    batch_upsert(f'{tgt_schema}.catalog_builder', catalog_builder_data, id_column=['catalog_id', 'builder_id', 'builder_order'])
-    logger.info(f"Completed catalog_builder migration. Migrated {len(catalog_builder_data)} catalog-builder relationships")
+    Builder = get_table('builder', tgt_schema)
+    Catalog = get_table('catalog', tgt_schema)
+    Catalog_Builder = get_table(tgt_table, tgt_schema)
+        
+    total_processed = 0
+    batch_size = 5061  # Increased from 1 for better performance
+    error_records = []
+    error_counts = {
+        'unique_violations': 0,
+        'foreign_key_violations': 0,
+        'other_integrity_errors': 0,
+        'other_errors': 0
+    }
+    
+    # Get column size constraints from table
+    columns_info = {c.name: c.type.length for c in Catalog_Builder.columns 
+                      if hasattr(c.type, 'length')}
+  
+    # Check table exists
+    if not create_table_if_not_exists(tgt_table, tgt_schema):
+        logger.info(f'{tgt_table}: Table not found')
+        sys.exit(1)
+    
+    batch_data = {}
+    # Data that we maintain fo reach batch
+    batch_data[tgt_table] = {'table_obj' : Catalog_Builder, 'error_records' : error_records,  'error_counts' : error_counts, 'columns_info' : columns_info} 
+    
+    # If we are using a generated id to identify uniqueness then table data must always be deleted first
+    # All tables after this one must also have data deleted.
+    try:
+        if uniq_columns == ['id']:
+          truncate_sql = f'TRUNCATE TABLE {tgt_schema}.{tgt_table}'
+          result = supabase.execute(text(truncate_sql))
+          supabase.commit()
+          logger.info(f"{tgt_table}: Data deleted")
+          
+    except Exception as e:
+        logger.error(f"Error during truncate of {tgt_schema}.{tgt_table}")
+        logger.exception("Exception details:")
+        sys.exit(1)
 
+    logger.info(f"{tgt_table}: Gathering Data")
+    for _, row in catalog_builders.iterrows():
+        try:
+            # Process up to 3 possible entries per image
+            for i in [1, 2, 3]:
+                suffix = str(i) if i > 1 else ""
+                name_suffix = str(i) if i > 1 else "1"  # Handle special case for first builder name
+                
+                # Get the values for this train
+                image_no = stripy(row['image_no'])
+                builder_code = str(stripy(row.get(f'Builder code{suffix}'))).upper()
+                builder_name = stripy(row.get(f'Builder name{name_suffix}'))
+                plant_code = stripy(row.get(f'Plant code{suffix}'))
+                works_number = stripy(row.get(f'Works number{suffix}'))
+                year_built = stripy(row.get(f'Year built{suffix}'))
+
+                # Skip if no data for this train
+                builder_code = None if builder_code in ['NONE'] else builder_code
+
+                # Get keys
+                catalog_id = lookup_caches['catalog'].get(stripy(image_no))
+                builder_id = lookup_caches['builder'].get(stripy(builder_code))
+                
+                # Most will skip 2nd and 3rd values 
+                if not any([builder_id, plant_code, works_number, year_built]):
+                    if False:
+                        logger.debug(f"{tgt_table}: Skip processing {image_no}: Train {i}: " +
+                           f"Builder: builder_id = {builder_id}, {builder_code}, " +
+                           f"Plant: {plant_code}, Works: {works_number}, Year: {year_built}")
+                    continue
+                
+                if builder_id == -1:
+                    logger.warning(f"{tgt_table}: {image_no}: Problem getting builder id for builder code {builder_code}")
+                    continue
+
+                if debug and False:
+                    logger.debug(f"{tgt_table}: Processing image {image_no}: Train {i}: " +
+                           f"Builder: {builder_code}/{builder_name}, " +
+                           f"Plant: {plant_code}, Works: {works_number}, Year: {year_built}")
+                
+                catalog_builder_data.append({
+                    'catalog_id': catalog_id,
+                    'builder_id': builder_id,
+                    'plant_code': plant_code,
+                    'works_number': works_number,
+                    'year_built': year_built,
+                    'builder_order': int(i),
+                })
+
+        except Exception as e:
+            logger.error(f"{tgt_table}: Error compiling data for image {image_no}: {str(e)}")
+            logger.exception(f"{tgt_table}: Exception details:")
+            continue  # Continue to next record on error
+    
+    logger.info(f"{tgt_table}: Applying Data")
+    cb_data = []
+    batch_cnt = 0
+    batches, remainder_batch_size = divmod(len(catalog_builder_data), batch_size)
+    for cb_data_itm in catalog_builder_data:
+        cb_data.append(cb_data_itm)
+        
+        # Adjust batch_size to handle end of batch
+        if batch_cnt + 1 > batches:
+            batch_size = remainder_batch_size
+            
+        # Process batch if we've reached batch_size
+        if len(cb_data) >= batch_size:
+            try:
+                success = batch_upsert(
+                    f"{tgt_schema}.{tgt_table}", 
+                    cb_data,
+                    uniq_columns=uniq_columns,
+                    return_after_batch=True,
+                    quiet=True,
+                    batch_data=batch_data
+                )
+                batch_cnt += 1
+                if success:
+                    total_processed += len(cb_data)
+                    cb_data = []  # Clear the batch after successful processing
+                else:
+                    logger.warning(f"{tgt_table}: Batch processing returned Errors, continuing...")
+                    if True: # abort
+                        sys.exit(1)
+
+                continue
+
+            except Exception as e:
+                exc_type, exc_obj, exc_tb = sys.exc_info()
+                logger.error(f"{tgt_table}: Error processing batch on line {exc_tb.tb_lineno}: {format_pg_error(e)}")    
+                continue  # Continue instead of raising to handle errors more gracefully
+
+    logger.info(f"{tgt_table}: Migration completed. Total records processed: {total_processed}")
+         
+   
 def migrate_picture_metadata(df):
-    logger.info("Starting picture_metadata migration")
-    # Assuming columns like 'image_no', 'file_location', 'file_type', 'file_size', 'width', 'height' exist
-    picture_metadata = df[['image_no', 'file_location', 'file_type', 'file_size', 'width', 'height']].dropna(subset=['image_no'])
-    metadata_data = []
-    for _, row in picture_metadata.iterrows():
-        metadata_data.append({
-            'image_no': row['image_no'],
-            'file_location': row['file_location'],
-            'file_type': row['file_type'],
-            'file_size': int(row['file_size']) if row['file_size'] else None,
-            'width': int(row['width']) if row['width'] else None,
-            'height': int(row['height']) if row['height'] else None,
-            'resolution': None,  # Add if available in your data
-            'color_space': None,  # Add if available in your data
-            'ai_description': None,  # Add if available in your data
-            'tags': None  # Add if available in your data
-        })
-    # TODO(idempotency): switch to id_column='catalog_id' once picture_metadata is
-    # de-duplicated on catalog_id and a UNIQUE(catalog_id) constraint is added.
-    # Deferred: ~354 extra rows (duplicate/orphan catalog_id) — report-only for now.
-    batch_upsert(f'{tgt_schema}.picture_metadata', metadata_data)
-    logger.info(f"Completed picture_metadata migration. Migrated {len(metadata_data)} picture metadata entries")
+    """Migrate picture metadata from image folder to database."""
+    tgt_table = 'picture_metadata'
+    logger.info(f"{tgt_table}: Starting migration")
+    #picture_metadata = df[['image_no', 'file_location', 'file_type', 'file_size', 'width', 'height']].dropna(subset=['image_no'])
+    #     picture_metadata = df[['image_no', 'cd_no', 'bw_image_no', 'cd_no_hr']].dropna(subset=['image_no'])
+        
+    try:
+        # Process all images
+        metadata_data = process_image_folder()
+        logger.info(f"Processed {len(metadata_data)} images")
+        
+        # Update catalog IDs
+        update_picture_catalog_ids(metadata_data)
+        
+        # Insert records
+        batch_upsert(f"{tgt_schema}.picture_metadata", metadata_data, uniq_columns=['catalog_id'], quiet=True)
+        logger.info(f"{tgt_schema}: Completed picture_metadata migration. Migrated {len(metadata_data)} picture metadata entries")
+        
+    except Exception as e:
+        logger.error(f"Error during picture metadata migration: {str(e)}")
+        logger.exception("Exception details:")
+    
 
 def check_tables(required_tables, schema):
     # Check
@@ -699,19 +1408,23 @@ def main():
     """Main function to orchestrate the migration process."""
     
     global user_id, debug, engine, session, logger, batch_size, mig_schema, tgt_schema, config, supabase
+    global null_data_lst
     
     # Load config file
     config = load_config()
     
     # Load config from command line
     args = get_args()
+       
     user_id = args.user_id
     batch_size = args.batch_size
-    mig_schema = 'rat_migration'
-    tgt_schema = 'rat'
+    mig_schema = config['database']['target']['schema'][0]
+    tgt_schema = config['database']['target']['schema'][1]
     debug = args.debug
-    logger = setup_logging(debug)
+    null_data_lst = ['', None, 'NULL', 'None']
     
+    logger, log_file = setup_logging(debug)
+    logger.info(f"Logging to {log_file}")
     logger.info("Starting migration process")
     
     engine = get_db_engine(config)
@@ -748,8 +1461,8 @@ def main():
     logger.info("Data extracted from SQL files:")
     for table_name, data in all_data.items():
         logger.info(f"  {table_name}: {len(data)} rows")
-        if debug:
-            logger.debug(f"    Columns: {', '.join(data[0].keys()) if data else 'No data'}")
+        # if debug:
+        #     logger.debug(f"    Columns: {', '.join(data[0].keys()) if data else 'No data'}")
 
     # Create DataFrames for each table
     routes_df = pd.DataFrame(all_data.get('ratroutes', []))
@@ -761,20 +1474,21 @@ def main():
 
     # Migration order respects referential dependencies
     with session() as supabase:
-        migrate_country(catalog_df)
-        migrate_organisation(catalog_df)
-        migrate_location(catalog_df)
-        migrate_route(routes_df)
-        migrate_collection(collections_df)
-        migrate_photographer(catalog_df)
-        migrate_builder(builders_df)
-        migrate_catalog(catalog_df)
+        # migrate_country(catalog_df)
+        # migrate_organisation(catalog_df)
+        # migrate_location(catalog_df)
+        # migrate_route(routes_df)
+        # migrate_collection(collections_df)
+        # migrate_photographer(catalog_df)
+        # migrate_builder(builders_df)
+        # migrate_catalog(catalog_df)
+        create_lookup_index_cache()
         migrate_catalog_metadata(catalog_df)
-        migrate_catalog_builder(catalog_df)
-        migrate_usage(catalog_df)
-        migrate_picture_metadata(catalog_df)
+        # migrate_catalog_builder(catalog_df)
+        # migrate_usage(catalog_df)
+        # migrate_picture_metadata(catalog_df)
         #migrate_prompts(prompts_df)    
-    
+        
         
     logger.info("Migration process completed")
 
