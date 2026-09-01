@@ -1154,9 +1154,20 @@ def migrate_catalog_metadata(df):
     logger.info(f"{tgt_table}: Starting metadata migration")
 
     metadata_data = []
+    skipped = 0
     for _, row in tqdm(df.iterrows(), total=len(df), desc="Processing metadata"):
+        catalog_id = lookup_caches['catalog'].get(stripy(row['image_no']))
+        if catalog_id is None:
+            # This source row's own catalog insert already failed/was rejected
+            # (e.g. NULL image_no) -- metadata for a catalog entry that doesn't
+            # exist is unlinkable and, unlike catalog_builder's builder_id, has
+            # no sentinel that would make it meaningfully re-runnable: catalog_id
+            # is UNIQUE-constrained (SQL NULL != NULL means every re-run would
+            # insert yet another orphan row). Skip rather than accumulate them.
+            skipped += 1
+            continue
         metadata_data.append({
-            'catalog_id': lookup_caches['catalog'].get(stripy(row['image_no'])),
+            'catalog_id': catalog_id,
             'organisation_id': lookup_caches['organisation'].get(stripy(row['organisation'])),
             'location_id': lookup_caches['location'].get(stripy(row['location'])),
             'route_id': lookup_caches['route'].get(stripy(row['route'])),
@@ -1165,7 +1176,9 @@ def migrate_catalog_metadata(df):
         })
     #uniq_columns=['catalog_id', 'collection_id', 'photographer_id' ,'organisation_id', 'location_id', 'route_id']
     batch_upsert(f'{tgt_schema}.catalog_metadata', metadata_data, uniq_columns=['catalog_id'])
-    logger.info(f"Completed catalog metadata migration. Migrated {len(df)} metadata entries")
+    if skipped:
+        logger.warning(f"{tgt_table}: Skipped {skipped} row(s) with no resolvable catalog_id (orphaned metadata)")
+    logger.info(f"Completed catalog metadata migration. Migrated {len(metadata_data)} metadata entries")
 
 
 def migrate_usage(df):
@@ -1243,6 +1256,15 @@ def migrate_photographer(df):
     
     batch_upsert(f'{tgt_schema}.photographer', photographer_data, uniq_columns=['name'])
     logger.info(f"Completed photographer migration. Migrated {len(photographer_data)} photographers")
+
+def ensure_unknown_builder():
+    """Make sure a sentinel 'UNK' builder row exists. catalog_builder rows whose
+    Builder code doesn't resolve fall back to this real row's id instead of
+    NULL, so they get a stable, non-NULL natural key on every re-run (SQL
+    NULL != NULL, so a NULL builder_id would never conflict with itself and
+    would duplicate every time). Matches the existing 'unknown' sentinel
+    convention already used for location/country."""
+    batch_upsert(f"{tgt_schema}.builder", [{'code': 'UNK', 'name': 'Unknown'}], uniq_columns=['code'], quiet=True)
 
 def migrate_builder(df):
     tgt_table = 'builder'
@@ -1343,19 +1365,33 @@ def migrate_catalog_builder(df):
 
                 # Get keys
                 catalog_id = lookup_caches['catalog'].get(stripy(image_no))
+                if catalog_id is None:
+                    # This source row's own catalog insert already failed/was
+                    # rejected -- same reasoning as catalog_metadata: unlinkable,
+                    # and catalog_id is part of the natural key, so a NULL here
+                    # would duplicate on every re-run (SQL NULL != NULL).
+                    continue
                 builder_id = lookup_caches['builder'].get(stripy(builder_code))
-                
-                # Most will skip 2nd and 3rd values 
+
+                # Most will skip 2nd and 3rd values
                 if not any([builder_id, plant_code, works_number, year_built]):
                     if False:
                         logger.debug(f"{tgt_table}: Skip processing {image_no}: Train {i}: " +
                            f"Builder: builder_id = {builder_id}, {builder_code}, " +
                            f"Plant: {plant_code}, Works: {works_number}, Year: {year_built}")
                     continue
-                
+
                 if builder_id == -1:
                     logger.warning(f"{tgt_table}: {image_no}: Problem getting builder id for builder code {builder_code}")
                     continue
+
+                if builder_id is None:
+                    # Builder code didn't resolve, but there's other real payload
+                    # (plant_code/works_number/year_built) worth keeping -- fall
+                    # back to the sentinel 'UNK' builder (same convention already
+                    # used for location/country's 'unknown' row) instead of NULL,
+                    # so this row has a real, stable, non-NULL key on every re-run.
+                    builder_id = lookup_caches['builder'].get('UNK')
 
                 if debug and False:
                     logger.debug(f"{tgt_table}: Processing image {image_no}: Train {i}: " +
@@ -1533,6 +1569,7 @@ def main():
         migrate_collection(collections_df)
         migrate_photographer(catalog_df)
         migrate_builder(builders_df)
+        ensure_unknown_builder()  # before the cache rebuild below, so 'UNK' gets cached like any other builder
         migrate_catalog(catalog_df)
         create_lookup_index_cache()  # full rebuild: picks up any add_location() additions above too
         migrate_catalog_metadata(catalog_df)

@@ -395,7 +395,76 @@ noted above, which is pre-existing and now cleaned up (not code-fixed).
 
 ### Open Threads
 
-- [ ] **`catalog_builder`/`catalog_metadata`'s `NULL`-key duplication is a real, unfixed bug** — any row where a natural-key column can't be resolved will duplicate on every re-run, since SQL never treats `NULL` as equal to `NULL`. Needs a real decision (partial unique index treating `NULL` as a value via `COALESCE`? A sentinel non-`NULL` value for "unresolved"? Skip rows with no resolvable key entirely, if that's ever acceptable per the project's quarantine philosophy?) — bigger than a performance-pass fix, flagged for whoever picks up Increment 2's remaining sub-tasks next, since delta-driven re-syncing will hit this constantly.
+- [x] ~~`catalog_builder`/`catalog_metadata`'s `NULL`-key duplication~~ — **fixed Session 7**, see below.
 - [ ] *(Carried)* everything from Session 5's Open Threads not resolved above: `--mode dml_files` parser rewrite; `config_manager.py`/`database_connections.py`/GUI profile support; Increment 2 sub-tasks 2–4; `picture_metadata` untested against real images; `requirements.txt`'s `pandas==2.1.4` pin; the 16 flagged source records; DDR; supabase-py/SQLAlchemy prune; anon-JWT rotation; `PicaLocoBackend` consolidation/rebrand; delete `sync_config.json`.
+
+---
+
+## Session 7 — 2026-09-01 — Fix the catalog_builder/catalog_metadata NULL-key duplication bug
+
+**Focus:** Session 6's performance testing exposed and accumulated a real bug: rows whose natural key includes an unresolved (`NULL`) lookup never conflict with themselves on re-run, since SQL treats `NULL ≠ NULL`. Fix it properly instead of just cleaning up the symptom again.
+**Status:** `completed`. Fix proven idempotent by running Stage 2 twice in a row and confirming zero growth, then the accumulated legacy duplicates were cleaned up once, for good this time.
+
+---
+
+### Context
+
+Two tables, two different root causes, two different fixes — treating them as one bug would have been wrong:
+
+- **`catalog_builder`** (`builder_id` unresolved): the row still carries real, worth-keeping payload
+  (`plant_code`/`works_number`/`year_built`) even without a matched builder — the existing skip-check
+  (`if not any([builder_id, plant_code, works_number, year_built])`) already proves that's the intended
+  design. `location`/`country` resolution already had a working answer to exactly this problem — fall back
+  to a real `'unknown'` sentinel row instead of leaving the FK `NULL` — but `catalog_builder`'s
+  `builder_id` resolution never had the equivalent, plausibly because it uses the fast in-memory cache
+  lookup directly rather than the slower `get_builder_id()` (dead code, confirmed unused, but its own
+  logic already anticipated an `'UNK'` fallback — the intended design just wasn't wired up).
+- **`catalog_metadata`** (`catalog_id` unresolved): means this source row's own `catalog` insert already
+  failed (e.g. `NULL image_no`) — there's no sentinel that makes sense here (a fake "unknown catalog" row
+  would corrupt `catalog` itself, unlike builder where `'unknown'` is a real, meaningful entity). The row
+  is genuinely unlinkable. Golden rule 1 (quarantine, don't silently keep broken data) points at skipping
+  it, not inventing a workaround.
+
+---
+
+### Decisions
+
+| Decision | Rationale | Alternatives Considered |
+|---|---|---|
+| `catalog_builder`: add a real sentinel `'UNK'` builder row (`ensure_unknown_builder()`, called once in `main()` before the full cache rebuild), fall back to its id when `builder_id` doesn't resolve **but the row has other real payload** | Reuses the exact convention already shipped for `location`/`country`; makes `builder_id` always a real, stable, non-`NULL` value, so the existing `(catalog_id, builder_id, builder_order)` constraint works as designed — no schema change needed | A `COALESCE`-based expression unique index (works, but needs the conflict target expressed as a matching expression, doesn't fit `batch_upsert()`'s simple `index_elements=uniq_columns` API without rework, and doesn't match any existing pattern in this codebase) |
+| `catalog_builder`: the skip-check (`any([builder_id, ...])`) must run **before** the sentinel substitution, using the real pre-substitution value | Substituting first would make `builder_id` always truthy (the sentinel's id), silently keeping every row regardless of whether it has any real payload — a behaviour change nobody asked for | — |
+| `catalog_metadata`: skip inserting when `catalog_id` is unresolved, rather than inventing a sentinel | No sentinel is semantically safe for the primary spine table; the row is unlinkable either way — skipping is honest about that instead of leaving synthetic-looking orphan rows | A `COALESCE` index limiting orphans to exactly one total (arbitrary — why keep one and silently drop the rest?) |
+
+---
+
+### Findings
+
+- Verified precisely before touching anything: 115,513 of the pre-fix `catalog_builder` rows had `builder_id IS NULL`, collapsing to only 57,187 distinct `(catalog_id, builder_order)` pairs — **58,326 duplicates**, all from Session 6's repeated test re-runs. Zero duplicates existed among the resolved (`NOT NULL`) rows, confirming the `(catalog_id, builder_id, builder_order)` key itself works correctly — only the `NULL` case was broken.
+- First attempt at `ensure_unknown_builder()` failed live (`NotNullViolation` on `builder.created_by`) — hand-rolling a `pg_insert(...).on_conflict_do_nothing(...)` skipped the audit columns `batch_upsert()` normally adds automatically. Fixed by just calling `batch_upsert()` itself instead of reinventing it.
+- Proved forward idempotency directly, not by inference: ran the full Stage 2 load twice back-to-back after the fix, confirmed `catalog_builder`'s total row count and its `UNK`-builder-id row count were bit-for-bit identical both times (173,725 → 173,725, both runs; the growth on the *first* post-fix run was 100% legacy `NULL` rows colliding with nothing — those are a different value on the conflict target than the new `UNK` rows, so of course they coexisted rather than deduping. Expected, not a fix failure).
+- Before deleting the legacy `NULL` rows, verified every single one had an exact-payload-match `UNK` row already covering it (`catalog_id`, `builder_order`, `plant_code`, `works_number`, `year_built` all `IS NOT DISTINCT FROM` matching) — zero were orphaned/unmatched, so nothing was lost in the cleanup.
+
+---
+
+### Outcome
+
+Code changes (`scripts/db_dml_loader.py`): new `ensure_unknown_builder()`, called once in `main()` right
+after `migrate_builder()`; `migrate_catalog_builder()`'s per-row loop now skips outright when `catalog_id`
+is unresolved (same reasoning as `catalog_metadata`) and falls back to the `'UNK'` sentinel for
+`builder_id` only after the existing skip-check has already decided the row is worth keeping;
+`migrate_catalog_metadata()` now skips (with a per-run count logged) rows whose `catalog_id` never
+resolved instead of inserting an orphan.
+
+Live on `oci`, after the code fix, the idempotency proof, and cleaning up both tables' accumulated legacy
+duplicates: `catalog` 141,244, `catalog_metadata` 141,244 (was 141,253 with 9 `NULL`-`catalog_id` orphans —
+those 9 were pre-existing from before this fix and are now gone for good), `catalog_builder` 116,538 (was
+up to 174,864 mid-testing; zero `NULL` `builder_id` rows remain, all real `UNK`-sentinel rows verified
+duplicate-free), `usage` 141,244. `builder` is 518 (517 real + the new `'UNK'` sentinel).
+
+---
+
+### Open Threads
+
+- [ ] *(Carried, unchanged)* `--mode dml_files` parser rewrite; `config_manager.py`/`database_connections.py`/GUI profile support; Increment 2 sub-tasks 2–4 (now genuinely unblocked — the natural-key idempotency gap that would have undermined delta-driven re-syncing is closed); `picture_metadata` untested against real images; `requirements.txt`'s `pandas==2.1.4` pin; the 16 flagged source records; DDR; supabase-py/SQLAlchemy prune; anon-JWT rotation; `PicaLocoBackend` consolidation/rebrand; delete `sync_config.json`.
 
 ---

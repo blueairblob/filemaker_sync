@@ -73,17 +73,23 @@ import-inflation) are still ahead.
 
 **`main()` now runs the full population**, not just `catalog_metadata` — every `migrate_*` call was
 restored (Session 5; they'd been commented out, so the live cloud data was never produced by a run of
-that committed code). Current order (Session 6 added the two early cache-build steps, marked `*`):
+that committed code). Current order (Session 6 added the two early cache-build steps, Session 7 added
+`ensure_unknown_builder()`, both marked `*`):
 `create_lookup_indexes()* → country → cache 'country'* → organisation → location → cache 'location'* →
-route → collection → photographer → builder → catalog → create_lookup_index_cache() (full rebuild) →
-catalog_metadata → catalog_builder → usage → picture_metadata`.
+route → collection → photographer → builder → ensure_unknown_builder()* → catalog →
+create_lookup_index_cache() (full rebuild) → catalog_metadata → catalog_builder → usage →
+picture_metadata`.
 
-**Known unfixed bug (Session 6): `catalog_builder`/`catalog_metadata` duplicate on `NULL`-key re-runs.**
+**Fixed (Session 7): `catalog_builder`/`catalog_metadata` no longer duplicate on `NULL`-key re-runs.**
 SQL never treats `NULL = NULL`, so a row whose `builder_id`/`catalog_id` couldn't be resolved never
-conflicts with its own earlier insert — every re-run adds a fresh copy. Cleaned up once (58,326 duplicate
-`catalog_builder` rows removed via a `DISTINCT ON (catalog_id, builder_order)` delete), not fixed at the
-code level. Will recur on the next full re-run until it's actually fixed (partial index treating `NULL`
-as a value? a sentinel for "unresolved"?) — see `devlog/worksheet.md` Session 6.
+conflicted with its own earlier insert, and every re-run added a fresh copy. Two different fixes for two
+different situations: `catalog_builder` rows with unresolved `builder_id` but real payload
+(`plant_code`/`works_number`/`year_built`) now fall back to a real sentinel `'UNK'` builder row (same
+convention already used for `location`/`country`'s `'unknown'`) — see `ensure_unknown_builder()`.
+`catalog_metadata` rows whose `catalog_id` never resolved are skipped outright (the row is unlinkable —
+its own `catalog` insert already failed, no sentinel makes sense for the spine table). Proven idempotent
+by running Stage 2 twice and confirming zero growth; 58,326 + 9 accumulated legacy duplicates cleaned up
+once. See `devlog/worksheet.md` Session 7.
 
 **Fixed a silent one-row-per-table loss (Session 5):** `read_data_from_migration_schema()` had a dead
 debug line (`first_row = result.fetchone()`) that consumed a row off the cursor before the real read
@@ -140,9 +146,9 @@ removed.
   root cause and "Gotchas" below for a real bug this exposed.
 - **`catalog_builder`'s real count is 116,538, not 116,530** — that older figure (Session 3, cloud target)
   may itself have been inflated by the same `NULL`-`builder_id`-never-conflicts bug Session 6 found and
-  cleaned up on `oci`; not reconciled against the cloud target. `builder_id IS NULL` accounts for 57,187 of
-  those rows (real data — many trains genuinely have no resolvable builder) and duplicates freely on every
-  re-run until the underlying bug is fixed (see Current focus).
+  Session 7 fixed on `oci`; not reconciled against the cloud target. 57,187 of those rows resolve to the
+  `'UNK'` sentinel builder (real data — many trains genuinely have no resolvable builder code, but do carry
+  real `plant_code`/`works_number`/`year_built`); this is now stable across re-runs, not growing.
 
 ---
 
@@ -253,20 +259,17 @@ python.exe scripts/fm_metadata_probe.py --selftest
 
 ## Current focus
 
-**The `oci` target bring-up is done (Session 5) and fast (Session 6).** Full archive loaded live, sync
-manifest baselined, `--preview` clean, and both pipeline stages run in minutes instead of hours (see
-"Loader status" above). `python.exe` interop works directly from this WSL environment — no separate
-Windows session needed to drive Stage 1 against the real FileMaker file.
-
-**Next up: fix the `NULL`-key duplication bug (Session 6 finding), before it bites the next full re-run.**
-`catalog_builder`/`catalog_metadata` rows with an unresolved natural-key column duplicate freely on every
-re-run since SQL never treats `NULL = NULL`. Cleaned up once by hand; not fixed in code. Needs a real
-design decision, not a quick patch.
+**The `oci` target bring-up is done (Session 5), fast (Session 6), and genuinely idempotent (Session 7).**
+Full archive loaded live, sync manifest baselined, `--preview` clean, both pipeline stages run in minutes
+instead of hours, and re-running Stage 2 no longer accumulates duplicates on unresolved natural-key
+lookups (see "Loader status" above). `python.exe` interop works directly from this WSL environment — no
+separate Windows session needed to drive Stage 1 against the real FileMaker file.
 
 **Increment 2** (the real loader is adopted): its first sub-task, converting `catalog_builder` to an
-incremental upsert, is **done** (Session 5) — though see the `NULL`-key caveat above, it's not fully
-idempotent yet. Remaining: feed the sync engine's `new + changed` delta into the loader, advance the
+incremental upsert, is **done** (Session 5) and now actually idempotent end-to-end (Session 7 closed the
+`NULL`-key gap). Remaining: feed the sync engine's `new + changed` delta into the loader, advance the
 manifest only on *verified* loads, and add a row-hash backstop so a FileMaker import can't masquerade as
-~140k edits — unblocked, since both the manifest and the full data are live on `oci`. Smaller threads:
-`picture_metadata` untested against real images (no local files); the 16 flagged source records
-(FileMaker-side, re-confirmed via the `oci` manifest baseline). Detail in `devlog/worksheet.md`.
+~140k edits — unblocked, since the manifest, the full data, and now idempotent re-runs are all live on
+`oci`. Smaller threads: `picture_metadata` untested against real images (no local files); the 16 flagged
+source records (FileMaker-side, re-confirmed via the `oci` manifest baseline). Detail in
+`devlog/worksheet.md`.
