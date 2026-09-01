@@ -900,10 +900,46 @@ def export_data(tab: dict, name: str, header_req: bool = True, footer_req = True
             if name not in ins_err:
               ins_err[name] = {}
               err_cnt = 0
-              
+
+            # Try the whole chunk as one bulk insert first (the common case --
+            # no conflicts). Falls back to the proven per-row loop below only if
+            # the bulk attempt actually conflicts, or when resuming via
+            # --start-from, which needs per-row inspection to find the resume
+            # point and can't be done in a single bulk statement.
+            bulk_done = False
+            if start_from == None:
+                try:
+                    # Same per-statement check the per-row loop below uses (not
+                    # `mode`, which is only ever assigned in the file-export
+                    # branch above -- unset for a --db-exp-only run): a chunk's
+                    # own dml already has its own "INSERT INTO ... VALUES" header
+                    # when it's the first chunk; a continuation chunk needs the
+                    # shared insert_header prepended.
+                    i = ''
+                    if not re.findall('INSERT INTO', tab[name]['dml'], re.IGNORECASE):
+                        i = insert_header
+                    bulk_dml = adjust_sql_syntax(i + tab[name]['dml'], db_type)
+                    pk_col_list = dbt.get(mig_schema, {}).get('pk', {}).get(name)
+                    if pk_col_list:
+                        pk_cols = ', '.join(pk_col_list).replace('\\', '')
+                        bulk_sql_txt = f"{bulk_dml} ON CONFLICT({pk_cols}) DO NOTHING"
+                    else:
+                        bulk_sql_txt = bulk_dml
+                    bulk_sql_txt = text(bulk_sql_txt.replace('\\\\', '\\'))
+
+                    cn_tgt.execute(bulk_sql_txt)
+                    cn_tgt.commit()
+                    ins_cnt += len(tab[name]['dml'].split(',\n'))
+                    bulk_done = True
+                except IntegrityError:
+                    # A real conflict inside this chunk -- the whole bulk statement
+                    # rolled back atomically (nothing partial to clean up). Fall
+                    # through to the per-row loop so duplicate detection/logging
+                    # stays per-record, exactly as before batching was added.
+                    cn_tgt.rollback()
+
             try:
-                batch_insert = False
-                if not batch_insert:   #do check integrity instead ?
+                if not bulk_done:
                     # Single Insert statements - useful for updating
                     for ins_sql in tab[name]['dml'].split(',\n'):
                         i = ''
@@ -959,16 +995,7 @@ def export_data(tab: dict, name: str, header_req: bool = True, footer_req = True
                         except SQLAlchemyError as e:
                             cn_tgt.rollback()
                             logger.error(f"{dbt[active_profile]['name'][1]} SQLAlchemy error inserting data into {name}: {clean_error(e)}")
-                            raise       
-                else:
-                    # Bulk insert when we are sure that there are no ins_err
-                    i = ''
-                    if mode == 'a':
-                        i = insert_header
-                    txt = text(i + tab[name]['dml'])
-                    status = cn_tgt.execute(txt)
-                    cn_tgt.commit()
-                    
+                            raise
             except Exception as e:
                 logger.error(f"{dbt[active_profile]['name'][1]}: Unexpected error inserting data into {name}: {clean_error(e)}")
                 if hasattr(e, '__cause__') and e.__cause__:

@@ -319,7 +319,83 @@ Delivered and **verified live** against the fresh OCI target (`huey.taila2eeb2.t
 - [ ] Increment 2 sub-tasks 2–4 (drive the loader from the sync-manifest delta, advance the manifest only on verified loads, row-hash backstop against FileMaker import-inflation) — still ahead, unchanged from Session 4. The manifest and full data are now both live on the OCI target, so this is unblocked.
 - [ ] `picture_metadata` untested against real images this session (needs local image files, none present in the WSL environment) — 0 entries migrated, expected given no local files, but the code path itself wasn't exercised against real photos.
 - [ ] `requirements.txt`'s `pandas==2.1.4` pin has no Python 3.13 wheel and fails building from source — worth loosening the pin (this session installed unpinned `pandas`/`sqlalchemy`/`tomli`/`pillow`/`tqdm` into the Windows Python instead).
-- [ ] `ratcatalogue`'s Stage-1 export dominates runtime (~2 hours for 141k rows, individual-insert overhead in `export_data`'s staging-table DML path) — worth a batched-insert pass if `--db-exp` becomes a routine/frequent operation rather than a one-off bootstrap.
+- [x] ~~`ratcatalogue`'s Stage-1 export dominates runtime~~ — **fixed Session 6**, see below.
 - [ ] *(Carried)* the 16 flagged source records (13 duplicate `image_no`, 3 null keys) — now precisely re-confirmed via the OCI manifest baseline, still FileMaker-side cleanup; DDR from the `.fmpur` copy; supabase-py vs SQLAlchemy prune; anon-JWT rotation when frontend ready; consolidation into `PicaLocoBackend` + rebrand once stable; delete the dead `sync_config.json`.
+
+---
+
+## Session 6 — 2026-09-01 — Fix the loader's and extract's row-by-row performance bottlenecks
+
+**Focus:** Session 5's full live load worked but was slow — Stage 1 took ~2 hours for 141k rows, and Stage 2's `migrate_route` alone took ~35 minutes for 2,874 rows. Find and fix the root cause in both stages, verify against real data, measure the actual improvement.
+**Status:** `completed`. Also surfaced (and cleaned up) a real, pre-existing data-integrity bug that testing this fix exposed at scale.
+
+---
+
+### Context
+
+Both bottlenecks traced to the same pattern: one network round trip per row where the codebase already
+had (or nearly had) a batched/cached alternative, discovered via `grep`/direct code trace, not guesswork
+— **Stage 2** (`db_dml_loader.py`): the project's own `lookup_caches` in-memory cache (built once via
+`create_lookup_index_cache()`, used correctly by `migrate_catalog_metadata`/`migrate_catalog_builder` at
+500–2,500+ rows/sec) was built too late — *after* `migrate_catalog()` — for `migrate_route`,
+`migrate_builder`, `migrate_organisation`, and `migrate_location`, which instead called
+`get_location_id()`/`get_country_id()`: always a live `SELECT`, unindexed until the same late point.
+**Stage 1** (`filemaker_extract.py`, `export_data()`): `batch_insert = False` was hardcoded (next to a
+literal `#do check integrity instead?` comment) — every row got its own `INSERT`+`commit()` despite
+`df_to_sql_bulk_insert()` already building one multi-row statement per chunk. A dead `else:` branch did
+attempt a real bulk insert, but with no per-row fallback — a single conflicting row in a 100-row chunk
+would have rolled back all 100, which is presumably why it was never turned on.
+
+---
+
+### Decisions
+
+| Decision | Rationale | Alternatives Considered |
+|---|---|---|
+| Build `country`/`location` caches early (right after their own `migrate_*`), keep the existing full rebuild after `migrate_catalog()` | `cache_lookup_table()` updates one key in `lookup_caches` rather than replacing the dict, so early partial builds survive; the later full rebuild is cheap (one bulk SELECT/table) and picks up anything `add_location()` inserted in between | Building every cache eagerly at the very start (impossible — location/builder caches need their own tables populated first, which is circular) |
+| `get_location_id()`/`get_country_id()`: cache-first fast path, falling through to the *unchanged* live-SELECT + auto-add path on a miss; update the cache in-memory when `add_location()` inserts a new row | Zero behaviour change on a miss — purely additive; the in-memory update means a second reference to the same new name later in the same run also hits the fast path | Making the cache the *only* path (would silently break the auto-add-missing-location quarantine behaviour on any staleness) |
+| Stage 1: try the whole chunk as one bulk statement, catch `IntegrityError`, fall back to the *existing* per-row loop for just that chunk | Mirrors `db_dml_loader.py`'s own proven `batch_upsert()` pattern; a single multi-row `INSERT` is atomic in Postgres, so a rolled-back bulk attempt leaves nothing to clean up before the per-row retry | Reusing the dead `else:` branch as-is (no fallback, would lose a whole chunk on one conflict) |
+| Bulk path keyed off "does this chunk's own text already start with `INSERT INTO`" (same check the per-row loop already uses), not the `mode` variable | Caught live: `mode` is only ever assigned inside the *file*-export branch — a `--db-exp`-only run (no `--fn-exp`) hit `UnboundLocalError` the first time this path actually ran, since `mode` was referenced but never assigned in that call path | Guarding with `getattr`/try-except around `mode` (papers over the same fragility instead of removing it) |
+
+---
+
+### Findings
+
+- **Confirmed by direct code trace, not guesswork**: `get_builder_id()` is dead code (nothing calls it — `migrate_builder` resolves its own `location`, not a builder lookup; `catalog_builder`'s builder resolution already goes through `lookup_caches['builder']` directly). Left untouched, out of scope.
+- **A live reproduction caught a bug in my own first version of the Stage-1 fix**: mirroring the dead bulk branch's `if mode == 'a': i = insert_header` line inherited its latent flaw — `mode` is local to `export_data()` as a whole (Python's whole-function static scoping) but only ever *assigned* inside the file-export branch, so a `--db-exp`-only run left it unbound. Fixed by using the same "does the text already start with INSERT INTO" check the per-row loop already relies on.
+- **A real, pre-existing data-integrity bug, exposed at scale by testing this fix**: `rat.catalog_builder`'s natural key is `(catalog_id, builder_id, builder_order)`, but SQL treats `NULL ≠ NULL` for uniqueness — so every row where `builder_id` couldn't be resolved (no conflict target match) gets a fresh, never-deduplicated copy on every re-run. Re-running Stage 2 twice this session (to measure the fix) accumulated **58,326 duplicate rows** — 115,513 `NULL`-`builder_id` rows where only 57,187 distinct `(catalog_id, builder_order)` pairs should exist. Non-`NULL` `builder_id` rows were unaffected (verified zero duplicates there — the natural-key fix from Session 5 works correctly for resolvable data). Cleaned up via a `DISTINCT ON (catalog_id, builder_order)` delete, verified before committing (57,187 + 59,351 = 116,538, matching exactly). **Not fixed at the code level** — that needs a real design decision (partial index? sentinel value for unresolved `builder_id`?) and is out of scope for a performance pass; flagged as a new open thread. A much smaller version of the same issue showed up in `catalog_metadata` too (9 `NULL`-`catalog_id` rows vs. the original 3) — too small and keyless to safely dedupe the same way, documented rather than touched.
+
+---
+
+### Outcome
+
+**Verified live, before/after, against the real FileMaker source and the `oci` target:**
+
+| Step | Rows | Before | After | Speedup |
+|---|---|---|---|---|
+| Stage 1 `ratcatalogue` extract | 141,262 | ~7,064s (~2h) | 225.71s (3m46s) | **~31×** |
+| Stage 2 `migrate_route` | 2,874–2,883 | ~2,100s (35m) | 1.8–2.1s | **~1,000×** |
+| Stage 2 `migrate_location` | 11,947 | ~200s (3.3m) | 5.5s | **~36×** |
+| Stage 2 `migrate_builder` | 517 | ~75s | 1.3–1.35s | **~57×** |
+| Stage 2 whole run | 141k rows, 8 tables | ~46m | ~7.6m | **~6×** |
+
+Isolated write-side tests against a scratch table (no FileMaker needed) proved both the clean-bulk path and
+the conflict-triggers-fallback path before touching real data: a clean 20-row batch went through bulk with
+zero fallback; a batch overlapping 16 already-existing ids correctly rolled back atomically and fell
+through to per-row, inserting exactly the 4 genuinely-new rows and quarantining exactly the 16 duplicates
+with individual `ins_err` records — no data loss either way.
+
+Final `rat.*` state after the full re-run + `catalog_builder` cleanup: `country` 117, `location` 14178,
+`route` 2874, `organisation` 1519, `collection` 66, `photographer` 270, `builder` 517, `catalog` 141244,
+`catalog_metadata` 141253, `catalog_builder` 116538, `usage` 141244 — all stable/idempotent across the
+performance-optimized code paths except the `catalog_builder`/`catalog_metadata` `NULL`-key duplication
+noted above, which is pre-existing and now cleaned up (not code-fixed).
+
+---
+
+### Open Threads
+
+- [ ] **`catalog_builder`/`catalog_metadata`'s `NULL`-key duplication is a real, unfixed bug** — any row where a natural-key column can't be resolved will duplicate on every re-run, since SQL never treats `NULL` as equal to `NULL`. Needs a real decision (partial unique index treating `NULL` as a value via `COALESCE`? A sentinel non-`NULL` value for "unresolved"? Skip rows with no resolvable key entirely, if that's ever acceptable per the project's quarantine philosophy?) — bigger than a performance-pass fix, flagged for whoever picks up Increment 2's remaining sub-tasks next, since delta-driven re-syncing will hit this constantly.
+- [ ] *(Carried)* everything from Session 5's Open Threads not resolved above: `--mode dml_files` parser rewrite; `config_manager.py`/`database_connections.py`/GUI profile support; Increment 2 sub-tasks 2–4; `picture_metadata` untested against real images; `requirements.txt`'s `pandas==2.1.4` pin; the 16 flagged source records; DDR; supabase-py/SQLAlchemy prune; anon-JWT rotation; `PicaLocoBackend` consolidation/rebrand; delete `sync_config.json`.
 
 ---

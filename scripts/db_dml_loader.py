@@ -106,6 +106,9 @@ logger: logging.Logger
 engine: Engine
 session: sessionmaker
 config: dict
+# In-memory id lookup caches (built incrementally -- see cache_lookup_table()),
+# keyed by table name ('country', 'location', ...) -> {natural_key: uuid}.
+lookup_caches: dict = {}
 
 
 # Set up logging
@@ -615,6 +618,10 @@ def batch_upsert(table_name, data, uniq_columns=['id'], return_after_batch=False
     
 
 def get_country_id(tab, data, ref_data = ''):
+    cached_id = lookup_caches.get('country', {}).get(stripy(data))
+    if cached_id is not None:
+        return cached_id
+
     stmt = select(tab.c.id).where(tab.c.name == data)
     #print(stmt.compile(compile_kwargs={"literal_binds": True}))
     result = supabase.execute(stmt).first()
@@ -729,11 +736,15 @@ def add_builder(builder_code: str, builder_name: str | None = None, location_nam
       
 def get_location_id(tab, data, ref_data = ''):
     data = stripy(data)
+    cached_id = lookup_caches.get('location', {}).get(data)
+    if cached_id is not None:
+        return cached_id
+
     stmt = select(tab.c.id).where(tab.c.name == data)
     #print(stmt.compile(compile_kwargs={"literal_binds": True}))
     result = supabase.execute(stmt).first()
     id = result[0] if result is not None else None
-    
+
     if id is None:
         def_name = 'unknown'
         if ref_data != '':
@@ -743,12 +754,18 @@ def get_location_id(tab, data, ref_data = ''):
         if data != None:
             if add_location(data):
               def_name = data
-          
+
         # Look up new location id
         stmt = select(tab.c.id).where(tab.c.name == def_name)
         result = supabase.execute(stmt).first()
         id = result[0] if result is not None else None
-      
+
+    # Populate/refresh the cache so a repeat reference to this name later in
+    # the same run (e.g. another route's start/end location) hits the fast
+    # path above instead of repeating a live lookup.
+    if id is not None and 'location' in lookup_caches:
+        lookup_caches['location'][data] = id
+
     return id
   
 def get_builder_id(tab, builder_code, builder_name='', ref_data=''):
@@ -880,23 +897,25 @@ def get_entity_id_from_cache(cache, value):
         return None
     return cache.get(stripy(value))
 
+def cache_lookup_table(table_name, lookup_column):
+    """(Re)build the lookup cache for a single table, updating just that key in
+    lookup_caches rather than replacing the whole dict -- safe to call early
+    (e.g. right after a table's own migrate_* completes) without clobbering
+    any other table's cache built earlier in the same run."""
+    lookup_caches[table_name] = create_lookup_cache(table_name, lookup_column)
+
 def create_lookup_index_cache():
-  
-    global lookup_caches
-    # First, ensure we have proper indexes
-    create_lookup_indexes()
-    
-    # Create lookup caches
-    lookup_caches = {
-        'catalog': create_lookup_cache('catalog', 'image_no'),
-        'organisation': create_lookup_cache('organisation', 'name'),
-        'location': create_lookup_cache('location', 'name'),
-        'route': create_lookup_cache('route', 'name'),
-        'collection': create_lookup_cache('collection', 'name'),
-        'photographer': create_lookup_cache('photographer', 'name'),
-        'builder': create_lookup_cache('builder', 'code')
-    }
-    
+    """Build (or rebuild) every lookup cache. Cheap to call more than once --
+    each call is one bulk SELECT per table -- so later callers see any rows
+    added since an earlier partial build (e.g. via add_location())."""
+    cache_lookup_table('catalog', 'image_no')
+    cache_lookup_table('organisation', 'name')
+    cache_lookup_table('location', 'name')
+    cache_lookup_table('route', 'name')
+    cache_lookup_table('collection', 'name')
+    cache_lookup_table('photographer', 'name')
+    cache_lookup_table('builder', 'code')
+
 def update_picture_catalog_ids(metadata_records):
     """Update catalog_ids using existing lookup cache."""
     for record in metadata_records:
@@ -1502,15 +1521,20 @@ def main():
 
     # Migration order respects referential dependencies
     with session() as supabase:
+        # Indexes first: cheap even on an empty table, and every batch_upsert/
+        # ON CONFLICT below benefits from them, not just the lookups.
+        create_lookup_indexes()
         migrate_country(catalog_df)
+        cache_lookup_table('country', 'name')  # needed by migrate_organisation/migrate_location next
         migrate_organisation(catalog_df)
         migrate_location(catalog_df)
+        cache_lookup_table('location', 'name')  # needed by migrate_route/migrate_builder next
         migrate_route(routes_df)
         migrate_collection(collections_df)
         migrate_photographer(catalog_df)
         migrate_builder(builders_df)
         migrate_catalog(catalog_df)
-        create_lookup_index_cache()
+        create_lookup_index_cache()  # full rebuild: picks up any add_location() additions above too
         migrate_catalog_metadata(catalog_df)
         migrate_catalog_builder(catalog_df)
         migrate_usage(catalog_df)

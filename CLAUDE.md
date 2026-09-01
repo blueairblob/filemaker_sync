@@ -46,9 +46,21 @@ The tkinter GUI (`gui/`) is a `subprocess` wrapper around the CLIs. It contains 
 ## Loader status — the real production loader is adopted
 
 `scripts/db_dml_loader.py` is now the **real production loader** (~1495 lines): schema-driven column
-handling, in-memory **lookup caches** (no N+1 per-row SELECTs), the full **sanitise/quarantine/reject**
-pipeline, and correct natural-key conflict targets. It has `env_secrets` wired into `get_db_engine`.
+handling, in-memory **lookup caches** (no N+1 per-row SELECTs — genuinely true everywhere as of Session 6,
+see below), the full **sanitise/quarantine/reject** pipeline, and correct natural-key conflict targets. It
+has `env_secrets` wired into `get_db_engine`.
 (It replaced an earlier stale 781-line reconstruction — if you see references to that, they're historical.)
+
+**Every lookup goes through `lookup_caches` now (Session 6, ~30–1,000× faster).** `migrate_route`/
+`migrate_builder`/`migrate_organisation`/`migrate_location` used to call `get_location_id()`/
+`get_country_id()` — always a live, unindexed `SELECT` per row — because the shared cache was only built
+once, *after* `migrate_catalog()`. Fixed by building `country`/`location` caches right after their own
+`migrate_*` (via the new `cache_lookup_table(name, column)` helper, which updates one key instead of
+replacing the whole `lookup_caches` dict) and running `create_lookup_indexes()` first thing in `main()`
+instead of buried inside the old single cache-build call. `get_location_id()`/`get_country_id()` now check
+the cache first and fall through to the *unchanged* live-SELECT + auto-add path only on a genuine miss —
+zero behaviour change, just short-circuits the common case. `get_builder_id()` is confirmed dead code
+(nothing calls it) — left alone.
 
 **Increment 2's first sub-task is done (Session 5):** `migrate_catalog_builder` now upserts on its real
 key `(catalog_id, builder_id, builder_order)` — the DB constraint already existed
@@ -61,9 +73,17 @@ import-inflation) are still ahead.
 
 **`main()` now runs the full population**, not just `catalog_metadata` — every `migrate_*` call was
 restored (Session 5; they'd been commented out, so the live cloud data was never produced by a run of
-that committed code). Order matters and is unchanged: `country → organisation → location → route →
-collection → photographer → builder → catalog → create_lookup_index_cache() → catalog_metadata →
-catalog_builder → usage → picture_metadata`.
+that committed code). Current order (Session 6 added the two early cache-build steps, marked `*`):
+`create_lookup_indexes()* → country → cache 'country'* → organisation → location → cache 'location'* →
+route → collection → photographer → builder → catalog → create_lookup_index_cache() (full rebuild) →
+catalog_metadata → catalog_builder → usage → picture_metadata`.
+
+**Known unfixed bug (Session 6): `catalog_builder`/`catalog_metadata` duplicate on `NULL`-key re-runs.**
+SQL never treats `NULL = NULL`, so a row whose `builder_id`/`catalog_id` couldn't be resolved never
+conflicts with its own earlier insert — every re-run adds a fresh copy. Cleaned up once (58,326 duplicate
+`catalog_builder` rows removed via a `DISTINCT ON (catalog_id, builder_order)` delete), not fixed at the
+code level. Will recur on the next full re-run until it's actually fixed (partial index treating `NULL`
+as a value? a sentinel for "unresolved"?) — see `devlog/worksheet.md` Session 6.
 
 **Fixed a silent one-row-per-table loss (Session 5):** `read_data_from_migration_schema()` had a dead
 debug line (`first_row = result.fetchone()`) that consumed a row off the cursor before the real read
@@ -115,6 +135,14 @@ removed.
   `route` 2874 vs 2863). `rat_migration.sync_manifest` is baselined; `--preview --target-profile oci` comes
   back clean and flags the identical known debris above. See `devlog/worksheet.md` Session 5 for exact
   counts and the six `filemaker_extract.py` bugs found getting a real live run working.
+- **Stage 1/Stage 2 are fast now (Session 6):** the full `ratcatalogue` extract dropped from ~2h to
+  ~3m46s (~31×); `migrate_route` dropped from ~35min to ~2s (~1,000×) — see "Loader status" above for the
+  root cause and "Gotchas" below for a real bug this exposed.
+- **`catalog_builder`'s real count is 116,538, not 116,530** — that older figure (Session 3, cloud target)
+  may itself have been inflated by the same `NULL`-`builder_id`-never-conflicts bug Session 6 found and
+  cleaned up on `oci`; not reconciled against the cloud target. `builder_id IS NULL` accounts for 57,187 of
+  those rows (real data — many trains genuinely have no resolvable builder) and duplicates freely on every
+  re-run until the underlying bug is fixed (see Current focus).
 
 ---
 
@@ -225,15 +253,20 @@ python.exe scripts/fm_metadata_probe.py --selftest
 
 ## Current focus
 
-**The `oci` target bring-up is done (Session 5).** Full archive loaded live, sync manifest baselined,
-`--preview` clean. Turns out `python.exe` interop works directly from this WSL environment — no separate
-Windows session was needed to drive Stage 1 against the real FileMaker file.
+**The `oci` target bring-up is done (Session 5) and fast (Session 6).** Full archive loaded live, sync
+manifest baselined, `--preview` clean, and both pipeline stages run in minutes instead of hours (see
+"Loader status" above). `python.exe` interop works directly from this WSL environment — no separate
+Windows session needed to drive Stage 1 against the real FileMaker file.
+
+**Next up: fix the `NULL`-key duplication bug (Session 6 finding), before it bites the next full re-run.**
+`catalog_builder`/`catalog_metadata` rows with an unresolved natural-key column duplicate freely on every
+re-run since SQL never treats `NULL = NULL`. Cleaned up once by hand; not fixed in code. Needs a real
+design decision, not a quick patch.
 
 **Increment 2** (the real loader is adopted): its first sub-task, converting `catalog_builder` to an
-incremental upsert, is **done** (Session 5), proven against a full live load. Remaining: feed the sync
-engine's `new + changed` delta into the loader, advance the manifest only on *verified* loads, and add a
-row-hash backstop so a FileMaker import can't masquerade as ~140k edits — now unblocked, since both the
-manifest and the full data are live on `oci`. Smaller threads: `picture_metadata` untested against real
-images this session (no local files); the 16 flagged source records (FileMaker-side, re-confirmed via the
-`oci` manifest baseline — same 13 duplicate `image_no`, same 3 unkeyed rows). Detail in
-`devlog/worksheet.md`.
+incremental upsert, is **done** (Session 5) — though see the `NULL`-key caveat above, it's not fully
+idempotent yet. Remaining: feed the sync engine's `new + changed` delta into the loader, advance the
+manifest only on *verified* loads, and add a row-hash backstop so a FileMaker import can't masquerade as
+~140k edits — unblocked, since both the manifest and the full data are live on `oci`. Smaller threads:
+`picture_metadata` untested against real images (no local files); the 16 flagged source records
+(FileMaker-side, re-confirmed via the `oci` manifest baseline). Detail in `devlog/worksheet.md`.
