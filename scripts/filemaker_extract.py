@@ -33,7 +33,7 @@ import re
 from pathlib import Path
 import tomli
 try:
-    from env_secrets import resolve_secret, url_quote
+    from env_secrets import resolve_secret, resolve_target_pwd, url_quote
 except ImportError:                       # self-contained fallback (identical behaviour)
     import os as _os
     from urllib.parse import quote_plus as _qp
@@ -46,8 +46,31 @@ except ImportError:                       # self-contained fallback (identical b
             pass
         _v = _os.environ.get(env_key)
         return _v if _v else (cfg_val if cfg_val is not None else default)
+    def resolve_target_pwd(profile, cfg_val=None, cli_val=None, default=""):
+        if cli_val is not None:
+            return cli_val
+        pwd = resolve_secret(f"RAT_TARGET_PWD_{profile.upper()}", cfg_val=None)
+        if pwd:
+            return pwd
+        if profile == "supabase":
+            pwd = resolve_secret("RAT_TARGET_PWD", cfg_val=None)
+            if pwd:
+                return pwd
+        return cfg_val if cfg_val is not None else default
     def url_quote(value):
         return _qp(str(value or ""))
+
+
+def resolve_active_profile(cfg, cli_val=None):
+    """Which [database.target.<profile>] is active. Precedence: CLI > env
+    RAT_TARGET_PROFILE > config.toml active_profile (or legacy 'db' key) > 'supabase'."""
+    tgt = cfg['database']['target']
+    return resolve_secret(
+        'RAT_TARGET_PROFILE',
+        cfg_val=tgt.get('active_profile') or tgt.get('db'),
+        cli_val=cli_val,
+        default='supabase',
+    )
 
 from PIL import Image
 from io import BytesIO
@@ -153,7 +176,7 @@ def format_value(val, postgres_version):
         return str(val)
     else:
         val_str = str(val)
-        if dbt_type == 'mysql':
+        if db_type == 'mysql':
             # Replace newlines with \n and escape backslashes
             escaped_val =val_str.replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '\\r')
             # Escape double quotes by doubling them
@@ -163,7 +186,7 @@ def format_value(val, postgres_version):
                 return f'"{escaped_val}"'
             return f"'{escaped_val}'"
         
-        elif dbt_type == 'supabase':  # assuming supabase uses PostgreSQL
+        elif db_type == 'supabase':  # assuming supabase uses PostgreSQL
             # Escape single quotes by doubling them
             val_str = val_str.replace("'", "''")
             if postgres_version and postgres_version >= 9.0:
@@ -206,7 +229,7 @@ def df_to_sql_bulk_insert(df: pd.DataFrame, table: str, postgres_version=None, h
     # Handle Chunking
     if header:
         # Preserve funny column names 
-        if dbt_type == 'mysql': 
+        if db_type == 'mysql': 
             columns = ', '.join("`%s`" % x for x in df.columns)
         else:  # PostgreSQL
             columns = ', '.join(f'"{x}"' for x in df.columns)
@@ -219,21 +242,22 @@ def df_to_sql_bulk_insert(df: pd.DataFrame, table: str, postgres_version=None, h
     return query
 
 def get_db_connect(db, dsn=True):
-   
+
     if db['type'] == 'url':
-        logger.info(f"Connecting to {db[db_type]['name'][1]}.")
-      
+        db_prof = db[active_profile]
+        logger.info(f"Connecting to {db_prof['name'][1]}.")
+
         dsn_str = ''
         if dsn:
-            dsn_str = db['dsn']
-        
+            dsn_str = db_prof.get('dbname') or db_prof.get('dsn') or 'postgres'
+
         try:
-            if dbt_type == 'mysql':
-                url=f"mysql+pymysql://{db[db_type]['user']}:{url_quote(resolve_secret('RAT_TARGET_PWD', db[db_type].get('pwd','')))}@{db['host']}:{db[db_type]['port']}/{dsn_str}"
+            if db_type == 'mysql':
+                url=f"mysql+pymysql://{db_prof['user']}:{url_quote(resolve_target_pwd(active_profile, db_prof.get('pwd','')))}@{db_prof['host']}:{db_prof['port']}/{dsn_str}"
                 engine = create_engine(url)
-                
-            elif dbt_type == 'supabase':
-                url=f"postgresql://{db[db_type]['user']}:{url_quote(resolve_secret('RAT_TARGET_PWD', db[db_type].get('pwd','')))}@{db['host']}:{db[db_type]['port']}/{dsn_str}"
+
+            elif db_type == 'supabase':
+                url=f"postgresql://{db_prof['user']}:{url_quote(resolve_target_pwd(active_profile, db_prof.get('pwd','')))}@{db_prof['host']}:{db_prof['port']}/{dsn_str}"
                 logger.debug(f"Db connect url: {url}")
                 engine = create_engine(url)
             else:
@@ -282,7 +306,7 @@ def get_db_connection(dbt, use_dsn=True):
             with get_db_connection(dbt, use_dsn=False) as conn:
                 yield conn
         else:
-            logger.error(f"{dbt[db_type]['name'][1]}: Error connecting: {e}")
+            logger.error(f"{dbt[active_profile]['name'][1]}: Error connecting: {e}")
             sys.exit(1)
     finally:
         if 'connection' in locals() and connection:
@@ -390,9 +414,14 @@ def get_table_data(tab: str, actions: dict, sql: str=None, rows: str='all', purg
                         else:
                           logger.info(f"{dbs['name'][1]}: {msg}: No count of rows found ({cnt})")
                             
-                        # Add ORDER BY to ensure consistent ordering
+                        # Add ORDER BY to ensure consistent ordering. Must come before any existing
+                        # "FETCH FIRST n ROWS ONLY" (added above when --max-rows is set) -- FETCH FIRST
+                        # after ORDER BY is the only valid clause order.
                         if tab == 'ratcatalogue':
-                            sql += " ORDER BY image_no ASC"
+                            if re.search(r'(?i)FETCH FIRST', sql):
+                                sql = re.sub(r'(?i)\s*FETCH FIRST', ' ORDER BY image_no ASC FETCH FIRST', sql, count=1)
+                            else:
+                                sql += " ORDER BY image_no ASC"
                         
                         # Convert dates
                         date_cols = {}
@@ -429,27 +458,32 @@ def get_table_data(tab: str, actions: dict, sql: str=None, rows: str='all', purg
                         start_from_txt = ''
                         if start_from != None:
                             start_from_txt = f", starting from {start_from}"
-                        logger.info(f"{dbt[db_type]['name'][1]}: {tab}: Inserted {ins_cnt} rows{start_from_txt}.")
+                        logger.info(f"{dbt[active_profile]['name'][1]}: {tab}: Inserted {ins_cnt} rows{start_from_txt}.")
                         
-                        # Export any ins_err to a file
+                        # Export any ins_err to a file. ins_err is only ever populated by
+                        # export_data()'s database-target branch, so it's normal/expected to be
+                        # absent here for a file-only (--fn-exp) export.
                         if tab != 'images':
-                            if len(ins_err[tab]) > 0:
+                            tab_ins_err = ins_err.get(tab, {})
+                            if len(tab_ins_err) > 0:
                                 err_file = f"{cur_pth}/{exp_pth}/ins_err_{tab}_{dt_ymd}.sql"
                                 with open(err_file, 'w', encoding='utf-8') as f:
                                     f.write(f"-- Duplicate entries for table {tab}\n")
-                                    for n in ins_err[tab]:
-                                        f.write(f"-- ID: Detail: {ins_err[tab][n]['detail']}\n")
-                                        f.write(f"{ins_err[tab][n]['sql']};\n\n")
-                                    logger.info(f"Exported {len(ins_err[tab])} duplicate entries for {tab} to {err_file}")
+                                    for n in tab_ins_err:
+                                        f.write(f"-- ID: Detail: {tab_ins_err[n]['detail']}\n")
+                                        f.write(f"{tab_ins_err[n]['sql']};\n\n")
+                                    logger.info(f"Exported {len(tab_ins_err)} duplicate entries for {tab} to {err_file}")
                         
                         txt = f"{action}: Processed {cnt} rows, {dupe_entry_cnt} duplicates"
                     
                     if action == 'DDL':
                         logger.info(f"{dbs['name'][1]}: {tab}: DDL: Fetching table definitions.")
                         # We have to run the full query as we need to ensure all data is correctly represented by the appropriate datatype
-                        if True:
+                        if rows == 'all':
                             ddl_sql = f"{sql} FETCH FIRST {chunk} ROWS ONLY"
                         else:
+                            # sql already has its own "FETCH FIRST {rows} ROWS ONLY" appended above --
+                            # adding a second FETCH clause here is invalid FileMaker SQL syntax.
                             ddl_sql = sql
                         df_ddl = run_query(ddl_sql)
                         # Drop index that auto added                                         
@@ -506,7 +540,16 @@ def get_date_string():
 
 def create_pk(engine, name, create=True):
     pk_name = f"pk_{name}"
-    columns = ', '.join(dbt[mig_schema]['pk'][name])
+    # Explicit named PKs on rat_migration staging tables are config-driven
+    # ([database.target.<schema>.pk.<table>]), but nothing populates or reads
+    # that config anywhere -- and nothing downstream needs a PK on these flat
+    # staging tables (db_dml_loader.py just SELECT *s them). Skip gracefully
+    # rather than requiring config that's never existed.
+    pk_cols = dbt.get(mig_schema, {}).get('pk', {}).get(name)
+    if not pk_cols:
+        if debug: logger.debug(f"{dbt[active_profile]['name'][1]}: No configured PK columns for \"{mig_schema}.{name}\" - skipping PK creation.")
+        return
+    columns = ', '.join(pk_cols)
     
     try:
         # Check if PK already exists
@@ -516,7 +559,7 @@ def create_pk(engine, name, create=True):
         ), {"schema": mig_schema, "table": name}).fetchone()
             
         if existing_pk:
-            if debug: logger.debug(f"{dbt[db_type]['name'][1]}: Primary key already exists for table \"{mig_schema}.{name}\" - skipping creation.")
+            if debug: logger.debug(f"{dbt[active_profile]['name'][1]}: Primary key already exists for table \"{mig_schema}.{name}\" - skipping creation.")
             return
           
         #print(f"ALTER TABLE {mig_schema}.{name} ADD CONSTRAINT {pk_name} PRIMARY KEY ({columns})")
@@ -531,10 +574,10 @@ def create_pk(engine, name, create=True):
 
     except ProgrammingError as e:
         if "already exists" in str(e):
-            logger.debug(f"{dbt[db_type]['name'][1]}: PK for table \"{name}\" Found  - skipping creation.")
+            logger.debug(f"{dbt[active_profile]['name'][1]}: PK for table \"{name}\" Found  - skipping creation.")
         raise
     except SQLAlchemyError as e:
-        logger.error(f"{dbt[db_type]['name'][1]}: Error in creating PK for table {name}: {e}")
+        logger.error(f"{dbt[active_profile]['name'][1]}: Error in creating PK for table {name}: {e}")
         raise
       
 def get_table_list():
@@ -565,7 +608,7 @@ def verify_target_database(db_name: str, create_db: bool=True, drop_db: bool=Fal
     """
     global cn_tgt, engine
     
-    if dbt_type == 'mysql':
+    if db_type == 'mysql':
       # Query for existing databases
       try:
           existing_databases = cn_tgt.execute(text("SHOW DATABASES;"))
@@ -591,7 +634,7 @@ def verify_target_database(db_name: str, create_db: bool=True, drop_db: bool=Fal
               cn_tgt.execute(text(f"USE {db_name}"))
               return 'created'
             
-    elif dbt_type == 'supabase':
+    elif db_type == 'supabase':
         try:
             if query_db:
                 existing_databases = cn_tgt.execute(text("SELECT datname FROM pg_database;"))
@@ -678,7 +721,7 @@ def table_exists(table_name, schema):
         inspector = inspect(cn_tgt)
         found = inspector.has_table(table_name, schema=schema)
         if debug and found:
-            logger.debug(f"{dbt[db_type]['name'][1]}: Found table \"{schema}.{table_name}\" - skipping creation.")
+            logger.debug(f"{dbt[active_profile]['name'][1]}: Found table \"{schema}.{table_name}\" - skipping creation.")
     except Exception as e:
         logger.error(f"Trying to see if table {table_name} exists and got: {e}")
 
@@ -811,7 +854,7 @@ def export_data(tab: dict, name: str, header_req: bool = True, footer_req = True
                     if reset and table_found:
                         logger.info(f"Recreating Table {name}.")
                     
-                        if dbt_type == 'supabase':
+                        if db_type == 'supabase':
                             tab_str = f"\"{name}\""
                         else:
                             tab_str = f"{name}"
@@ -854,10 +897,8 @@ def export_data(tab: dict, name: str, header_req: bool = True, footer_req = True
         # DML
         if exp_req['type']['dml']:
             lst_err_dtl = ''
-            try:
-              ins_err[name] == {}
-            except:
-              ins_err = {name: {}}
+            if name not in ins_err:
+              ins_err[name] = {}
               err_cnt = 0
               
             try:
@@ -880,9 +921,15 @@ def export_data(tab: dict, name: str, header_req: bool = True, footer_req = True
                                     ok_to_insert_from = True
 
                         try:
-                            pk_cols = ', '.join(dbt[mig_schema]['pk'][name])
-                            pk_cols = pk_cols.replace('\\', '')
-                            sql_txt = f"{adjusted_dml} ON CONFLICT({pk_cols}) DO NOTHING"
+                            # Same config-driven PK list as create_pk() -- never populated, and these
+                            # flat staging tables have no unique constraint to conflict on anyway.
+                            # Plain insert when there's nothing configured to conflict against.
+                            pk_col_list = dbt.get(mig_schema, {}).get('pk', {}).get(name)
+                            if pk_col_list:
+                                pk_cols = ', '.join(pk_col_list).replace('\\', '')
+                                sql_txt = f"{adjusted_dml} ON CONFLICT({pk_cols}) DO NOTHING"
+                            else:
+                                sql_txt = adjusted_dml
                             sql_txt = text(sql_txt.replace('\\\\', '\\'))
                             
                             status = cn_tgt.execute(sql_txt)
@@ -901,17 +948,17 @@ def export_data(tab: dict, name: str, header_req: bool = True, footer_req = True
                                 dupe_entry_cnt += 1
                             else:
                                 # Only non dupe errors get logged                                                                        
-                                logger.error(f"{dbt[db_type]['name'][1]}: Integrity error inserting data into {name}: {cur_err_msg}")
+                                logger.error(f"{dbt[active_profile]['name'][1]}: Integrity error inserting data into {name}: {cur_err_msg}")
                             ins_err[name][err_cnt] = err_info
                             cn_tgt.rollback()
                             continue
                         except OperationalError as e:
                             cn_tgt.rollback()
-                            logger.error(f"{dbt[db_type]['name'][1]}: Operational error inserting data into {name}: {clean_error(e.orig)}")
+                            logger.error(f"{dbt[active_profile]['name'][1]}: Operational error inserting data into {name}: {clean_error(e.orig)}")
                             raise
                         except SQLAlchemyError as e:
                             cn_tgt.rollback()
-                            logger.error(f"{dbt[db_type]['name'][1]} SQLAlchemy error inserting data into {name}: {clean_error(e)}")
+                            logger.error(f"{dbt[active_profile]['name'][1]} SQLAlchemy error inserting data into {name}: {clean_error(e)}")
                             raise       
                 else:
                     # Bulk insert when we are sure that there are no ins_err
@@ -923,7 +970,7 @@ def export_data(tab: dict, name: str, header_req: bool = True, footer_req = True
                     cn_tgt.commit()
                     
             except Exception as e:
-                logger.error(f"{dbt[db_type]['name'][1]}: Unexpected error inserting data into {name}: {clean_error(e)}")
+                logger.error(f"{dbt[active_profile]['name'][1]}: Unexpected error inserting data into {name}: {clean_error(e)}")
                 if hasattr(e, '__cause__') and e.__cause__:
                     cause = str(e.__cause__).replace('\n', ' ').strip()
                     logger.error(f"Caused by: {cause}")
@@ -1060,7 +1107,8 @@ def get_args ():
     parser.add_argument("--del-db", action = "store_true", default = False, help = "Delete the objects in the target staging database")
     parser.add_argument("--get-schema", action = "store_true", default = False, help ="Get source database schema details")
     parser.add_argument("-r", "--max-rows", type = str, default = 'all', help = "Maximum rows to return")
-    parser.add_argument("--db-type", type = str, choices = ['mysql', 'supabase'], default = 'supabase', help = "Specify the target database type")
+    parser.add_argument("--db-type", type = str, choices = ['mysql', 'supabase'], default = 'supabase', help = "Specify the target database SQL dialect")
+    parser.add_argument("--target-profile", type = str, help = "Target DB profile from config.toml's [database.target.<profile>] (overrides config/env RAT_TARGET_PROFILE)")
     parser.add_argument("--fn-fmt", type = str, choices = ['single', 'multi'], default = 'multi', help = "Single or Multi File export")
     parser.add_argument("--start-from", type=str, help="Start migration from this image_no in the ratcatalogue table")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
@@ -1093,9 +1141,9 @@ if __name__ == "__main__":
     set_mem()
     
     # Init
-    pth = Path(os.path.abspath(__file__)) 
+    pth = Path(os.path.abspath(__file__))
     script_name = pth.stem
-    cur_pth = pth.parent
+    cur_pth = Path(os.getcwd())  # config.toml/.env are read from the working directory (run from repo root), not this script's own directory
     table_data = {}
     dt_ymd = get_date_string()
     cfg_fn = 'config.toml'
@@ -1123,6 +1171,7 @@ if __name__ == "__main__":
     cfg = tomli.loads(Path(f'{cur_pth}/{cfg_fn}').read_text(encoding='utf-8'))
     dbs = cfg['database']['source']
     dbt = cfg['database']['target']
+    active_profile = resolve_active_profile(cfg, target_profile)  # type: ignore  # noqa: F821 -- injected by get_args()
     mig_schema = cfg['database']['target']['schema'][cfg['database']['target']['mig_schema']]
     
     # Disable insert until start_from (image_no) found 
@@ -1170,7 +1219,7 @@ if __name__ == "__main__":
                 logger.info('No tables found to export. Now exiting')
                 sys.exit(1)
     except Exception as e:
-        logger.error(f"{dbs[db_type]['name'][1]}: Error connecting: {e}")
+        logger.error(f"{dbs['name'][1]}: Error connecting: {e}")
         sys.exit(1)
       
        
@@ -1178,12 +1227,11 @@ if __name__ == "__main__":
     try:
         # Database Target dependent    
         if db_exp or del_data:
-            dbt_type = cfg['database']['target']['db']
-            dbt_name = dbt['dsn']
+            dbt_name = dbt[active_profile].get('dbname') or dbt[active_profile].get('dsn')
             engine = get_db_connection(dbt)
             with engine as cn_tgt:
                 # Get Version Info
-                if dbt_type == 'supabase':
+                if db_type == 'supabase':
                     postgres_version_string, postgres_version_number = get_postgres_version(cn_tgt)
                     if postgres_version_number:
                         postgres_version = postgres_version_number / 10000  # Convert to major version number
@@ -1215,7 +1263,7 @@ if __name__ == "__main__":
         if get_images and len(export_image_formats) != 0:
             # Get Image data
             table = 'images'
-            dbt_type = 'mysql' # This is required to structure the Pandas data in memory
+            db_type = 'mysql' # This is required to structure the Pandas data in memory
             # This table does not exist in the source Db
             actions = get_actions(cnt, ddl, True)
             sql="SELECT image_no, GetAs(picture,'JPEG') picture, entry_date, date_taken FROM RATCatalogue"

@@ -240,7 +240,7 @@ AUDIT_HINTS = ("modif", "modstamp", "mod_ts", "modified", "creat", "created",
 
 def probe_target_table(report: Report, cur, catalog: dict, table: str):
     report.section(f"[3] TARGET TABLE: {table}")
-    result = {"table": table}
+    result: dict = {"table": table}
 
     # Column inventory via the generic SQLColumns catalog call (version-agnostic).
     def cols_via_catalog():

@@ -2,7 +2,7 @@
 
 Operational guide for working in this repo with Claude Code. **Read this first every session.**
 For the running history and open threads, read `devlog/worksheet.md` (Sessions 1–3).
-For the task currently in flight, read `devlog/HANDOFF_loader_adoption.md`.
+For the task currently in flight, read `devlog/HANDOFF_increment2.md`.
 
 ---
 
@@ -43,23 +43,32 @@ The tkinter GUI (`gui/`) is a `subprocess` wrapper around the CLIs. It contains 
 
 ---
 
-## /!\ Loader status - READ BEFORE TOUCHING db_dml_loader.py
+## Loader status — the real production loader is adopted
 
-There are **two** loaders and they are not the same:
+`scripts/db_dml_loader.py` is now the **real production loader** (~1495 lines): schema-driven column
+handling, in-memory **lookup caches** (no N+1 per-row SELECTs), the full **sanitise/quarantine/reject**
+pipeline, and correct natural-key conflict targets. It has `env_secrets` wired into `get_db_engine`.
+(It replaced an earlier stale 781-line reconstruction — if you see references to that, they're historical.)
 
-- The **committed `scripts/db_dml_loader.py`** is a **stale partial reconstruction**. Several of its
-  migrate functions can't load the live uuid schema (e.g. `migrate_catalog` sets `id = image_no` into a
-  uuid PK; `migrate_picture_metadata` never resolves `catalog_id`; uses `color_space` - column is
-  `colour_space`). **Do not trust it as the source of truth.**
-- The **real production loader** (the code that actually loaded the live data) lives at
-  `C:\dev\RAT_Trains_Project\Migration\scripts\db_dml_loader.py` (~1476 lines): schema-driven column
-  handling, in-memory **lookup caches** (no N+1), the full **sanitise/quarantine/reject** pipeline, and
-  correct conflict keys throughout. **This is the one to adopt.**
+**Increment 2's first sub-task is done (Session 5):** `migrate_catalog_builder` now upserts on its real
+key `(catalog_id, builder_id, builder_order)` — the DB constraint already existed
+(`catalog_builder_catalog_id_builder_id_builder_order_key`), so this was a conflict-target change plus
+deleting the now-dead `TRUNCATE` branch (traced: nothing downstream depended on the truncate having
+happened). **Never dedupe on `(catalog_id, builder_id)` alone** — 5,927 legitimate multi-build pairs
+differ only in `builder_order`/payload. Remaining Increment 2 sub-tasks (drive the loader from the sync
+manifest's delta, advance the manifest only on verified loads, row-hash backstop against FileMaker
+import-inflation) are still ahead.
 
-The loader adoption is **in progress** - see `devlog/HANDOFF_loader_adoption.md` for exactly where it
-stands and the remaining steps. Until it's done, treat loader behaviour as under active reconstruction.
+**`main()` now runs the full population**, not just `catalog_metadata` — every `migrate_*` call was
+restored (Session 5; they'd been commented out, so the live cloud data was never produced by a run of
+that committed code). Order matters and is unchanged: `country → organisation → location → route →
+collection → photographer → builder → catalog → create_lookup_index_cache() → catalog_metadata →
+catalog_builder → usage → picture_metadata`.
 
----
+**Fixed a silent one-row-per-table loss (Session 5):** `read_data_from_migration_schema()` had a dead
+debug line (`first_row = result.fetchone()`) that consumed a row off the cursor before the real read
+loop. This plausibly explains the long-standing "catalog is 1 short of the manifest" mystery below —
+removed.
 
 ## Golden rules (invariants - do not violate without explicit sign-off)
 
@@ -96,8 +105,16 @@ stands and the remaining steps. Until it's done, treat loader behaviour as under
   only the delta. Manifest = `rat_migration.sync_manifest`, keyed on `image_no`, storing last-loaded ROWMODID.
 - **Known data-quality debris (surfaced, mostly report-only):** 13 duplicate `image_no` (12 `br...`, plus
   `lwp8181`); 3 NULL `image_no` (ROWIDs 42279, 47343, 145873); 354 `picture_metadata` rows with NULL
-  `catalog_id`; and catalog is 1 short of the manifest (141,243 vs 141,244 - the manifest baseline asserts
-  one row it didn't verify).
+  `catalog_id`. **The "catalog is 1 short of the manifest" mystery is solved (Session 5):** root cause was
+  `read_data_from_migration_schema()`'s dead `first_row = result.fetchone()` line silently consuming a row
+  off the cursor. Fixed; a fresh full load on the `oci` target landed `catalog` at exactly 141,244, matching
+  the manifest. (The cloud target itself wasn't re-loaded this session, so its `catalog` may still read
+  141,243 until it's re-run.)
+- **The `oci` target profile is live and fully populated (Session 5):** same source, same counts as above
+  (allowing for organic growth since the cloud target's original load — e.g. `location` 14178 vs 14176,
+  `route` 2874 vs 2863). `rat_migration.sync_manifest` is baselined; `--preview --target-profile oci` comes
+  back clean and flags the identical known debris above. See `devlog/worksheet.md` Session 5 for exact
+  counts and the six `filemaker_extract.py` bugs found getting a real live run working.
 
 ---
 
@@ -108,8 +125,8 @@ Added and correct: `collection_name_key` UNIQUE(name), `photographer_name_key` U
 plus `catalog_id` keys on `catalog_metadata`/`usage` and the schema's own `picture_metadata.catalog_id UNIQUE`
 and `builder.code UNIQUE`.
 
-**Wrong - must be dropped:** `builder_name_key` UNIQUE(name) was added on a mistaken assumption; builder's
-real key is `code`. `DROP CONSTRAINT builder_name_key` is part of the loader-adoption reconciliation.
+**Reconciled:** `builder_name_key` UNIQUE(name) was dropped (see `supabase/schema/fix_rat_builder_key.sql`) —
+builder's real key is `code` (`builder.code NOT NULL UNIQUE`), which the adopted loader conflicts on.
 
 ---
 
@@ -119,7 +136,12 @@ One shared mechanism: `scripts/env_secrets.py` (`resolve_secret` + `url_quote`).
 imports it. Precedence: **CLI arg > env/.env > config.toml > default**. Env vars:
 
 - `RAT_SOURCE_PWD` - FileMaker source password (the `train` account has **none** - leave blank)
-- `RAT_TARGET_PWD` - Supabase/Postgres DB password (current, post-rotation)
+- `RAT_TARGET_PWD` - password for the `supabase` target profile (legacy name, kept for back-compat)
+- `RAT_TARGET_PWD_<PROFILE>` - password for a named target profile, e.g. `RAT_TARGET_PWD_OCI`. Resolved via
+  `resolve_target_pwd(profile, ...)`. **No fallback to `RAT_TARGET_PWD`** for any profile except `supabase`
+  itself — switching profiles can never silently reuse the wrong target's password.
+- `RAT_TARGET_PROFILE` - which `[database.target.<profile>]` is active (also `--target-profile` CLI flag on
+  `db_dml_loader.py`/`db_sync_manifest.py`/`filemaker_extract.py`); defaults to `supabase`.
 
 `.env` lives at repo root, is gitignored, and is auto-loaded (python-dotenv). `config.toml` is secret-free
 and committed. All `postgresql://` URLs must wrap the password in `url_quote()`.
@@ -131,13 +153,25 @@ and committed. All `postgresql://` URLs must wrap the password in `url_quote()`.
 - **Run from the repo root** - scripts read `config.toml` and `.env` from the working directory.
 - **FileMaker (Stage 1, the probe, the sync scan) MUST run under native Windows Python**, invoked as
   `python.exe` from WSL, or from PowerShell. WSL's own Python has **no FileMaker ODBC driver** and can't
-  see the Windows System DSN (`rat`). Postgres-only work (manifest, loader target) runs fine anywhere.
-- Tooling installed by hand into Windows Python this session: `pyodbc`, `psycopg2-binary`, `python-dotenv`
-  (pin these in `requirements.txt` - outstanding).
+  see the Windows System DSN (`rat`). **Postgres-only work runs fine from WSL directly, confirmed live
+  (Session 5)** - the loader/manifest/probe's target-DB side needs no Windows detour, only the
+  FileMaker-facing side does.
+- Two target profiles exist in `config.toml`: `supabase` (the original cloud project, default) and `oci`
+  (self-hosted, Tailscale). Pass `--target-profile oci` (or set `RAT_TARGET_PROFILE=oci`) to point any of
+  the three scripts at it. See Secrets above for the profile's password env var.
+- **WSL's `python.exe` interop genuinely works for a full live run** (Session 5, confirmed against the real
+  FileMaker file and a live OCI load, not just theory) — no separate Windows session needed, this session's
+  agent ran Stage 1 + Stage 2 directly via `python.exe scripts/...` from WSL.
+- Windows Python tooling: `pyodbc`, `psycopg2-binary`, `python-dotenv` were already installed; Session 5
+  added `pandas`, `SQLAlchemy`, `tomli`, `pillow`, `tqdm` **unpinned** (that Windows Python is 3.13;
+  `requirements.txt`'s `pandas==2.1.4` has no 3.13 wheel and fails building from source — pin needs
+  loosening, outstanding).
 
 ```bash
 # incremental sync preview (dry-run; the "what would change" view)
 python.exe scripts/db_sync_manifest.py --preview
+# same, against the OCI target
+python.exe scripts/db_sync_manifest.py --preview --target-profile oci
 # read-only FileMaker metadata probe
 python.exe scripts/fm_metadata_probe.py --json fm_probe.json
 # offline self-tests (no DB)
@@ -150,9 +184,12 @@ python.exe scripts/fm_metadata_probe.py --selftest
 ## Gotchas that waste time
 
 - **WSL can't do FileMaker** - `libodbc.so.2` / "data source name not found" means you're in WSL; use `python.exe`.
-- **`config.toml` target creds are split** - `host` in `[database.target]`, `user`/`pwd`/`port` in
-  `[database.target.supabase]`; merge them (child wins). Supabase dbname is always `postgres`. Pooler user
-  is `postgres.<project-ref>`; port `5432` = session pooler (use this), `6543` = transaction pooler.
+- **`config.toml` target creds live per-profile** - `host`/`user`/`pwd`/`port`/`dbname` are all inside
+  `[database.target.<profile>]` (`supabase` or `oci`); only `schema`/`mig_schema`/`tgt_schema`/
+  `default_migration_user` are shared at the parent `[database.target]` level. dbname is always
+  `postgres`. Cloud pooler user is `postgres.<project-ref>`; self-hosted (Supavisor) is
+  `postgres.<tenant>` (this box's tenant is `default`). Port `5432` = session pooler (use this - the
+  loader holds explicit multi-statement transactions), `6543` = transaction pooler.
 - **A failing statement inside a single `DO $$ ... $$` block rolls the WHOLE block back.** Add constraints
   individually if one might fail.
 - **`FileMaker_ValueLists` is not a real system table** - pull controlled vocabularies from a DDR or the
@@ -160,6 +197,10 @@ python.exe scripts/fm_metadata_probe.py --selftest
 - **Line endings:** Windows checkout is CRLF; `.gitattributes` normalises. Patches from Linux are LF - use
   `git apply --3way` if one won't apply.
 - `scripts/scripts.old/` and other `*.old` paths are cruft - don't build on them.
+- **`db_dml_loader.py --mode dml_files` cannot parse a realistic FileMaker export** (confirmed against
+  `test/test.sql`: mixed quoting, `Timestamp('...')`-style values, embedded punctuation all break its
+  `pd.read_csv`-based parser). Use `--mode migration_schema` instead (reads `rat_migration.*` staging
+  tables populated by `filemaker_extract.py --db-exp`) until the parser gets a real rewrite.
 
 ---
 
@@ -167,25 +208,32 @@ python.exe scripts/fm_metadata_probe.py --selftest
 
 | Need | Look at |
 |---|---|
-| Real migration logic (adopt this) | the real loader from `Migration\scripts\db_dml_loader.py` |
-| Stale committed loader (don't trust) | `scripts/db_dml_loader.py` |
-| Stage-1 extract (already correct) | `scripts/filemaker_extract.py` |
+| Stage-2 loader (the real, adopted one) | `scripts/db_dml_loader.py` |
+| Stage-1 extract (target-connection path fixed Session 5; see Gotchas re: `--mode dml_files`) | `scripts/filemaker_extract.py` |
 | Incremental sync engine | `scripts/db_sync_manifest.py` |
 | FileMaker metadata probe | `scripts/fm_metadata_probe.py` |
 | Shared secret resolution | `scripts/env_secrets.py` |
-| Ground-truth schema | `rat_schema_original.sql` |
-| Constraint DDL | `supabase/schema/fix_rat_constraints.sql`, `fix_rat_idempotency.sql` |
+| Ground-truth schema (reference only, not re-appliable) | `rat_schema_original.sql` |
+| Fresh-target bootstrap DDL (idempotent, corrections baked in) | `supabase/schema/bootstrap_rat_schema.sql` |
+| Constraint DDL (already-applied patches, cloud target only) | `supabase/schema/fix_rat_constraints.sql`, `fix_rat_idempotency.sql` |
 | Sanitisation fixtures | `test/` |
 | Source field meanings / valid values | `FileMakerPro_source_details/` |
 | History + open threads | `devlog/worksheet.md` |
-| Current task | `devlog/HANDOFF_loader_adoption.md` |
+| Current task (Increment 2) | `devlog/HANDOFF_increment2.md` |
 
 ---
 
 ## Current focus
 
-**Adopt the real loader** (see the handoff doc), then **Increment 2**: feed the sync engine's `new + changed`
-delta into the now-idempotent loader, advance the manifest only on *verified* loads, and add a row-hash
-backstop so a FileMaker import can't masquerade as ~140k edits. Smaller open threads: `picture_metadata`
-idempotency, the 1 missing catalog row, the 16 flagged source records (FileMaker-side), and the
-`requirements.txt` pins. All are listed with detail in `devlog/worksheet.md`.
+**The `oci` target bring-up is done (Session 5).** Full archive loaded live, sync manifest baselined,
+`--preview` clean. Turns out `python.exe` interop works directly from this WSL environment — no separate
+Windows session was needed to drive Stage 1 against the real FileMaker file.
+
+**Increment 2** (the real loader is adopted): its first sub-task, converting `catalog_builder` to an
+incremental upsert, is **done** (Session 5), proven against a full live load. Remaining: feed the sync
+engine's `new + changed` delta into the loader, advance the manifest only on *verified* loads, and add a
+row-hash backstop so a FileMaker import can't masquerade as ~140k edits — now unblocked, since both the
+manifest and the full data are live on `oci`. Smaller threads: `picture_metadata` untested against real
+images this session (no local files); the 16 flagged source records (FileMaker-side, re-confirmed via the
+`oci` manifest baseline — same 13 duplicate `image_no`, same 3 unkeyed rows). Detail in
+`devlog/worksheet.md`.

@@ -77,7 +77,7 @@ except ModuleNotFoundError:            # pragma: no cover
 # first, config.toml as fallback), so config.toml can be secret-free. The inline
 # fallback keeps this working even if env_secrets.py isn't beside this file.
 try:
-    from env_secrets import resolve_secret
+    from env_secrets import resolve_secret, resolve_target_pwd
 except ImportError:                       # self-contained fallback (identical behaviour)
     import os as _os
     def resolve_secret(env_key, cfg_val=None, cli_val=None, default=""):
@@ -89,6 +89,17 @@ except ImportError:                       # self-contained fallback (identical b
             pass
         _v = _os.environ.get(env_key)
         return _v if _v else (cfg_val if cfg_val is not None else default)
+    def resolve_target_pwd(profile, cfg_val=None, cli_val=None, default=""):
+        if cli_val is not None:
+            return cli_val
+        pwd = resolve_secret(f"RAT_TARGET_PWD_{profile.upper()}", cfg_val=None)
+        if pwd:
+            return pwd
+        if profile == "supabase":
+            pwd = resolve_secret("RAT_TARGET_PWD", cfg_val=None)
+            if pwd:
+                return pwd
+        return cfg_val if cfg_val is not None else default
 
 NOW = datetime.now(timezone.utc)
 STAMP = NOW.strftime("%Y%m%d_%H%M%S")
@@ -152,15 +163,30 @@ def source_conf(cfg: dict) -> dict:
     return cfg.get("database", {}).get("source", {})
 
 
-def target_conf(cfg: dict) -> dict:
-    # Connection details are split: host lives in [database.target] while
-    # user/pwd/port live in [database.target.supabase]. Merge them, with the
-    # supabase child overriding the parent for any overlapping key.
+def resolve_active_profile(cfg: dict, cli_val: str | None = None) -> str:
+    """Which [database.target.<profile>] is active. Precedence: CLI > env
+    RAT_TARGET_PROFILE > config.toml active_profile (or legacy 'db' key) > 'supabase'."""
+    tgt = cfg.get("database", {}).get("target", {})
+    return resolve_secret(
+        "RAT_TARGET_PROFILE",
+        cfg_val=tgt.get("active_profile") or tgt.get("db"),
+        cli_val=cli_val,
+        default="supabase",
+    )
+
+
+def target_conf(cfg: dict, profile: str | None = None) -> dict:
+    # Connection details are split: shared keys live in [database.target] while
+    # host/user/pwd/port live in [database.target.<profile>]. Merge them, with the
+    # active profile's sub-table overriding the parent for any overlapping key.
     tgt = dict(cfg.get("database", {}).get("target", {}))
-    sub = tgt.pop("supabase", {})
+    active = resolve_active_profile(cfg, profile)
+    sub = tgt.get(active, {})
     if not isinstance(sub, dict):
         sub = {}
-    return {**tgt, **sub}
+    merged = {**tgt, **sub}
+    merged["_active_profile"] = active
+    return merged
 
 
 # =============================================================================
@@ -367,7 +393,7 @@ class PgManifest:
         self._pg = psycopg2
         self.cnxn = psycopg2.connect(
             host=host, port=port or 5432, user=user, password=pwd or "",
-            dbname=dbname or "postgres", sslmode="require", connect_timeout=30,
+            dbname=dbname or "postgres", sslmode="prefer", connect_timeout=30,
         )
         self.cnxn.autocommit = False
 
@@ -423,12 +449,13 @@ def resolve_source(args, cfg):
 
 
 def resolve_target(args, cfg):
-    t = target_conf(cfg) if cfg else {}
+    t = target_conf(cfg, getattr(args, "target_profile", None)) if cfg else {}
+    profile = t.get("_active_profile", "supabase")
     return {
         "host": args.pg_host or t.get("host"),
         "port": args.pg_port or t.get("port"),
         "user": args.pg_user or t.get("user"),
-        "pwd": resolve_secret("RAT_TARGET_PWD", t.get("pwd", ""), args.pg_pwd),
+        "pwd": resolve_target_pwd(profile, t.get("pwd", ""), args.pg_pwd),
         # Supabase's database is always 'postgres'; parent keys like dsn/db/name
         # are labels (and 'name' is a list), so don't use them as the dbname.
         "dbname": args.pg_db or t.get("dbname") or "postgres",
@@ -522,6 +549,8 @@ def main() -> int:
     # target overrides
     ap.add_argument("--pg-host"); ap.add_argument("--pg-port")
     ap.add_argument("--pg-user"); ap.add_argument("--pg-pwd"); ap.add_argument("--pg-db")
+    ap.add_argument("--target-profile", help="Target DB profile from config.toml's "
+                    "[database.target.<profile>] (overrides config/env RAT_TARGET_PROFILE)")
     ap.add_argument("--manifest-snapshot", help="use a snapshot as the manifest baseline")
     ap.add_argument("--json", metavar="FILE")
     args = ap.parse_args()

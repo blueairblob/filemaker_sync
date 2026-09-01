@@ -8,12 +8,15 @@ tool, and the GUI's config_manager — resolves passwords through resolve_secret
 here, so there is ONE mechanism and config.toml can be secret-free.
 
 Environment variables:
-    RAT_SOURCE_PWD   FileMaker source account password (may be blank)
-    RAT_TARGET_PWD   Supabase / Postgres target database password
+    RAT_SOURCE_PWD        FileMaker source account password (may be blank)
+    RAT_TARGET_PWD        Supabase / Postgres target password (legacy / 'supabase' profile)
+    RAT_TARGET_PWD_<NAME> Password for target profile <NAME> (e.g. RAT_TARGET_PWD_OCI)
+    RAT_TARGET_PROFILE    Which [database.target.<name>] profile is active
 
 Typical use:
-    from env_secrets import resolve_secret, url_quote
+    from env_secrets import resolve_secret, resolve_target_pwd, url_quote
     pwd = resolve_secret("RAT_TARGET_PWD", cfg_pwd)      # env wins, else config
+    pwd = resolve_target_pwd("oci", cfg_pwd)             # profile-scoped password
     url = f"postgresql://{user}:{url_quote(pwd)}@{host}:{port}/{db}"
 
 .env is loaded automatically (if python-dotenv is installed) the first time a
@@ -49,6 +52,27 @@ def resolve_secret(env_key, cfg_val=None, cli_val=None, default=""):
     env_val = os.environ.get(env_key)
     if env_val:                       # a non-empty env var wins over config
         return env_val
+    return cfg_val if cfg_val is not None else default
+
+
+def resolve_target_pwd(profile, cfg_val=None, cli_val=None, default=""):
+    """Resolve the password for a named target-DB profile (e.g. "supabase", "oci").
+    Precedence: CLI arg > env RAT_TARGET_PWD_<PROFILE> > (profile "supabase" only:
+    legacy env RAT_TARGET_PWD) > config.toml value > default.
+
+    The legacy bare RAT_TARGET_PWD is intentionally NOT a fallback for any profile
+    other than "supabase" -- a new profile must get its own env var, so switching
+    profiles can never silently authenticate against the wrong host with a stale
+    password."""
+    if cli_val is not None:
+        return cli_val
+    pwd = resolve_secret(f"RAT_TARGET_PWD_{profile.upper()}", cfg_val=None)
+    if pwd:
+        return pwd
+    if profile == "supabase":
+        pwd = resolve_secret("RAT_TARGET_PWD", cfg_val=None)
+        if pwd:
+            return pwd
     return cfg_val if cfg_val is not None else default
 
 

@@ -52,6 +52,7 @@ import pandas as pd
 from PIL import Image
 #from supabase import create_client, Client
 from sqlalchemy import create_engine, MetaData, Table, select, insert, inspect, text
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -62,13 +63,13 @@ import glob
 from tqdm import tqdm
 import io
 from collections import OrderedDict
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, DataError
 from psycopg2.errors import UniqueViolation, ForeignKeyViolation, StringDataRightTruncation
-from psycopg2.errors import StringDataRightTruncation, Error as PGError
+from psycopg2.errors import Error as PGError
 
 # --- shared secret resolution (env/.env first, config fallback) ---------------
 try:
-    from env_secrets import resolve_secret, url_quote
+    from env_secrets import resolve_secret, resolve_target_pwd, url_quote
 except ImportError:                       # self-contained fallback (identical behaviour)
     import os as _os
     from urllib.parse import quote_plus as _qp
@@ -81,17 +82,30 @@ except ImportError:                       # self-contained fallback (identical b
             pass
         _v = _os.environ.get(env_key)
         return _v if _v else (cfg_val if cfg_val is not None else default)
+    def resolve_target_pwd(profile, cfg_val=None, cli_val=None, default=""):
+        if cli_val is not None:
+            return cli_val
+        pwd = resolve_secret(f"RAT_TARGET_PWD_{profile.upper()}", cfg_val=None)
+        if pwd:
+            return pwd
+        if profile == "supabase":
+            pwd = resolve_secret("RAT_TARGET_PWD", cfg_val=None)
+            if pwd:
+                return pwd
+        return cfg_val if cfg_val is not None else default
     def url_quote(value):
         return _qp(str(value or ""))
 
         
-# Global variables
+# Global variables — populated by main() (via `global`) before any migration
+# function runs; declared here (without a None default) so their static type
+# is the real type, not Optional[...].
 user_id = None
 debug = False
-logger = None
-engine = None
-session = None
-config = None
+logger: logging.Logger
+engine: Engine
+session: sessionmaker
+config: dict
 
 
 # Set up logging
@@ -143,6 +157,8 @@ def get_args():
     parser.add_argument("--user-id", help="User ID for audit columns")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("--upload-images", action="store_true", help="Upload images to Supabase storage")
+    parser.add_argument("--target-profile", help="Target DB profile from config.toml's "
+                        "[database.target.<profile>] (overrides config/env RAT_TARGET_PROFILE)")
     return parser.parse_args()
 
 def load_config():
@@ -198,6 +214,8 @@ def postprocess_dataframe(df, single_quoted, double_quoted):
 
 def parse_insert_statement(insert_statement, file_path, first_reject=True):
     """Parse a SQL INSERT statement using pandas, handling both single and double quotes."""
+    table_name = "Unknown"
+    columns = []
     try:
         # Extract table name
         table_match = re.search(r'INSERT INTO `?(\w+)`?', insert_statement)
@@ -268,10 +286,18 @@ def read_dml_extracts(export_path):
     for file_path in glob.glob(os.path.join(export_path, '*.sql')):
         print(f"Processing file: {file_path}")
         first_reject = True
+        content = ""
         try:
             with open(file_path, 'r', encoding='utf-8') as file:
                 content = file.read()
-            
+
+            # Strip a leading /* ... */ header comment (every real FileMaker
+            # export has one, e.g. "/* Table: ratcatalogue Rows: N Date: ... */").
+            # Without this, the chunk before the first real INSERT INTO doesn't
+            # start with that keyword, so the "prepend INSERT INTO" fallback
+            # below glues the comment onto a doubled/malformed statement.
+            content = re.sub(r'^\s*/\*.*?\*/\s*', '', content, flags=re.DOTALL)
+
             # Split content into individual INSERT statements
             insert_statements = re.split(r';[\s\n]*INSERT INTO', content)
             insert_statements = [stmt if stmt.strip().upper().startswith('INSERT INTO') else f'INSERT INTO {stmt}' 
@@ -300,11 +326,24 @@ def read_dml_extracts(export_path):
     
     return all_data
     
-def get_db_engine(config):
-    db_type = config['database']['target']['db']
-    db_config = config['database']['target'][db_type]
-    pwd = resolve_secret('RAT_TARGET_PWD', db_config.get('pwd', ''))
-    db_url = f"postgresql://{db_config['user']}:{url_quote(pwd)}@{config['database']['target']['host']}:{db_config['port']}/{config['database']['target']['dsn']}"
+def resolve_active_profile(config, cli_val=None):
+    """Which [database.target.<profile>] is active. Precedence: CLI > env
+    RAT_TARGET_PROFILE > config.toml active_profile (or legacy 'db' key) > 'supabase'."""
+    tgt = config['database']['target']
+    return resolve_secret(
+        'RAT_TARGET_PROFILE',
+        cfg_val=tgt.get('active_profile') or tgt.get('db'),
+        cli_val=cli_val,
+        default='supabase',
+    )
+
+def get_db_engine(config, profile_override=None):
+    tgt = config['database']['target']
+    profile = resolve_active_profile(config, profile_override)
+    db_config = tgt[profile]
+    pwd = resolve_target_pwd(profile, cfg_val=db_config.get('pwd', ''))
+    dbname = db_config.get('dbname') or db_config.get('dsn') or 'postgres'
+    db_url = f"postgresql://{db_config['user']}:{url_quote(pwd)}@{db_config['host']}:{db_config['port']}/{dbname}"
     return create_engine(db_url)
   
 def get_table(table_name, schema = 'public'):
@@ -315,7 +354,7 @@ def get_table(table_name, schema = 'public'):
 def get_or_create_user(username):
     users_table = get_table('users', mig_schema)
     if not username:
-        username = config['database']['target']['user']
+        username = config['database']['target']['default_migration_user']
         result = supabase.execute(select(users_table).where(users_table.c.username == username)).first()
         if not result:
             raise ValueError("Default migration_user not found")
@@ -340,10 +379,6 @@ def read_data_from_migration_schema(table_name):
     with engine.connect() as connection:
         result = connection.execute(select(table))
         columns = result.keys()
-        first_row = result.fetchone()
-        # if debug: 
-        #     print(f"{table_name}: Columns: {columns}")
-        #     print(f"{table_name}: First row: {first_row}")
         data = []
         for row in result:
             row_dict = {}
@@ -426,8 +461,8 @@ def batch_upsert(table_name, data, uniq_columns=['id'], return_after_batch=False
             tgt_table_obj = get_table(table_name, tgt_schema)
             
             # Get column size constraints from table
-            columns_info = {c.name: c.type.length for c in tgt_table_obj.columns 
-                              if hasattr(c.type, 'length')}
+            columns_info = {c.name: length for c in tgt_table_obj.columns
+                              if (length := getattr(c.type, 'length', None)) is not None}
           
             # Check table exists
             if not create_table_if_not_exists(table_name, tgt_schema):
@@ -484,7 +519,7 @@ def batch_upsert(table_name, data, uniq_columns=['id'], return_after_batch=False
                 supabase.commit()
                 success_cnt += len(cleaned_batch)
                 
-            except (IntegrityError, StringDataRightTruncation) as e:
+            except (IntegrityError, DataError) as e:
                 supabase.rollback()
                 logger.debug(f"{table_name}: Bulk insert failed, falling back to individual inserts")
                 
@@ -526,12 +561,13 @@ def batch_upsert(table_name, data, uniq_columns=['id'], return_after_batch=False
                         if error_detail != {}:
                             error_records.append(error_detail)
                             
-                    except StringDataRightTruncation as e:
+                    except DataError as e:
                         supabase.rollback()
                         error_counts['truncation_errors'] += 1
                         err_msg = format_pg_error(e)
                         logger.warning(f"{table_name}: Data truncation: {err_msg}")
-                        logger.debug(f"Column: {e.orig.diag.column_name}, Length: {e.orig.diag.message_detail}")
+                        if isinstance(e.orig, StringDataRightTruncation):
+                            logger.debug(f"Column: {e.orig.diag.column_name}, Length: {e.orig.diag.message_detail}")
                         
                     except Exception as e:
                         supabase.rollback()
@@ -635,7 +671,7 @@ def add_location(location_name: str, country_name: str = 'unknown', check_exists
         logger.exception(f"{tgt_table}: Exception details:")
         return False
       
-def add_builder(builder_code: str, builder_name: str = None, location_name: str = 'unknown'):
+def add_builder(builder_code: str, builder_name: str | None = None, location_name: str = 'unknown'):
     """ Add a single builder record to the database. """
     tgt_table = 'builder'
     logger.info(f"{tgt_table}: Adding missing builder: {builder_code}")
@@ -741,12 +777,13 @@ def get_builder_id(tab, builder_code, builder_name='', ref_data=''):
             if ref_data != '':
                 ref_data = f" Ref. \"{ref_data}\": "
             logger.warning(f"{tab.name}:{ref_data}No id found for \"{tab.name}\": code=\"{def_builder_code}\" name=\"{def_builder_name}\" so will add it to builder table")
+            assert def_builder_code is not None  # only 'UNK' (handled above) can be None-derived
             id = add_builder(def_builder_code, def_builder_name)
       
     return id
   
 
-def get_entity_id(table_name: str, search_field: str, search_value: str) -> str:
+def get_entity_id(table_name: str, search_field: str, search_value: str | None) -> str | None:
     """
     Generic function to get an entity's ID based on a search field and value.
     
@@ -933,10 +970,8 @@ def upload_images_to_supabase(storage_bucket="rat", storage_folder="images"):
     error_count = 0
     
     for img_path in tqdm(image_files, desc="Uploading images"):
+        file_name = img_path.name
         try:
-            # Get file name from path
-            file_name = img_path.name
-            
             # Read file content
             with open(img_path, 'rb') as f:
                 file_content = f.read()
@@ -1233,8 +1268,13 @@ def migrate_catalog_builder(df):
                           'Plant code', 'Plant code2', 'Plant code3',
                           'Builder name1', 'Builder name2', 'Builder name3']].dropna(subset=['image_no'])
     
-    uniq_columns = ['id']
-    
+    # Increment 2: real key is (catalog_id, builder_id, builder_order) -- 5,927 catalog/builder
+    # pairs legitimately repeat with a different builder_order and payload, so this must stay a
+    # 3-column key. NEVER dedupe on (catalog_id, builder_id) alone. The constraint already exists
+    # in the DB (catalog_builder_catalog_id_builder_id_builder_order_key), so on_conflict_do_nothing
+    # below makes this table idempotent on re-run without a truncate.
+    uniq_columns = ['catalog_id', 'builder_id', 'builder_order']
+
     catalog_builder_data = []
     Builder = get_table('builder', tgt_schema)
     Catalog = get_table('catalog', tgt_schema)
@@ -1251,8 +1291,8 @@ def migrate_catalog_builder(df):
     }
     
     # Get column size constraints from table
-    columns_info = {c.name: c.type.length for c in Catalog_Builder.columns 
-                      if hasattr(c.type, 'length')}
+    columns_info = {c.name: length for c in Catalog_Builder.columns
+                      if (length := getattr(c.type, 'length', None)) is not None}
   
     # Check table exists
     if not create_table_if_not_exists(tgt_table, tgt_schema):
@@ -1263,30 +1303,16 @@ def migrate_catalog_builder(df):
     # Data that we maintain fo reach batch
     batch_data[tgt_table] = {'table_obj' : Catalog_Builder, 'error_records' : error_records,  'error_counts' : error_counts, 'columns_info' : columns_info} 
     
-    # If we are using a generated id to identify uniqueness then table data must always be deleted first
-    # All tables after this one must also have data deleted.
-    try:
-        if uniq_columns == ['id']:
-          truncate_sql = f'TRUNCATE TABLE {tgt_schema}.{tgt_table}'
-          result = supabase.execute(text(truncate_sql))
-          supabase.commit()
-          logger.info(f"{tgt_table}: Data deleted")
-          
-    except Exception as e:
-        logger.error(f"Error during truncate of {tgt_schema}.{tgt_table}")
-        logger.exception("Exception details:")
-        sys.exit(1)
-
     logger.info(f"{tgt_table}: Gathering Data")
     for _, row in catalog_builders.iterrows():
+        image_no = stripy(row.get('image_no'))
         try:
             # Process up to 3 possible entries per image
             for i in [1, 2, 3]:
                 suffix = str(i) if i > 1 else ""
                 name_suffix = str(i) if i > 1 else "1"  # Handle special case for first builder name
-                
+
                 # Get the values for this train
-                image_no = stripy(row['image_no'])
                 builder_code = str(stripy(row.get(f'Builder code{suffix}'))).upper()
                 builder_name = stripy(row.get(f'Builder name{name_suffix}'))
                 plant_code = stripy(row.get(f'Plant code{suffix}'))
@@ -1365,8 +1391,9 @@ def migrate_catalog_builder(df):
                 continue
 
             except Exception as e:
-                exc_type, exc_obj, exc_tb = sys.exc_info()
-                logger.error(f"{tgt_table}: Error processing batch on line {exc_tb.tb_lineno}: {format_pg_error(e)}")    
+                exc_tb = e.__traceback__
+                line_no = exc_tb.tb_lineno if exc_tb else None
+                logger.error(f"{tgt_table}: Error processing batch on line {line_no}: {format_pg_error(e)}")
                 continue  # Continue instead of raising to handle errors more gracefully
 
     logger.info(f"{tgt_table}: Migration completed. Total records processed: {total_processed}")
@@ -1427,13 +1454,13 @@ def main():
     logger.info(f"Logging to {log_file}")
     logger.info("Starting migration process")
     
-    engine = get_db_engine(config)
+    engine = get_db_engine(config, args.target_profile)
     session = sessionmaker(bind = engine)
-  
+
     # Check
     tgt_tables = ['country', 'organisation', 'location', 'route', 'collection', 'photographer', 'builder', 'catalog']
-    mig_tables = ['migration_log', 'user', 'ratroutes', 'ratcatalogue', 'ratbuilders', 'ratcollections', 'prompts']
-    if not (check_tables(tgt_tables, tgt_schema) or check_tables(mig_tables, mig_schema)):
+    mig_tables = ['migration_log', 'users', 'ratroutes', 'ratcatalogue', 'ratbuilders', 'ratcollections', 'prompts']
+    if not (check_tables(tgt_tables, tgt_schema) and check_tables(mig_tables, mig_schema)):
         return
 
     # Get UUID for the specified user or defaults to a the target config user
@@ -1441,6 +1468,7 @@ def main():
         user_id = get_or_create_user(args.user_id)
         logger.info(f"Using user_id: {user_id}")
         
+    all_data: dict = {}
     if args.mode == 'dml_files':
         if not args.export_path:
             logger.error("Export path is required for DML files mode")
@@ -1474,22 +1502,21 @@ def main():
 
     # Migration order respects referential dependencies
     with session() as supabase:
-        # migrate_country(catalog_df)
-        # migrate_organisation(catalog_df)
-        # migrate_location(catalog_df)
-        # migrate_route(routes_df)
-        # migrate_collection(collections_df)
-        # migrate_photographer(catalog_df)
-        # migrate_builder(builders_df)
-        # migrate_catalog(catalog_df)
+        migrate_country(catalog_df)
+        migrate_organisation(catalog_df)
+        migrate_location(catalog_df)
+        migrate_route(routes_df)
+        migrate_collection(collections_df)
+        migrate_photographer(catalog_df)
+        migrate_builder(builders_df)
+        migrate_catalog(catalog_df)
         create_lookup_index_cache()
         migrate_catalog_metadata(catalog_df)
-        # migrate_catalog_builder(catalog_df)
-        # migrate_usage(catalog_df)
-        # migrate_picture_metadata(catalog_df)
-        #migrate_prompts(prompts_df)    
-        
-        
+        migrate_catalog_builder(catalog_df)
+        migrate_usage(catalog_df)
+        migrate_picture_metadata(catalog_df)
+        # migrate_prompts(prompts_df)  # not restored: migrate_prompts() doesn't exist in this file
+
     logger.info("Migration process completed")
 
 if __name__ == "__main__":
