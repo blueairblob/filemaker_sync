@@ -571,3 +571,83 @@ closed; 2–4 close this session).
 - [ ] *(Carried, unchanged)* `--mode dml_files` parser rewrite; `config_manager.py`/`database_connections.py`/GUI profile support; `picture_metadata` untested against real images; `requirements.txt`'s `pandas==2.1.4` pin; the 16 flagged source records; DDR; supabase-py/SQLAlchemy prune; anon-JWT rotation; `PicaLocoBackend` consolidation/rebrand; delete `sync_config.json`; cron/Task Scheduler wiring for `run_incremental_sync.py` (deliberately out of scope this session).
 
 ---
+
+## Session 9 — 2026-09-02 — Wire the delta sync into the GUI; fix a long-broken script-path bug
+
+**Focus:** Add a GUI button for Session 8's delta-driven sync. Investigating how to do that safely surfaced a
+bigger, pre-existing problem: the GUI's subprocess dispatch has been broken since before this worksheet
+started.
+**Status:** `completed`, scoped deliberately narrow per the user's explicit choice (see Decisions) — smoke
+tested live via `python.exe`, not just compiled.
+
+---
+
+### Context
+
+`gui/gui_operations.py`'s `run_python_command()` resolves the script it's about to run as a **bare
+filename** (e.g. `'db_dml_loader.py'`) relative to whatever directory the GUI process happens to be
+launched from — not a path into `scripts/`, where every pipeline script actually lives. Git history pins
+the cause exactly: the commit that wired `db_dml_loader.py` into the GUI (`0d3c812`) predates the `scripts/`
+subdirectory existing at all — a later commit (`7281663 Recover migration files`) moved everything into
+`scripts/` without updating the GUI's assumptions. Net effect: **every existing GUI operation** (Full Sync,
+the old "Incremental Sync", Load to Target, Export Files/Images, Test Connections, Migration Status) has
+been silently broken — `"{script} not found"` — for as long as `scripts/` has existed, with nothing in the
+GUI's own code or any launcher setting `cwd` to make the bare filename resolve. Separately (found, not
+fixed — see Decisions): `gui/filemaker_extract_refactored.py` is a stale June-2025 fork of the extract
+script, missing every Session 5–8 fix, and is itself a duplicate of `scripts/filemaker_extract_refactored.py`.
+
+---
+
+### Decisions
+
+| Decision | Rationale | Alternatives Considered |
+|---|---|---|
+| Fix `run_python_command()`'s path resolution (`Path.cwd() / 'scripts' / script`) as part of this change, rather than working around it for just the new button | The new button needs correct resolution anyway; the fix is small, mechanical, and repairs every other GUI operation for free | Route only the new operation around the bug locally (leaves the other seven operations broken, doesn't fix the actual defect) |
+| Leave `gui/filemaker_extract_refactored.py` (the stale duplicate extract fork) untouched | Explicitly out of scope — user chose the narrower option when asked; retiring it or repointing the other GUI operations at the real `scripts/filemaker_extract.py` is a bigger, separate call | Full cleanup: also repoint `full_sync`/`export_files`/etc. at `scripts/filemaker_extract.py` (offered, user declined for this pass) |
+| New button labelled **"Delta Sync"**, a distinct operation key (`delta_sync`) from the pre-existing **"Incremental Sync"** button | The existing "Incremental Sync" button (`operation_commands['incremental_sync']`) is just a plain full-table extract without DDL regen — not delta-driven at all, despite the name. Reusing the name or the key would have silently changed what an existing button does | Renaming/repurposing the old "Incremental Sync" button (bigger behavioural change than asked for; leaves users' muscle memory pointing at something different) |
+
+---
+
+### Findings
+
+- Confirmed live (`python.exe`, headless smoke test calling `run_python_command()` directly with the same
+  args a button click sends): the path fix correctly resolves and launches `run_incremental_sync.py` from
+  `scripts/`, with `cwd` still the repo root so `config.toml`/`.env` load exactly as they do outside the
+  GUI. First attempt legitimately failed — not a wiring bug — because `run_incremental_sync.py` defaults to
+  `config.toml`'s `active_profile = "supabase"` (the old cloud project), which is no longer reachable
+  (`psycopg2.OperationalError: ... tenant/user postgres.kmoehqdowgdupzdxtbei not found`, i.e. that project's
+  pooler doesn't recognise the tenant anymore — likely paused/rotated, unrelated to anything in this repo).
+  Passing `--target-profile oci` (exactly as every live test since Session 5 has) succeeded: `new: 0,
+  changed: 0, Nothing to do.` — correct, since nothing had changed on `oci` since Session 8's test edit.
+- The GUI still has **no target-profile picker at all** (`grep` across `gui/*.py` for
+  `target_profile`/`active_profile` returns nothing) — every GUI operation, including the new button, runs
+  against whatever `config.toml`'s `active_profile` says (currently `supabase`, the now-unreachable one).
+  This was already a known open thread (`config_manager.py`/`database_connections.py`/GUI profile support)
+  and is unchanged by this session — flagging again since it now also blocks the new button's default
+  usability, not just the pre-existing ones.
+
+---
+
+### Outcome
+
+`gui/gui_operations.py`: `run_python_command()` resolves scripts under `scripts/` instead of a bare
+filename; new `operation_commands['delta_sync'] = []`; `operation_scripts` dict maps `delta_sync` →
+`run_incremental_sync.py` and `load_to_target` → `db_dml_loader.py` (replacing the old two-way ternary,
+same behaviour, easier to extend); 10-minute timeout for `delta_sync`. `gui/gui_widgets.py`: new "Delta
+Sync" button (`both_required` connection gate). `gui/filemaker_gui.py`: button wired to
+`safe_run_operation('delta_sync')`. `py_compile`/pyright clean on both platforms (the 2 remaining pyright
+errors in `gui/` are pre-existing, confirmed via `git stash` diff, unrelated to this change).
+
+---
+
+### Open Threads
+
+- [ ] *(Carried, unchanged)* `--mode dml_files` parser rewrite; GUI target-profile picker (now blocks the
+  new Delta Sync button's default usability too, not just the older operations — config.toml's
+  `active_profile` currently points at the unreachable `supabase` project); `gui/filemaker_extract_refactored.py`
+  stale-fork cleanup (found this session, deliberately left untouched); `picture_metadata` untested against
+  real images; `requirements.txt`'s `pandas==2.1.4` pin; the 16 flagged source records; DDR;
+  supabase-py/SQLAlchemy prune; anon-JWT rotation; `PicaLocoBackend` consolidation/rebrand; delete
+  `sync_config.json`; cron/Task Scheduler wiring for `run_incremental_sync.py`.
+
+---

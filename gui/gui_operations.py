@@ -104,15 +104,19 @@ class OperationManager:
             if self._shutdown_requested.is_set():
                 return {'success': False, 'error': 'Shutdown requested'}
             
-            # Check if script exists
-            script_path = Path(script)
+            # Check if script exists. All pipeline scripts live under scripts/,
+            # not the repo root -- resolve there explicitly rather than as a
+            # bare filename relative to whatever the GUI's cwd happens to be.
+            script_path = Path.cwd() / 'scripts' / script
             if not script_path.exists():
-                error_msg = f'{script} not found'
+                error_msg = f'{script} not found in scripts/'
                 self.log_manager.log(LogLevel.ERROR, "Command", error_msg)
                 return {'success': False, 'error': error_msg}
-            
-            # Build command
-            full_command = [sys.executable, script] + cmd_args
+
+            # Build command. cwd stays the repo root (below) so the invoked
+            # script still finds config.toml/.env there, matching every
+            # documented way these scripts are run outside the GUI.
+            full_command = [sys.executable, str(script_path)] + cmd_args
             self.log_manager.log(LogLevel.DEBUG, "Command", f"Executing: {' '.join(full_command)}")
             
             with PerformanceLogger(self.log_manager, "Command", description):
@@ -245,6 +249,11 @@ class OperationManager:
         # Operation commands
         # 'load_to_target' runs the second-stage normaliser (db_dml_loader.py) in
         # dml_files mode against the export directory produced by 'Export to Files'.
+        # 'delta_sync' runs the real delta-driven sync (run_incremental_sync.py):
+        # scan+diff -> extract just the new/changed rows -> load -> verify against
+        # rat.catalog -> advance the manifest for exactly what committed. Distinct
+        # from the older 'incremental_sync' above, which is just a plain extract
+        # (no ddl regen) of the *whole* table -- not delta-driven at all.
         export_path = self._load_export_path()
         operation_commands = {
             'full_sync': ['--db-exp', '--ddl', '--dml'],
@@ -254,7 +263,8 @@ class OperationManager:
             'test_connections': ['--info-only'],
             'migration_status': ['--migration-status', '--json'],
             'load_to_target': ['--mode', 'dml_files', '--export-path', export_path,
-                               '--user-id', 'migration-gui']
+                               '--user-id', 'migration-gui'],
+            'delta_sync': [],
         }
         
         if operation not in operation_commands:
@@ -288,10 +298,16 @@ class OperationManager:
                     timeout = 300  # 5 minutes for long operations
                 elif operation == 'export_images':
                     timeout = 600  # 10 minutes for image export
+                elif operation == 'delta_sync':
+                    timeout = 600  # 10 minutes: scan+diff, targeted extract, load, verify
                 else:
                     timeout = 60   # 1 minute for quick operations
-                
-                script = 'db_dml_loader.py' if operation == 'load_to_target' else 'filemaker_extract_refactored.py'
+
+                operation_scripts = {
+                    'load_to_target': 'db_dml_loader.py',
+                    'delta_sync': 'run_incremental_sync.py',
+                }
+                script = operation_scripts.get(operation, 'filemaker_extract_refactored.py')
                 command_result = self.run_python_command(cmd, f"{operation.replace('_', ' ').title()}", timeout, script=script)
                 
                 if command_result['success']:

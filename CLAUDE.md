@@ -41,6 +41,15 @@ FileMaker Pro
 ```
 
 The tkinter GUI (`gui/`) is a `subprocess` wrapper around the CLIs. It contains **no** migration logic.
+**`gui/gui_operations.py`'s script-path resolution was broken from before this worksheet started until
+Session 9** — it resolved scripts as bare filenames relative to the GUI's launch directory, but every
+script lives under `scripts/`; fixed to `Path.cwd() / 'scripts' / script`. Has a "Delta Sync" button wired
+to `scripts/run_incremental_sync.py` (Session 9) — distinct from the older, differently-behaved
+"Incremental Sync" button (`operation_commands['incremental_sync']`, a plain full-table extract, not
+delta-driven despite the name). **The GUI has no target-profile picker** — every GUI operation runs against
+`config.toml`'s `active_profile` (currently `supabase`, not the live-tested `oci`) unless that's changed by
+hand. `gui/filemaker_extract_refactored.py` is a stale June-2025 fork, missing every Session 5–8 fix —
+known, deliberately untouched. See `devlog/worksheet.md` Session 9.
 
 ---
 
