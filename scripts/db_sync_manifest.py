@@ -63,6 +63,7 @@ Requires: pyodbc (scan), psycopg2 (manifest); tomllib/tomli for config.
 
 from __future__ import annotations
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -119,8 +120,15 @@ CREATE TABLE IF NOT EXISTS rat_migration.sync_manifest (
     first_seen_at  timestamptz NOT NULL DEFAULT now(),
     last_seen_at   timestamptz,                    -- last scan in which this key was present
     last_loaded_at timestamptz,                    -- set ONLY on a successful load
-    load_status    text NOT NULL DEFAULT 'pending' -- pending | loaded | rejected
+    load_status    text NOT NULL DEFAULT 'pending', -- pending | loaded | rejected
+    row_hash       text                            -- hash of the last-loaded row's full content, for the
+                                                     -- import-inflation backstop (ROWMODID moved but the
+                                                     -- data didn't) -- see row_hash() / mark_loaded()
 );
+
+-- Guarded ALTER for a manifest table that already existed before row_hash was added (CREATE TABLE IF NOT
+-- EXISTS above is a no-op against it, so the column needs its own idempotent statement).
+ALTER TABLE rat_migration.sync_manifest ADD COLUMN IF NOT EXISTS row_hash text;
 
 COMMENT ON TABLE  rat_migration.sync_manifest IS
     'Per-record sync state for the FileMaker->rat migration. Keyed on image_no. '
@@ -210,6 +218,17 @@ def norm_key(v):
         return None
     s = str(v).strip()
     return s or None
+
+
+def row_hash(record: dict) -> str:
+    """Deterministic content hash of a source row, for the import-inflation
+    backstop: FileMaker bumps ROWMODID on *import* even when a row's actual
+    data didn't change, so ROWMODID alone can't tell a real edit from that.
+    Comparing this hash against the manifest's stored value (only meaningful
+    once the row's full data has actually been extracted -- the cheap skinny
+    scan has no content to hash) catches the false positive."""
+    canonical = json.dumps(record, sort_keys=True, default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 # =============================================================================
@@ -404,9 +423,10 @@ class PgManifest:
 
     def read_all(self) -> dict:
         with self.cnxn.cursor() as c:
-            c.execute("SELECT image_no, fm_rowmodid "
+            c.execute("SELECT image_no, fm_rowmodid, row_hash "
                       "FROM rat_migration.sync_manifest")
-            return {row[0]: {"rowmodid": as_int(row[1])} for row in c.fetchall()}
+            return {row[0]: {"rowmodid": as_int(row[1]), "row_hash": row[2]}
+                    for row in c.fetchall()}
 
     def baseline(self, by_image: dict):
         """Assert the target already holds these rows at their current ROWMODID."""
@@ -427,6 +447,41 @@ class PgManifest:
                     load_status    = 'loaded'
             """, [(img, rid, rm, NOW, NOW) for (img, rid, rm) in rows],
                 template="(%s, %s, %s, %s, %s, 'loaded')")
+        self.cnxn.commit()
+        return len(rows)
+
+    def mark_loaded(self, by_image: dict):
+        """Advance the manifest for exactly these image_nos, after -- and only
+        after -- the caller has independently verified (against rat.catalog
+        itself, not the scan/diff step) that each one actually committed.
+        Never call this from the scan/diff path; that would defeat the whole
+        point of tracking *verified* loads. Rows not passed here (rejected/
+        quarantined) are left untouched, so they naturally reappear as
+        new/changed on the next preview -- no separate "still pending" write
+        needed.
+
+        by_image: {image_no: {"rowid": ..., "rowmodid": ..., "row_hash": ...}}
+        """
+        if not by_image:
+            return 0
+        from psycopg2.extras import execute_values
+        rows = [(img, rec.get("rowid"), as_int(rec.get("rowmodid")), rec.get("row_hash"))
+                for img, rec in by_image.items()]
+        with self.cnxn.cursor() as c:
+            execute_values(c, """
+                INSERT INTO rat_migration.sync_manifest
+                    (image_no, fm_rowid, fm_rowmodid, row_hash, last_seen_at,
+                     last_loaded_at, load_status)
+                VALUES %s
+                ON CONFLICT (image_no) DO UPDATE SET
+                    fm_rowid       = EXCLUDED.fm_rowid,
+                    fm_rowmodid    = EXCLUDED.fm_rowmodid,
+                    row_hash       = EXCLUDED.row_hash,
+                    last_seen_at   = EXCLUDED.last_seen_at,
+                    last_loaded_at = EXCLUDED.last_loaded_at,
+                    load_status    = 'loaded'
+            """, [(img, rid, rm, rh, NOW, NOW) for (img, rid, rm, rh) in rows],
+                template="(%s, %s, %s, %s, %s, %s, 'loaded')")
         self.cnxn.commit()
         return len(rows)
 

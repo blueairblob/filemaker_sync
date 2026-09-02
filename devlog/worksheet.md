@@ -465,6 +465,109 @@ duplicate-free), `usage` 141,244. `builder` is 518 (517 real + the new `'UNK'` s
 
 ### Open Threads
 
-- [ ] *(Carried, unchanged)* `--mode dml_files` parser rewrite; `config_manager.py`/`database_connections.py`/GUI profile support; Increment 2 sub-tasks 2–4 (now genuinely unblocked — the natural-key idempotency gap that would have undermined delta-driven re-syncing is closed); `picture_metadata` untested against real images; `requirements.txt`'s `pandas==2.1.4` pin; the 16 flagged source records; DDR; supabase-py/SQLAlchemy prune; anon-JWT rotation; `PicaLocoBackend` consolidation/rebrand; delete `sync_config.json`.
+- [ ] *(Carried, unchanged)* `--mode dml_files` parser rewrite; `config_manager.py`/`database_connections.py`/GUI profile support; `picture_metadata` untested against real images; `requirements.txt`'s `pandas==2.1.4` pin; the 16 flagged source records; DDR; supabase-py/SQLAlchemy prune; anon-JWT rotation; `PicaLocoBackend` consolidation/rebrand; delete `sync_config.json`.
+
+---
+
+## Session 8 — 2026-09-01 — Increment 2 sub-tasks 2–4: delta-driven incremental sync, live-proven
+
+**Focus:** Wire `db_sync_manifest.py`'s already-working change-detection engine into an actual periodic sync — extract and load only `new`/`changed` rows instead of a full re-extract, advance the manifest only for loads verified against `rat.catalog` itself (never from the scan/diff step), and add a row-hash backstop against FileMaker import-inflation (ROWMODID bumped, content unchanged).
+**Status:** `completed`. Proven against a live, hand-edited FileMaker record on `oci`: exactly one `image_no` detected, extracted, loaded, verified, and its manifest entry advanced — everything else (140,243 other rows) untouched. Two real bugs found and fixed along the way (see Findings).
+
+---
+
+### Context
+
+Sub-task 1 (`catalog_builder` incremental key, Session 5) and sub-task 5 (`picture_metadata` idempotency,
+already fine) were done. This session closed sub-tasks 2–4 — the actual point of Increment 2 — now
+buildable because Sessions 5–7 made the `oci` target fully loaded, fast, and genuinely idempotent on
+re-run. Three code changes, one new orchestrator:
+
+- **Schema**: `rat_migration.sync_manifest` gained a `row_hash text` column (guarded `ALTER ... ADD COLUMN
+  IF NOT EXISTS`, applied live via the existing `--init` path).
+- **`filemaker_extract.py`**: new `--image-nos-file <path>` flag — when set, `get_table_data_set()` scopes
+  `ratcatalogue` to exactly those `image_no`s via a parameterised `WHERE image_no IN (?,?,...)` (pyodbc
+  positional params, not string interpolation), instead of the full-table extract. Every other table keeps
+  its normal full extract — they're small and cheap even every run, and aren't `image_no`-scoped data.
+  `--max-rows` is ignored (with a warning) when combined, since the delta list *is* the row selection.
+- **`db_sync_manifest.py`**: new `row_hash(record) -> str` (`sha256` over `json.dumps(record,
+  sort_keys=True, default=str)`) and `PgManifest.mark_loaded(by_image)` — an upsert that advances
+  `fm_rowmodid`/`row_hash`/`load_status='loaded'` for exactly the `image_no`s passed in. `read_all()` now
+  also returns the stored `row_hash` so a caller can compare.
+- **New `scripts/run_incremental_sync.py`**: the orchestrator. Imports `db_sync_manifest`'s scan/diff/
+  `PgManifest` directly (already clean, side-effect-scoped functions); invokes `filemaker_extract.py` and
+  `db_dml_loader.py` as **subprocesses**, matching `gui/gui_operations.py`'s existing pattern — both rely
+  on `globals().update(vars(args))` and dozens of implicit globals set up through their own `__main__`
+  blocks, confirmed fragile when hand-unit-testing one function in isolation this session; subprocess
+  isolation sidesteps that entirely. Flow: scan+diff (`--dry-run` stops here) → extract the delta +
+  refresh the 4 small reference tables in full → load via the loader's unmodified `--mode migration_schema`
+  entry point → verify by querying `rat.catalog` directly for the attempted `image_no`s (DB truth, not the
+  loader's exit code) → for each verified row, compare its freshly-extracted `row_hash` against the
+  manifest's stored one (a match means ROWMODID moved but content didn't — still safe to have upserted,
+  but reported separately, not counted as a real change) → `mark_loaded()` for exactly the verified set.
+
+---
+
+### Findings — two real bugs, both pre-existing, both surfaced by finally exercising this code path live
+
+1. **`filemaker_extract.py`'s `--ddl`/`--dml` flags default to `False`.** `run_incremental_sync.py`'s two
+   `filemaker_extract.py` subprocess calls passed `--db-exp --tables-to-export ... --del-data` but never
+   `--ddl --dml` — so `get_table_data()`'s action loop only ever ran the row-count action, silently
+   skipping the actual DDL-fetch/DML-fetch-and-insert steps entirely. No error, no exception — the log just
+   quietly jumped from "Has N rows" straight to "Finished". Both delta and reference-table extracts left
+   their `rat_migration.*` staging tables **dropped and never refilled** (`--del-data` did drop them, since
+   that step doesn't depend on the missing flags). Caught only because the next stage, `db_dml_loader.py`,
+   crashed on `catalog_df['country']` — `pd.DataFrame([])` from an empty read has no columns at all. Fixed
+   by adding `--ddl --dml` to both subprocess calls. **`rat.catalog` and the rest of the production `rat`
+   schema were never touched** — the crash happened at the very first line of `main()`'s migration order,
+   before any write — confirmed live before doing anything further (`rat.catalog` held steady at 141,244
+   throughout).
+2. **`migrate_builder()`'s NaN-vs-None check silently let bad data through the intended safety net.**
+   `if row['Location'] != None:` was meant to route builders with a blank `Location` to the `'unknown'`
+   sentinel (the `else` branch beneath it already existed for exactly this) — but pandas represents a blank
+   source cell as a float `NaN`, and `NaN != None` evaluates `True` in plain Python (NaN compares unequal
+   to everything, including `None`), so the check let it through to `get_location_id()` → `stripy()`, which
+   crashed on `NaN.strip()`. Fixed the one call site with `pd.notna(row['Location'])`, **and** hardened
+   `stripy()` itself (`isinstance(txt, str)` guard, returns `None` for anything else including `NaN`) since
+   it's reused across a dozen call sites reading raw DataFrame cells, several of which (`organisation`,
+   `route`, `collection`, `photographer`, `plant_code`, `works_number`, `year_built`) are exactly as exposed
+   to the same NaN-from-blank-cell pattern — a one-line root-cause fix instead of hunting each call site
+   down by crash.
+
+Both bugs are latent in code paths that simply hadn't been exercised this way before: `run_incremental_sync.py`
+is new, so nothing had called `filemaker_extract.py` without explicit `--ddl --dml` before; and this was the
+first `migrate_builder()` run against a builder whose `Location` cell happened to be genuinely blank in the
+live extract.
+
+---
+
+### Verification (in order run)
+
+1. **Fixture test** — a disposable scratch-rows test (`__synctest_a`/`__synctest_b` image_nos, cleaned up in
+   a `finally`) against the *live* `oci` manifest table, proving `row_hash()` correctly tells a real content
+   change apart from a ROWMODID-only bump, and `mark_loaded()` upserts both correctly. PASS, zero leftover
+   rows confirmed after.
+2. **Live `--dry-run` against `oci`, no source changes**: `new: 0, changed: 0`, clean exit, no manifest
+   writes.
+3. **Live hand-edit test**: asked the user to edit one real FileMaker record. `--dry-run` correctly showed
+   `changed: 1`. Real run hit the two bugs above; after fixing both, re-ran clean: `verified: 1, false
+   positives: 0, real changes: 1`, manifest advanced for exactly 1 row. `rat.catalog` count unchanged at
+   141,244 (in-place update, not a duplicate) confirmed by direct query. Follow-up `--dry-run` came back to
+   `new: 0, changed: 0` — settled.
+
+---
+
+### Outcome
+
+All four plan phases are code-complete and live-verified. `scripts/run_incremental_sync.py` is a real,
+runnable "sync now" — cron/Task Scheduler wiring remains deliberately out of scope (this made the sync
+itself correct and runnable, not automatic). Increment 2 is now fully done (sub-tasks 1 and 5 were already
+closed; 2–4 close this session).
+
+---
+
+### Open Threads
+
+- [ ] *(Carried, unchanged)* `--mode dml_files` parser rewrite; `config_manager.py`/`database_connections.py`/GUI profile support; `picture_metadata` untested against real images; `requirements.txt`'s `pandas==2.1.4` pin; the 16 flagged source records; DDR; supabase-py/SQLAlchemy prune; anon-JWT rotation; `PicaLocoBackend` consolidation/rebrand; delete `sync_config.json`; cron/Task Scheduler wiring for `run_incremental_sync.py` (deliberately out of scope this session).
 
 ---

@@ -312,8 +312,8 @@ def get_db_connection(dbt, use_dsn=True):
         if 'connection' in locals() and connection:
             connection.close()
 
-def run_query(sql, concat_result=True, chunk=1000):
-    df_qry = pd.read_sql(sql, cn,  index_col=None, coerce_float=False, chunksize=chunk)
+def run_query(sql, concat_result=True, chunk=1000, params=None):
+    df_qry = pd.read_sql(sql, cn,  index_col=None, coerce_float=False, chunksize=chunk, params=params)
     # Concatenate all of the chunks into a single DataFrame
     if concat_result: 
         df = pd.concat(df_qry)
@@ -359,15 +359,37 @@ def convert_create_table_to_dict(create_table_sql: str) -> dict:
   
 def get_table_data_set():
     global dupe_entry_cnt
-    
+
+    # --image-nos-file scopes ratcatalogue to exactly these image_nos (the
+    # incremental-sync delta) -- every other table (ratbuilders, ratroutes,
+    # ratcollections, prompts) still gets its normal full extract; they're
+    # small, cheap, and aren't image_no-scoped data to begin with.
+    delta_image_nos = None
+    if image_nos_file:  # type: ignore  # noqa: F821 -- injected by get_args()
+        with open(image_nos_file, 'r', encoding='utf-8') as f:  # type: ignore
+            delta_image_nos = [line.strip() for line in f if line.strip()]
+        if max_rows != 'all':  # type: ignore
+            logger.warning("--image-nos-file and --max-rows both set -- ignoring --max-rows; "
+                            "the delta list is the row selection, capping it would silently drop rows.")
+
     for table in table_list:
         #, 'ratlabels', 'ratroutes'
         #if table not in ['ratcopyright']:
         #    continue
         dupe_entry_cnt = 0
-        table_data[dbs['dsn']] = get_table_data(table, actions, rows=max_rows)
+        if table == 'ratcatalogue' and delta_image_nos is not None:
+            if not delta_image_nos:
+                # Empty delta: "WHERE image_no IN ()" is invalid SQL, and there's
+                # nothing to extract anyway -- skip the table entirely.
+                logger.info(f"{table}: --image-nos-file was empty, nothing to extract.")
+                continue
+            placeholders = ','.join(['?'] * len(delta_image_nos))
+            sql = f'SELECT * FROM "ratcatalogue" WHERE image_no IN ({placeholders})'
+            table_data[dbs['dsn']] = get_table_data(table, actions, sql=sql, params=tuple(delta_image_nos))
+        else:
+            table_data[dbs['dsn']] = get_table_data(table, actions, rows=max_rows)
 
-def get_table_data(tab: str, actions: dict, sql: str=None, rows: str='all', purge: bool=True, parse_dates=True) -> dict:
+def get_table_data(tab: str, actions: dict, sql: str=None, params=None, rows: str='all', purge: bool=True, parse_dates=True) -> dict:
     """
     Perform various actions on the source database:
         - Export data in terms of DML (Data Manipulation Language) e.g. INSERT statements
@@ -431,7 +453,7 @@ def get_table_data(tab: str, actions: dict, sql: str=None, rows: str='all', purg
                                 if col['column_type'] == 'DATE':
                                     date_cols.update({col['column_name']:fmt}) 
 
-                        for sub_df in tqdm(pd.read_sql(sql, cn, index_col = None, coerce_float = False, chunksize = chunk, parse_dates = date_cols), total = prop_cnt, desc = f"{tab} Query"):
+                        for sub_df in tqdm(pd.read_sql(sql, cn, index_col = None, coerce_float = False, chunksize = chunk, parse_dates = date_cols, params = params), total = prop_cnt, desc = f"{tab} Query"):
                             chunk_cnt += 1
                             # Images are being ignored here
                             tab_dat[tab]['dml'] = df_to_sql_bulk_insert(sub_df, tab, postgres_version, header_req)
@@ -485,7 +507,7 @@ def get_table_data(tab: str, actions: dict, sql: str=None, rows: str='all', purg
                             # sql already has its own "FETCH FIRST {rows} ROWS ONLY" appended above --
                             # adding a second FETCH clause here is invalid FileMaker SQL syntax.
                             ddl_sql = sql
-                        df_ddl = run_query(ddl_sql)
+                        df_ddl = run_query(ddl_sql, params=params)
                         # Drop index that auto added                                         
                         df_ddl.reset_index(drop=True, inplace=True)
                         ddl = pd.io.sql.get_schema(df_ddl, f"{tab}", con=cn_tgt)
@@ -506,7 +528,7 @@ def get_table_data(tab: str, actions: dict, sql: str=None, rows: str='all', purg
                         # Pre-Count of query results from source database
                         logger.info(f"{dbs['name'][1]}: {tab}: Getting a query count")
                         sql_cnt = re.sub(r'(SELECT).*(FROM)', r'\1 COUNT(*) AS n \2', sql)
-                        df_cnt = run_query(sql_cnt)
+                        df_cnt = run_query(sql_cnt, params=params)
                         cnt = int(df_cnt['n'][0])
 
                         # Over ride cnt to be the limit (rows) if set
@@ -1138,6 +1160,9 @@ def get_args ():
     parser.add_argument("--target-profile", type = str, help = "Target DB profile from config.toml's [database.target.<profile>] (overrides config/env RAT_TARGET_PROFILE)")
     parser.add_argument("--fn-fmt", type = str, choices = ['single', 'multi'], default = 'multi', help = "Single or Multi File export")
     parser.add_argument("--start-from", type=str, help="Start migration from this image_no in the ratcatalogue table")
+    parser.add_argument("--image-nos-file", type=str, help="Path to a file of image_nos (one per line) -- "
+                        "scopes ratcatalogue to exactly these rows (incremental-sync delta); other tables "
+                        "still get a full extract. Ignores --max-rows if both are set.")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     
     try:
@@ -1294,7 +1319,7 @@ if __name__ == "__main__":
             # This table does not exist in the source Db
             actions = get_actions(cnt, ddl, True)
             sql="SELECT image_no, GetAs(picture,'JPEG') picture, entry_date, date_taken FROM RATCatalogue"
-            table_data[dbs['dsn']] = get_table_data(table, actions, sql, max_rows, False, False)
+            table_data[dbs['dsn']] = get_table_data(table, actions, sql=sql, rows=max_rows, purge=False, parse_dates=False)
             export_data(table_data[dbs['dsn']], table)
             export_images(table)
                 

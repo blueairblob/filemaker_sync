@@ -1,8 +1,9 @@
 # CLAUDE.md
 
 Operational guide for working in this repo with Claude Code. **Read this first every session.**
-For the running history and open threads, read `devlog/worksheet.md` (Sessions 1–3).
-For the task currently in flight, read `devlog/HANDOFF_increment2.md`.
+For the running history and open threads, read `devlog/worksheet.md` (Sessions 1–8).
+Increment 2 (its handoff doc, `HANDOFF_increment2.md`) is complete as of Session 8 — see "Current focus"
+below and `devlog/worksheet.md` Session 8 for what's next.
 
 ---
 
@@ -62,14 +63,13 @@ the cache first and fall through to the *unchanged* live-SELECT + auto-add path 
 zero behaviour change, just short-circuits the common case. `get_builder_id()` is confirmed dead code
 (nothing calls it) — left alone.
 
-**Increment 2's first sub-task is done (Session 5):** `migrate_catalog_builder` now upserts on its real
-key `(catalog_id, builder_id, builder_order)` — the DB constraint already existed
+**Increment 2 is done (Sessions 5–8).** Sub-task 1 (Session 5): `migrate_catalog_builder` now upserts on its
+real key `(catalog_id, builder_id, builder_order)` — the DB constraint already existed
 (`catalog_builder_catalog_id_builder_id_builder_order_key`), so this was a conflict-target change plus
 deleting the now-dead `TRUNCATE` branch (traced: nothing downstream depended on the truncate having
 happened). **Never dedupe on `(catalog_id, builder_id)` alone** — 5,927 legitimate multi-build pairs
-differ only in `builder_order`/payload. Remaining Increment 2 sub-tasks (drive the loader from the sync
-manifest's delta, advance the manifest only on verified loads, row-hash backstop against FileMaker
-import-inflation) are still ahead.
+differ only in `builder_order`/payload. Sub-tasks 2–4 (Session 8): a real delta-driven sync,
+`scripts/run_incremental_sync.py` — see "Delta-driven incremental sync" below.
 
 **`main()` now runs the full population**, not just `catalog_metadata` — every `migrate_*` call was
 restored (Session 5; they'd been commented out, so the live cloud data was never produced by a run of
@@ -95,6 +95,31 @@ once. See `devlog/worksheet.md` Session 7.
 debug line (`first_row = result.fetchone()`) that consumed a row off the cursor before the real read
 loop. This plausibly explains the long-standing "catalog is 1 short of the manifest" mystery below —
 removed.
+
+**Delta-driven incremental sync — real, runnable, live-proven (Session 8):** `scripts/run_incremental_sync.py`
+ties `db_sync_manifest.py`'s scan/diff engine, `filemaker_extract.py`, and `db_dml_loader.py` together into
+an on-demand "sync now": skinny-scan → diff against the manifest → extract exactly the `new`/`changed`
+`image_no`s (new `filemaker_extract.py --image-nos-file` flag, parameterised `WHERE image_no IN (...)`) plus
+a full refresh of the 4 small reference tables → load via the loader's unmodified `--mode migration_schema`
+entry point → verify against `rat.catalog` directly (DB truth, not the loader's exit code) → compare each
+verified row's freshly-extracted `row_hash()` (new in `db_sync_manifest.py`, `sha256` over the row's JSON)
+against the manifest's stored hash to separate real edits from FileMaker import-inflation (ROWMODID bumped,
+content unchanged) → `PgManifest.mark_loaded()` (new) advances the manifest **only** for the verified set.
+Run with `python.exe scripts/run_incremental_sync.py --target-profile oci` (add `--dry-run` to stop after
+the scan/diff). **Two real bugs found and fixed getting this to run live** (see `devlog/worksheet.md`
+Session 8 for full detail — both worth knowing about elsewhere in this codebase):
+1. `filemaker_extract.py`'s `--ddl`/`--dml` flags default to `False` and must be passed explicitly for
+   `get_table_data()` to actually fetch/insert data — passing `--db-exp` alone silently only runs the
+   row-count action, no error, staging table ends up dropped-and-never-refilled. `run_incremental_sync.py`
+   now passes `--ddl --dml` on every `filemaker_extract.py` call it makes.
+2. `stripy()` (`scripts/db_dml_loader.py`) now guards against pandas' `NaN` (blank source cell), not just
+   `None` — `migrate_builder()`'s `row['Location'] != None` check let a `NaN` float through because
+   `NaN != None` is `True` in Python, crashing on `NaN.strip()`. Fixed both the one call site
+   (`pd.notna(...)`) and `stripy()` itself, since it's reused across a dozen call sites reading raw
+   DataFrame cells equally exposed to the same pattern.
+
+Cron/Task Scheduler wiring is deliberately out of scope — this makes the sync correct and runnable on
+demand, not automatic.
 
 ## Golden rules (invariants - do not violate without explicit sign-off)
 
@@ -244,7 +269,8 @@ python.exe scripts/fm_metadata_probe.py --selftest
 |---|---|
 | Stage-2 loader (the real, adopted one) | `scripts/db_dml_loader.py` |
 | Stage-1 extract (target-connection path fixed Session 5; see Gotchas re: `--mode dml_files`) | `scripts/filemaker_extract.py` |
-| Incremental sync engine | `scripts/db_sync_manifest.py` |
+| Incremental sync engine (scan/diff/manifest) | `scripts/db_sync_manifest.py` |
+| Incremental sync orchestrator (the actual periodic sync) | `scripts/run_incremental_sync.py` |
 | FileMaker metadata probe | `scripts/fm_metadata_probe.py` |
 | Shared secret resolution | `scripts/env_secrets.py` |
 | Ground-truth schema (reference only, not re-appliable) | `rat_schema_original.sql` |
@@ -253,7 +279,6 @@ python.exe scripts/fm_metadata_probe.py --selftest
 | Sanitisation fixtures | `test/` |
 | Source field meanings / valid values | `FileMakerPro_source_details/` |
 | History + open threads | `devlog/worksheet.md` |
-| Current task (Increment 2) | `devlog/HANDOFF_increment2.md` |
 
 ---
 
@@ -265,11 +290,9 @@ instead of hours, and re-running Stage 2 no longer accumulates duplicates on unr
 lookups (see "Loader status" above). `python.exe` interop works directly from this WSL environment — no
 separate Windows session needed to drive Stage 1 against the real FileMaker file.
 
-**Increment 2** (the real loader is adopted): its first sub-task, converting `catalog_builder` to an
-incremental upsert, is **done** (Session 5) and now actually idempotent end-to-end (Session 7 closed the
-`NULL`-key gap). Remaining: feed the sync engine's `new + changed` delta into the loader, advance the
-manifest only on *verified* loads, and add a row-hash backstop so a FileMaker import can't masquerade as
-~140k edits — unblocked, since the manifest, the full data, and now idempotent re-runs are all live on
-`oci`. Smaller threads: `picture_metadata` untested against real images (no local files); the 16 flagged
-source records (FileMaker-side, re-confirmed via the `oci` manifest baseline). Detail in
+**Increment 2 is done (Sessions 5–8).** The real loader is adopted, `catalog_builder`'s incremental key is
+idempotent end-to-end, and `scripts/run_incremental_sync.py` is a real, live-proven "sync now" — see
+"Delta-driven incremental sync" above. Smaller threads: `picture_metadata` untested against real images (no
+local files); the 16 flagged source records (FileMaker-side, re-confirmed via the `oci` manifest baseline);
+cron/Task Scheduler wiring for the new orchestrator (deliberately out of scope). Detail in
 `devlog/worksheet.md`.

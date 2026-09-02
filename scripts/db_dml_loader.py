@@ -1278,7 +1278,7 @@ def migrate_builder(df):
     for _, row in builders.iterrows():
         builder_code = row['Builder code']
         builder_name = row['Builder name']
-        if row['Location'] != None:
+        if pd.notna(row['Location']):
             location_id = get_location_id(Location, row['Location'], f"migrate_{tgt_table}: {builder_code}")
         else:
             location_id = location_nvl
@@ -1294,7 +1294,11 @@ def migrate_builder(df):
     logger.info(f"Completed {tgt_table} migration. Migrated {len(builder_data)} builders")
 
 def stripy(txt):
-    return txt.strip() if txt is not None else txt
+    # pandas represents a blank source cell as a float NaN, not None -- treat
+    # it the same as None rather than crashing on NaN.strip() (Session 8).
+    if not isinstance(txt, str):
+        return None if txt is None or pd.isna(txt) else txt
+    return txt.strip()
 
 def migrate_catalog_builder(df):
     """
