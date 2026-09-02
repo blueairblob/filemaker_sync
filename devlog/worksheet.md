@@ -651,3 +651,43 @@ errors in `gui/` are pre-existing, confirmed via `git stash` diff, unrelated to 
   `sync_config.json`; cron/Task Scheduler wiring for `run_incremental_sync.py`.
 
 ---
+
+## Session 10 — 2026-09-02 — Flip `config.toml`'s default target profile to `oci`
+
+**Focus:** Quick fix for the usability gap Session 9 surfaced — the GUI (and any script run without
+`--target-profile`) defaulted to the now-unreachable `supabase` cloud project. Flip the default instead of
+building a full profile picker.
+**Status:** `completed`. One-line config change, verified live.
+
+---
+
+### Context
+
+`config.toml`'s `[database.target].active_profile` was still `"supabase"` — the original cloud project,
+whose pooler no longer resolves the tenant (`FATAL: tenant/user postgres.kmoehqdowgdupzdxtbei not found`,
+confirmed live in Session 9). `oci` has been the actively-loaded, live-tested target since Session 5, but
+every script and every GUI operation that doesn't pass `--target-profile` explicitly was still silently
+defaulting to the dead one.
+
+### Outcome
+
+`config.toml`: `active_profile = "oci"`. Verified live: `python.exe scripts/run_incremental_sync.py
+--dry-run` (no `--target-profile`) now correctly connects to `postgres.default@huey.taila2eeb2.ts.net` and
+reports `new: 0, changed: 0`; `python.exe scripts/db_sync_manifest.py --preview` likewise resolves `oci` by
+default and comes back clean (`141,244` manifest rows, `0` new/changed). The GUI's Delta Sync button (and
+every other GUI operation) now works without any code change, since none of them pass `--target-profile`
+either.
+
+A real in-GUI profile picker (to switch back to `supabase` if it's ever revived, or add future profiles)
+remains an open thread — this was the cheap fix, not that one.
+
+### Open Threads
+
+- [ ] *(Carried, unchanged)* `--mode dml_files` parser rewrite; GUI target-profile picker (no longer
+  urgent now the default is live, but still the only way to reach `supabase` from the GUI is by hand-editing
+  `config.toml`); `gui/filemaker_extract_refactored.py` stale-fork cleanup; `picture_metadata` untested
+  against real images; `requirements.txt`'s `pandas==2.1.4` pin; the 16 flagged source records; DDR;
+  supabase-py/SQLAlchemy prune; anon-JWT rotation; `PicaLocoBackend` consolidation/rebrand; delete
+  `sync_config.json`; cron/Task Scheduler wiring for `run_incremental_sync.py`.
+
+---

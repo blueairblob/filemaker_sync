@@ -46,10 +46,17 @@ Session 9** — it resolved scripts as bare filenames relative to the GUI's laun
 script lives under `scripts/`; fixed to `Path.cwd() / 'scripts' / script`. Has a "Delta Sync" button wired
 to `scripts/run_incremental_sync.py` (Session 9) — distinct from the older, differently-behaved
 "Incremental Sync" button (`operation_commands['incremental_sync']`, a plain full-table extract, not
-delta-driven despite the name). **The GUI has no target-profile picker** — every GUI operation runs against
-`config.toml`'s `active_profile` (currently `supabase`, not the live-tested `oci`) unless that's changed by
-hand. `gui/filemaker_extract_refactored.py` is a stale June-2025 fork, missing every Session 5–8 fix —
-known, deliberately untouched. See `devlog/worksheet.md` Session 9.
+delta-driven despite the name). **The GUI still has no target-profile picker** (Session 9's finding) — every GUI operation runs against
+`config.toml`'s `active_profile`, which is now `oci` (flipped from `supabase` — see below), so this no
+longer silently fails, but there's still no way to pick `supabase` from the GUI if it's ever needed again.
+`gui/filemaker_extract_refactored.py` is a stale June-2025 fork, missing every Session 5–8 fix — known,
+deliberately untouched. See `devlog/worksheet.md` Session 9.
+
+**`config.toml`'s `active_profile` is now `oci`** (was `supabase`). The old cloud project's pooler no
+longer resolves the tenant (`FATAL: tenant/user postgres.kmoehqdowgdupzdxtbei not found` — found live in
+Session 9, likely paused/rotated on Supabase's side, unrelated to this repo); `oci` is the actively-loaded,
+live-tested target since Session 5. Every script/GUI operation that doesn't pass `--target-profile`
+explicitly now defaults to `oci`.
 
 ---
 

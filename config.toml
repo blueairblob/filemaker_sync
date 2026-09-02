@@ -23,7 +23,7 @@ tgt_schema = 1
 default_migration_user = "migration_user"
 # Which [database.target.<name>] profile is active by default. CLI --target-profile
 # or env RAT_TARGET_PROFILE override this (see scripts/env_secrets.py resolve_secret).
-active_profile = "supabase"
+active_profile = "oci"
 
 [database.target.supabase]
 # Existing Supabase.com cloud project.
