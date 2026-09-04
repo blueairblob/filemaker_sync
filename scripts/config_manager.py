@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 try:
-    from env_secrets import resolve_secret, url_quote
+    from env_secrets import resolve_secret, resolve_target_pwd, url_quote
 except ImportError:                       # self-contained fallback (identical behaviour)
     import os as _os
     from urllib.parse import quote_plus as _qp
@@ -23,9 +23,34 @@ except ImportError:                       # self-contained fallback (identical b
             pass
         _v = _os.environ.get(env_key)
         return _v if _v else (cfg_val if cfg_val is not None else default)
+    def resolve_target_pwd(profile, cfg_val=None, cli_val=None, default=""):
+        if cli_val is not None:
+            return cli_val
+        pwd = resolve_secret(f"RAT_TARGET_PWD_{profile.upper()}", cfg_val=None)
+        if pwd:
+            return pwd
+        if profile == "supabase":
+            pwd = resolve_secret("RAT_TARGET_PWD", cfg_val=None)
+            if pwd:
+                return pwd
+        return cfg_val if cfg_val is not None else default
     def url_quote(value):
         return _qp(str(value or ""))
 
+
+def resolve_active_profile(cfg, cli_val=None):
+    """Which [database.target.<profile>] is active. Precedence: CLI > env
+    RAT_TARGET_PROFILE > config.toml active_profile (or legacy 'db' key) > 'supabase'.
+    Same logic as filemaker_extract.py/db_dml_loader.py/db_sync_manifest.py's own
+    copies of this helper -- kept local rather than centralised, matching how
+    this codebase already does it three times over."""
+    tgt = cfg['database']['target']
+    return resolve_secret(
+        'RAT_TARGET_PROFILE',
+        cfg_val=tgt.get('active_profile') or tgt.get('db'),
+        cli_val=cli_val,
+        default='supabase',
+    )
 
 
 @dataclass
@@ -67,8 +92,15 @@ class AppConfig:
 class ConfigManager:
     """Manages application configuration from TOML files"""
     
-    def __init__(self, config_file: str = 'config.toml'):
+    def __init__(self, config_file: str = 'config.toml', target_profile: Optional[str] = None,
+                 db_type: str = 'supabase'):
         self.config_file = Path(config_file)
+        # target_profile: which [database.target.<profile>] to resolve (None -> config.toml's
+        # active_profile / env RAT_TARGET_PROFILE, via resolve_active_profile()).
+        # db_type: SQL dialect ('mysql'/'supabase') -- decoupled from the profile name since
+        # Session 5; both current profiles ('supabase', 'oci') are Postgres.
+        self.target_profile = target_profile
+        self.db_type = db_type
         self.logger = logging.getLogger(__name__)
         self._config_data: Optional[Dict[str, Any]] = None
         self._app_config: Optional[AppConfig] = None
@@ -113,18 +145,27 @@ class ConfigManager:
                 schema=source_config.get('schema', [])
             )
             
-            # Parse target database config
+            # Parse target database config. Connection details live per-profile under
+            # [database.target.<profile>] since Session 5 -- resolve which profile is
+            # active, then read that sub-table (mirrors db_sync_manifest.py's
+            # resolve_target()). db_type (SQL dialect) is a separate concept from the
+            # profile name; both current profiles are Postgres.
             target_config = self._config_data['database']['target']
-            db_type = target_config['db']
-            
+            db_type = self.db_type
+            profile = resolve_active_profile(self._config_data, self.target_profile)
+            profile_config = target_config[profile]
+
             target_db = DatabaseConfig(
-                host=target_config['host'],
-                dsn=target_config['dsn'],
-                user=target_config[db_type]['user'],
-                pwd=resolve_secret('RAT_TARGET_PWD', target_config[db_type].get('pwd', '')),
-                port=target_config[db_type]['port'],
+                host=profile_config['host'],
+                # 'dsn' here is the database name used in the connection URL's path
+                # segment (get_target_connection_url()), not an ODBC DSN -- profiles
+                # store that as 'dbname'.
+                dsn=profile_config.get('dbname', 'postgres'),
+                user=profile_config['user'],
+                pwd=resolve_target_pwd(profile, profile_config.get('pwd', '')),
+                port=profile_config.get('port', ''),
                 type=target_config['type'],
-                name=target_config[db_type]['name'],
+                name=profile_config['name'],
                 schema=target_config['schema']
             )
             

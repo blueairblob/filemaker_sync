@@ -691,3 +691,660 @@ remains an open thread — this was the cheap fix, not that one.
   `sync_config.json`; cron/Task Scheduler wiring for `run_incremental_sync.py`.
 
 ---
+
+## Session 11 — 2026-09-02 — Make every GUI operation actually work (client-demo readiness)
+
+**Focus:** User wants the pipeline's "nuts and bolts" solid, then the GUI demo-ready for clients.
+Investigating what "fix all GUI operations" required (the user's explicit scope choice) surfaced a genuine
+runtime bug that would have crashed several buttons in front of a client — not just staleness.
+**Status:** `completed` for the backend/code side. Every operation smoke-tested live via `python.exe`,
+exercising `run_python_command()` exactly as a button click would. Visual/click-through testing on Windows
+is explicitly deferred to the user, per their choice this session (code-only review, not live GUI testing).
+
+---
+
+### Context
+
+Three separate problems, found in order while tracing why "repoint the GUI at real scripts" wasn't a clean
+swap:
+
+1. **`scripts/config_manager.py`'s `_parse_config()` was flatly broken against the current `config.toml`.**
+   It still read the pre-profile shape (`target_config['host']`, `target_config['db']`,
+   `target_config[db_type]['user']`, `target_config['dsn']`) that stopped existing when Session 5
+   introduced `[database.target.<profile>]` sub-tables. **Confirmed live**: running the file's own `__main__`
+   demo against the real config threw `Missing required configuration key: 'db'` and crashed outright.
+   Every consumer was broken by this — `filemaker_extract_refactored.py`'s diagnostic layer (which backs
+   the GUI's Test Connections and migration-status dashboard), `data_exporter.py`, and the standalone
+   `usage_example.py` demo. A *second*, separate bug in the same function: `target_config['dsn']` doesn't
+   exist either — that key never moved into the per-profile sub-tables; profiles store `dbname` instead
+   (used as the connection URL's path segment despite the dataclass field still being called `dsn` —
+   pre-existing naming quirk, left alone, just pointed at the right source key).
+2. **`scripts/filemaker_extract.py` (the real, actively-maintained script) has no `--json`/`--migration-status`
+   support at all** — that reporting layer (`run_info_only()`, `run_migration_status()`, structured
+   `connection_status` dicts) only exists in `filemaker_extract_refactored.py`'s class-based design.
+   "Repoint everything at the real script" would have silently broken Test Connections/Migration Status
+   rather than fixed them.
+3. **`gui/` held a second, more-stale, fully independent copy** of `config_manager.py`/
+   `database_connections.py`/`filemaker_extract_refactored.py` — confirmed dead code: nothing in `gui/`
+   (`filemaker_gui.py`, `gui_operations.py`, etc.) imports any of the three directly, and Python's
+   `sys.path[0]` for any subprocess-invoked script under `scripts/` (Session 9's fix) always resolves
+   sibling imports to `scripts/`, never `gui/`. A silently-diverging duplicate nobody could reach was exactly
+   the kind of trap that caused this session's own confusion tracing the bug.
+
+Separately, `CLAUDE.md` already documented "Load to Target" (`db_dml_loader.py --mode dml_files`) as unable
+to parse a realistic FileMaker export — a real, demo-breaking bug, not theoretical.
+
+---
+
+### Decisions
+
+| Decision | Rationale | Alternatives Considered |
+|---|---|---|
+| Fix `config_manager.py`'s profile resolution (reuse `resolve_active_profile()`/`resolve_target_pwd()`, same pattern as the three main scripts) rather than rebuild the diagnostic layer into `scripts/filemaker_extract.py` | Root-cause fix, small and well-understood; the diagnostic layer's logic was never actually wrong, just fed a config shape that stopped existing two sessions ago | Port `--json`/`--migration-status` into the real script (much bigger, duplicates working logic, not needed just to make the GUI reliable) |
+| Split GUI operations by kind: data-moving ops (`full_sync`/`incremental_sync`/`export_files`/`export_images`) → `scripts/filemaker_extract.py`; diagnostic ops (`test_connections`/`migration_status`) stay on `filemaker_extract_refactored.py` (now fixed) | Both scripts support the data-moving flags identically (confirmed via a direct `add_argument` diff); only the refactored script has working diagnostics | Force everything onto one script (would have required building new diagnostic functionality for no reliability benefit) |
+| Delete the dead `gui/` duplicate trio outright, not just leave it | Confirmed genuinely unreachable at runtime; a stale, drifting duplicate is itself a reliability risk for future debugging, matching the session's own "nuts and bolts" goal | Leave it in place as inert (rejected — it's exactly what caused this session's own confusion) |
+| Fix "Load to Target" by switching to `--mode migration_schema` (drop the broken `dml_files` mode entirely), removing the now-dead `_load_export_path()` helper | `migration_schema` mode is what every live test since Session 5 has actually used and is proven idempotent (Session 7); `--export-path` stays required by argparse but is genuinely unused in this mode — `'unused'` matches how `run_incremental_sync.py` already calls it | Fix the `dml_files` parser instead (bigger, separate, already-known-hard task per `CLAUDE.md`'s own Gotchas) |
+
+---
+
+### Findings
+
+- `scripts/config_manager.py`'s bug was **confirmed live before any fix was written**: `venv/bin/python -c
+  "..."` instantiating `ConfigManager` against the real `config.toml` reproduced `Missing required
+  configuration key: 'db'` exactly. After the fix, the same call correctly resolved `oci`'s real host
+  (`huey.taila2eeb2.ts.net`), user, dbname, and password with `validate_config()` returning `True`.
+- **`gui/config_manager.py` had an additional, independent problem** even setting aside staleness: it read
+  `target_config[db_type]['pwd']` directly from `config.toml`, with no `resolve_secret`/`env_secrets`
+  involvement at all — a real secrets-hygiene gap for whichever copy the GUI happened to import (moot now
+  it's deleted, but worth noting: `config.toml`'s per-profile `pwd` fields are just placeholder text, not
+  real passwords, so this was never an actual leak — just wrong hygiene, not a live incident).
+- Live smoke test (`python.exe`, calling `run_python_command()` directly, same shape a button click sends)
+  after all fixes: **Test Connections** now correctly reports both FileMaker (`Found 102.0 base table
+  fields`) and target (`PostgreSQL 17.6`, `oci`) connected; **Migration Status** correctly reports live
+  per-table row counts (`ratcatalogue: source 141,262 / target 1` — accurately reflecting that staging
+  currently only holds Session 8's single test-delta row, not stale/cached numbers); **Load to Target**
+  (new `migration_schema` command) ran the loader successfully against that same live staging data.
+- No regressions: `py_compile`/pyright clean on both platforms for every touched file; the pyright errors
+  that remain in `gui/`/`scripts/config_manager.py`/`filemaker_extract_refactored.py` are byte-for-byte the
+  same set as before this session's changes (confirmed via `git stash` diff), just line-shifted.
+
+---
+
+### Outcome
+
+`scripts/config_manager.py`: `_parse_config()` resolves the active profile via
+`resolve_active_profile()`/`resolve_target_pwd()` instead of a config shape that stopped existing at Session
+5; `ConfigManager.__init__` gained `target_profile`/`db_type` params. `scripts/filemaker_extract_refactored.py`:
+new `--target-profile` flag threaded into its `ConfigManager` construction. `gui/gui_operations.py`:
+`operation_scripts` now routes data-moving ops to `scripts/filemaker_extract.py` and diagnostic ops to
+`scripts/filemaker_extract_refactored.py` explicitly; `load_to_target`'s command switched to
+`--mode migration_schema`; dead `_load_export_path()` removed. `gui/filemaker_gui.py`: the "Run
+Diagnostics" file-existence check pointed at the real, correctly-resolvable path. Deleted:
+`gui/config_manager.py`, `gui/database_connections.py`, `gui/filemaker_extract_refactored.py` (confirmed
+dead code).
+
+This round was explicitly **code-only** — no live tkinter click-through (the user's choice this session).
+Every operation's *backend* wiring is now proven live; visual/UX testing (does it look right, is it
+pleasant to click through for a client) is the user's next step on Windows.
+
+---
+
+### Open Threads
+
+- [ ] *(Carried, unchanged)* `--mode dml_files` parser rewrite; GUI target-profile picker;
+  `picture_metadata` untested against real images; `requirements.txt`'s `pandas==2.1.4` pin; the 16 flagged
+  source records; DDR; supabase-py/SQLAlchemy prune; anon-JWT rotation; `PicaLocoBackend`
+  consolidation/rebrand; delete `sync_config.json`; cron/Task Scheduler wiring for
+  `run_incremental_sync.py`; `gui/install_gui_fixed.py`/`gui/setup_gui.py` still reference the deleted
+  `gui/`-local trio by name (standalone installer scripts, not imported by the live app — left untouched,
+  out of this session's scope, but will report those files "missing" if ever run).
+
+---
+
+## Session 12 — 2026-09-02 — Live output streaming for the GUI (the user's first real click-through)
+
+**Focus:** The user ran the actual GUI on Windows for the first time (following Sessions 9 & 11's backend
+fixes) — a real Full Sync — and reported the only sign of activity was the indeterminate progress bar
+strobing; no log output appeared anywhere, even in the already-built "View Logs" viewer.
+**Status:** `completed`. Root cause traced through two layers, not one; both fixed; live-proven via a
+headless smoke test that asserts log entries arrive *during* a real subprocess call, not only after it
+returns.
+
+---
+
+### Context
+
+Two separate, stacked problems — fixing only the first would still have shown nothing:
+
+1. **`gui/gui_operations.py`'s `run_python_command()`** — the one method every GUI operation goes through —
+   used a single blocking `subprocess.run(capture_output=True, ...)`. All output is buffered by the OS pipe
+   and only reaches Python after the subprocess exits; `_process_command_result()` (the only place that
+   called `log_subprocess_output()`) only ran at that point. For a multi-minute Full Sync, nothing new
+   reached `LogManager` between "Starting: ..." and the final "✓ Completed" — there was nothing for the
+   already-working, already-auto-refreshing `LogViewerWindow` to show, no matter when it was opened.
+2. **Even after fixing (1), a smoke test still showed zero live entries.** Traced to a second, independent
+   bug one layer down: `scripts/filemaker_extract.py`, `scripts/db_dml_loader.py`, and
+   `scripts/filemaker_extract_refactored.py`'s `setup_logging()` functions all gated their console
+   `StreamHandler` behind `if debug_mode:` — so without `--debug` (which the GUI never passes, and which
+   also bumps the logger to a much noisier DEBUG level), every `logger.info()` progress line
+   ("Getting a query count", "Has N rows", "Inserted N rows", etc.) went **only** to the log file, never to
+   stdout. Confirmed live outside the GUI entirely: piping `filemaker_extract.py`'s own output without
+   `--debug` showed nothing but tqdm's progress bar. Streaming an empty pipe live is still an empty pipe —
+   fixing (1) alone would have "worked" but shown almost nothing.
+
+A third, connected bug found while reading the cancel path: **`OperationManager._current_process` was
+declared in `__init__` but never actually assigned anywhere** — `cancel_current_operation()` ("Stop
+Action") checks `if self._current_process: self._current_process.terminate()`, but that was always `None`.
+Stop Action could never actually kill a running subprocess; it only reset GUI state to idle while the real
+process kept running in the background. Switching to `Popen` (needed for streaming anyway) meant holding a
+real process handle, so setting `self._current_process` was a natural, essentially-free part of the same
+change.
+
+---
+
+### Decisions
+
+| Decision | Rationale | Alternatives Considered |
+|---|---|---|
+| Merge stderr into stdout (`stderr=subprocess.STDOUT`) rather than reading two pipes | Order doesn't matter for a live feed (chronological interleaving is more useful than separated streams); avoids a two-pipe reader-thread deadlock; and it's what makes a *fourth*, connected bug fixable for free — the old code unconditionally logged every stderr line as `ERROR`, but `tqdm`'s progress bar defaults to stderr and isn't an error. `log_subprocess_output()` already sniffs real severity from content, so routing everything through it (instead of forcing stderr=ERROR) fixes both problems at once | Two separate reader threads for stdout/stderr (more complexity, no real benefit for a log feed where order-of-arrival matters more than source) |
+| Fix the console-handler gating in all three `setup_logging()` functions (always attach, `debug_mode` only controls logger *level*) | Root cause of "nothing to stream" even after fixing the GUI side; also fixes plain CLI usability — running these scripts directly from a terminal without `--debug` showed almost nothing either, which `CLAUDE.md`'s own "How to run" examples never account for | Have the GUI always pass `--debug` (rejected — conflates "show console output" with "verbose DEBUG-level logging," would make a demo's log view far noisier than needed) |
+| Rely on Python's default universal-newline translation (`text=True` implies `newline=None`) to handle `tqdm`'s `\r`-based progress updates as ordinary lines | Verified this is standard `io`/`subprocess` behavior, not an assumption — `\r` maps to `\n` on read in text mode, so a plain `for line in process.stdout:` loop naturally yields each tqdm tick as its own line with zero special-casing | Suppressing tqdm output entirely for GUI-invoked runs (would lose real, wanted progress detail; and there's no clean env-var lever for it without touching every `tqdm()` call site) |
+
+---
+
+### Findings
+
+- The bug surfaced through direct live user testing, not code review — confirms the value of the "user
+  runs it on Windows and reports back" split from Session 11.
+- My own first smoke test attempt (checking `entry.component == "Command-Output"`) produced a false
+  negative — `LogManager.log()` bakes the `component` argument into the *message* text
+  (`f"[{component}] {message}"`); `LogEntry.component` actually holds the underlying Python logger's name
+  (`'FileMakerSync'`, from `record.name` in `LogCaptureHandler.emit()`). Caught by isolating the two halves
+  (`log_subprocess_output()` alone vs. a bare `Popen` read loop alone) before concluding the *fix* was
+  broken — it wasn't; the *test* was checking the wrong field. Fixed the test to check
+  `"[Command-Output]" in entry.message` instead.
+- Final live smoke test (`python.exe`, real `scripts/filemaker_extract.py` extract of a small table,
+  registering a `LogManager` callback and timestamping every entry): 16 log entries received, **all 16
+  arrived before the call returned** — proving the stream is genuinely live, not a fast post-hoc dump.
+  Timeout handling re-verified unchanged (`"Command timed out after {timeout}s: {description}"`, same
+  shape as before). `_current_process` confirmed `None` again after clean completion (lifecycle correct).
+
+---
+
+### Outcome
+
+`gui/gui_operations.py`: `run_python_command()`'s execution now goes through new `_run_streaming()` —
+`subprocess.Popen` with merged stdout/stderr, line-by-line live `log_subprocess_output()` calls, a
+`threading.Timer` watchdog reproducing the original timeout behavior, and `self._current_process` properly
+set/cleared (fixing Stop Action as a side effect). `_process_command_result()` simplified — output logging
+moved to the streaming path, so its old post-hoc stdout/stderr loops are gone; JSON-extraction and
+success/failure logic unchanged. `scripts/filemaker_extract.py`, `scripts/db_dml_loader.py`,
+`scripts/filemaker_extract_refactored.py`: console log handler now always attached (`debug_mode` only
+affects logger level, as it should). No regressions: `py_compile`/pyright clean both platforms; pyright
+error set byte-for-byte identical to before this session (confirmed via `git stash` diff).
+
+Still outstanding: the user's next real-world check is the same live Full Sync in the actual GUI, watching
+for live-updating log entries this time — that's the true end-to-end proof, not the headless smoke test.
+
+---
+
+### Open Threads
+
+- [ ] *(Carried, unchanged)* `--mode dml_files` parser rewrite; GUI target-profile picker;
+  `picture_metadata` untested against real images; `requirements.txt`'s `pandas==2.1.4` pin; the 16 flagged
+  source records; DDR; supabase-py/SQLAlchemy prune; anon-JWT rotation; `PicaLocoBackend`
+  consolidation/rebrand; delete `sync_config.json`; cron/Task Scheduler wiring for `run_incremental_sync.py`;
+  `gui/install_gui_fixed.py`/`gui/setup_gui.py` stale references.
+
+---
+
+## Session 13 — 2026-09-03 to 2026-09-04 — Nine rounds of live GUI testing with the user, real-time
+
+**Focus:** One continuous live-testing session with the user actually clicking through the real Windows
+GUI after every fix, reporting back immediately — nine rounds total, each building directly on the user's
+own feedback rather than a prescribed plan. Started from a live Unicode crash and a tab-layout request;
+along the way surfaced and fixed two genuinely serious bugs (a reentrant-lock deadlock, a concurrent
+FileMaker-ODBC-access freeze — both reproduced mechanically before trusting the fix, not just reasoned
+about), a real data bug (`full_sync` silently inflating staging 3–4×), and iterated Migration Overview
+through three attempts before it actually read well to the user. Round-by-round detail below; short version:
+**Round 1** Unicode crash fix + tabbed Actions/Status layout. **Round 2** live output streaming was
+incomplete without it — same-day gap fix. **Round 3–4** the tab redesign's `LiveStatusPanel` exposed a real
+deadlock in `LogManager`, found, reproduced, fixed. **Round 5** the Unicode fix itself had a gap in one of
+three files — found via the user's very next click. **Round 6** the user's direct question after a real
+FileMaker edit + Delta Sync ("should I have been told 1 update found?") led to surfacing Delta Sync's own
+JSON summary, a startup connection check, button tooltips. **Round 7–8** Migration Overview relabeled, then
+fixed at the root (stop refreshing with misleading data), then given a genuinely useful delta-aware
+breakdown — three iterations because the first two weren't enough on their own. **Round 9** a real app
+freeze from concurrent FileMaker ODBC access, root-caused via the child processes' own log files and fixed
+by serializing every subprocess launch through one lock.
+**Status:** `completed`. All nine rounds fixed and confirmed live by the user, including the final
+delta-aware Migration Overview breakdown. The deadlock was reproduced and disproven mechanically (not just
+argued from code reading) — see Findings. The tab layout's actual feel is still the user's to confirm on
+Windows.
+
+---
+
+### Context
+
+**The Unicode bug.** Session 12's live re-test showed a "⚠ Minor Issues, 3 errors" status badge during Full
+Sync. Traced via the log file (`logs/filemaker_sync_20260903.log`): repeated `UnicodeEncodeError: 'charmap'
+codec can't encode character '✓'` — the ✓ checkmark. Root cause: `gui/gui_logging.py`'s own
+`LogManager.setup_logging_system()` attaches a console `StreamHandler(sys.stdout)` when `config.toml`'s
+`[debug] console_logging = true` (which it is), with no UTF-8 wrapping — unlike the fix already applied to
+the three CLI scripts' `setup_logging()` in Session 12. The character comes from `gui/gui_operations.py`'s
+own native log calls (`f"✓ Completed: {description}"` etc.), not subprocess output — this was always a
+latent bug, just newly exercised at volume once Session 12 started pushing far more log entries through the
+system (streamed subprocess lines) than before.
+
+**The layout request.** User's own words, watching a live Full Sync: the Migration Overview grid "shuold be
+expandable or on a tab with the funtions buttons on another tab so when the user selects a function they
+can just flip to the status / stats / messages screen." Clarified with the user: add a new, simple
+always-live status tab; leave the existing, more elaborate `LogViewerWindow` popup (~1400 lines,
+search/filter/sort) untouched rather than refactor it into the tab — lower risk, faster to ship. Worth
+noting for future reference: the empty Migration Overview grid itself was never going to solve this even
+before the tab redesign — it's a static per-table summary populated only by "Update Dashboard", not a log
+feed; the real gap was the *absence* of any embedded live feed, not the grid's emptiness specifically.
+
+---
+
+### Decisions
+
+| Decision | Rationale | Alternatives Considered |
+|---|---|---|
+| Fix the Unicode bug the same way as Session 12's three CLI-script fixes (`codecs.getwriter('utf-8')(sys.stdout.buffer)` before creating the console handler) | Consistent, already-proven pattern in this exact codebase from the same day; small and contained | Disable `console_logging` in config.toml instead (would silence a legitimately useful debug channel just to dodge a fixable bug) |
+| New `LiveStatusPanel` widget (`gui/gui_widgets.py`) reusing `LogManager.get_recent_logs()`/`add_callback()` — the same primitives `LogViewerWindow` already uses — rather than inventing a new log-delivery mechanism | No new plumbing needed; Session 12's streaming fix already pushes everything through these; keeps the popup and the new tab reading from one source of truth | A separate polling mechanism (redundant, more moving parts) |
+| Keep `LogViewerWindow` popup untouched, ship a deliberately simpler tab (no search/filter/sort) | User's explicit choice when asked; the popup's ~1400 lines are working, tested-by-use code — refactoring it into an embeddable frame was assessed as real risk for this pass | Retire the popup and move all its functionality into the tab (offered, user declined) |
+| Auto-switch to the Status tab in `safe_run_operation()`'s confirm callback, not as a separate manual step | Matches the user's own stated goal ("so when the user selects a function they can just flip to the status screen") — made automatic rather than requiring an extra click | Leave switching manual (doesn't fulfil what was actually asked) |
+
+---
+
+### Findings
+
+- Caught a real editing mistake before it shipped: the first attempt at adding `LiveStatusPanel` to
+  `gui/gui_widgets.py` didn't account for `StatusBar.update_health()`'s actual last two lines (an "Update
+  timestamp" statement) — the `Read` used to locate the insertion point stopped just short of the file's
+  true end, so the new class got spliced into the middle of that method, orphaning its trailing statement
+  at the end of the file where it silently became part of `LiveStatusPanel._append()`'s body instead
+  (`self.last_update_label.configure(...)` — an attribute that doesn't exist on that class). Caught by
+  pyright (`Cannot access attribute "last_update_label" for class "LiveStatusPanel*"`) before any runtime
+  test ran — not by the runtime smoke test itself. Fixed by restoring the timestamp line to
+  `update_health()` and removing the orphaned duplicate.
+- Live headless smoke test built a *real* (offscreen, `root.withdraw()`) Tk instance rather than only
+  import-checking — necessary here since the previous two sessions' `run_python_command()`-level tests
+  couldn't have caught a Tk widget-tree/layout bug like the one above; this one specifically constructed
+  `FileMakerSyncGUI(root)` end-to-end and asserted `self.notebook.tabs()` has exactly 2 tabs named "Actions"
+  and "Status", plus pushed real log entries through a real `LiveStatusPanel` and confirmed the widget's
+  text content updated and the line cap enforces correctly.
+
+---
+
+### The deadlock — found immediately after shipping the tab redesign
+
+Right after relaunching with the new tabs, the user clicked "Test Connections" and the window went "Not
+Responding". Root-caused via `gui/gui_logging.py`, not guessed at:
+
+`LogManager._add_log_entry()` calls `_notify_callbacks(entry)` **while still holding** `self._log_lock` (a
+plain, non-reentrant `threading.Lock`). `_notify_callbacks`'s own except-handler used to call
+`self.logger.error(...)` when a callback raised — which re-enters the standard `logging` module's handler
+chain, which calls back into `LogCaptureHandler.emit()` → `self.log_manager._add_log_entry()` → tries to
+reacquire the *same* lock, from the *same* thread, that the outer call still holds. A plain `Lock` isn't
+reentrant, so that thread blocks forever — and since it's holding Python's global `logging` module lock
+partway through, every *other* thread's logging calls (including the Tk main thread's) block behind it too.
+That's what "Not Responding" actually was.
+
+This bug was latent in `gui_logging.py` before today, but nothing had ever triggered it: no registered
+callback had ever raised. `LiveStatusPanel`'s new callback (`_on_new_entry`) was the first one invoked
+*concurrently from two background threads simultaneously* — `ConnectionTester.test_all_connections()`
+deliberately runs the FileMaker and target checks concurrently — combined with `self.after(0, ...)` being
+called from a background thread under that concurrent load being the first realistic way to actually
+trigger an exception in a callback.
+
+**Reproduced mechanically, not just reasoned about:** wrote a standalone test that registers a callback set
+to raise every 3rd call, fires two threads each logging 200 entries concurrently, with a 15s watchdog.
+Run against the pre-fix code: hung, confirmed dead at exactly `callback calls: 3` (the exact call that first
+raised) — the watchdog's timeout is what let the test fail cleanly instead of hanging the test run itself.
+Run against the fix: 0.03s, all 400 calls completed, zero deadlock.
+
+**Fix:** moved `_notify_callbacks(entry)` outside the `with self._log_lock:` block in `_add_log_entry()` —
+the lock only needs to protect the `memory_logs` list mutation, not arbitrary callback execution. Changed
+`_notify_callbacks`'s except-handler from `self.logger.error(...)` to a direct `print(..., file=sys.stderr)`
+— eliminates the recursion risk entirely rather than just narrowing the window for it. Also widened
+`LiveStatusPanel._on_new_entry`'s except clause from `tk.TclError` specifically to a bare `except Exception`,
+defensively — a `LogManager` callback must never let anything escape back into that chain, regardless of
+type.
+
+Separately, the user also flagged the Actions tab having "lots of empty space" now that Migration Overview
+moved to the Status tab — the Quick Actions box was still only `pack(fill='x')` (no vertical expand), so it
+sat as a small block above a large dead void. Changed to `fill='both', expand=True` so the bordered box
+itself grows to fill the tab.
+
+---
+
+### Outcome
+
+`gui/gui_logging.py`: `LogManager.setup_logging_system()`'s console handler now UTF-8-wrapped on Windows
+(same fix as the three scripts); `_add_log_entry()`/`_notify_callbacks()` no longer call callbacks while
+holding `_log_lock`, and never re-enter the logging chain from an error handler. `gui/gui_widgets.py`: new
+`LiveStatusPanel` class (`ScrolledText`, capped at 500 lines, same color palette as `LogViewerWindow`'s
+tree tags), its callback now catches broadly; `QuickActions`'s frame now fills its tab. `gui/filemaker_gui.py`:
+`create_main_content()` rebuilt around a `ttk.Notebook` (Actions tab: Quick Actions buttons + progress bar;
+Status tab: Migration Overview grid + the new `LiveStatusPanel`); `safe_run_operation()` now calls
+`self.notebook.select(self.status_tab)` on confirm. No regressions: `py_compile`/pyright clean both
+platforms (pyright error set unchanged from before this session, confirmed via `git stash` diff each round).
+
+Still outstanding: the user's own re-test on Windows — does the tab flip feel right, is the live panel
+legible and useful during a real Full Sync, and (most importantly this round) does Test Connections now
+actually complete instead of freezing.
+
+---
+
+### Open Threads
+
+- [ ] *(Carried, unchanged)* `--mode dml_files` parser rewrite; GUI target-profile picker;
+  `picture_metadata` untested against real images; `requirements.txt`'s `pandas==2.1.4` pin; the 16 flagged
+  source records; DDR; supabase-py/SQLAlchemy prune; anon-JWT rotation; `PicaLocoBackend`
+  consolidation/rebrand; delete `sync_config.json`; cron/Task Scheduler wiring for `run_incremental_sync.py`;
+  `gui/install_gui_fixed.py`/`gui/setup_gui.py` stale references; **user's live re-test on Windows** (tab
+  layout feel, live panel usefulness, and specifically that Test Connections no longer hangs).
+
+---
+
+### Round 4 (same session, same day) — staging duplication found; level filter + duration summary added
+
+After the deadlock fix, the user's live re-test surfaced two more things:
+
+**`rat_migration` staging tables were 3–4x inflated.** The Status tab's Migration Overview showed
+"Completion %: 302%" — not a display bug. Checked directly against `oci`: `ratbuilders` 520→2,080 (4x),
+`ratroutes` 2,892→11,568 (4x), `ratcatalogue` 141,262→423,787 (~3x), etc. — exact multiples, all seven
+tables. Root cause: `gui/gui_operations.py`'s `operation_commands['full_sync']` never included `--del-data`,
+so every repeated Full Sync from the GUI today just appended onto existing staging rows instead of
+replacing them. **Verified the actual production data was never at risk**: `rat.catalog`/`catalog_metadata`/
+`usage`/`builder`/`catalog_builder` all matched the documented-correct baseline exactly (`catalog` 141,244,
+`catalog_builder` 116,538, etc.) — the final schema's upsert-on-natural-key logic dedupes regardless of how
+much staging duplication feeds into it; only the intermediate staging tables (and the GUI's own read of
+their row counts) were affected. `picture_metadata = 0` is separately expected and pre-existing (documented
+since Session 5 — needs local image files, none present in this environment). Fixed: added `--del-data` to
+`full_sync`'s command. **Cleanup done, with the user's explicit go-ahead**: ran
+`python.exe scripts/filemaker_extract.py --db-exp --ddl --dml --del-data --target-profile oci` directly
+(~4m22s). Verified after: every `rat_migration.*` staging count now matches the true FileMaker source
+exactly (`ratcatalogue` 141,262, `ratbuilders` 520, `ratroutes` 2,892, `ratcollections` 66, `ratcopyright`
+24, `ratlabels` 21, `prompts` 3 — no inflation), and `rat.*` (`catalog` 141,244, `builder` 518,
+`catalog_builder` 116,538) unchanged, confirming the final schema was never at risk either before or after.
+
+**Level filter + duration summary.** User: "lots of logging" (confirmed the color-coding is working, wants
+volume control) and "how long etc. did it take stats." `gui/gui_widgets.py`'s `LiveStatusPanel` gained a
+header row: a level-filter combobox (`All`/`Info+`/`Warning+`/`Errors only`, defaulting to `Info+` to hide
+DEBUG-level chatter) that re-renders from `LogManager.get_recent_logs()` on change — filters the *view*
+only, `LogManager`'s own history is untouched — and a duration/result summary label, fed by a new
+`'duration'` field threaded through `gui/gui_operations.py`'s existing `run_operation_async` →
+`_notify_callbacks_safe('complete', ...)` payload (`time.time()` at start, computed in the `finally` block
+so it's correct even on failure/exception). Deliberately did not attempt to parse/condense the underlying
+subprocess log lines into per-table summaries — bigger, riskier text-parsing scope; the filter and duration
+summary directly address what was actually asked.
+
+Caught a real bug in my own first attempt: `on_operation_status_safe`'s nested `update_operation_ui()`
+closure did `result = result or {}`, which — because of Python's closure scoping rules (any assignment to a
+name inside a nested function makes that name local to the *whole* function, not just from that line
+onward) — shadowed the outer `result` parameter and raised `UnboundLocalError` at the read on the same
+line. Caught by pyright (`"result" is unbound`) before runtime. Fixed by renaming the local to `op_result`.
+
+Live headless smoke test (real offscreen Tk `LiveStatusPanel`): default filter correctly hides DEBUG,
+switching to "All" reveals it, switching to "Errors only" hides INFO/WARNING and shows a subsequent ERROR;
+duration formatting correct for both sub-minute and multi-minute cases; `update_summary()`/`set_running()`
+produce the expected label text. (One test-only false alarm along the way: my test's own bare `LogManager()`
+call defaulted to `log_level='INFO'`, silently dropping the DEBUG entry before it ever reached the panel —
+not a real bug, just not matching `config.toml`'s actual `log_level = "DEBUG"`; fixed the test's setup, not
+the code.)
+
+`py_compile`/pyright clean both platforms, no regressions (confirmed via `git stash` diff).
+
+---
+
+### Round 5 (same session, same day) — the Unicode fix had a gap; found via the user's very next click
+
+User re-tested with the new filter/summary and immediately reported: "not sure the filtering is working"
+plus a wall of `UnicodeEncodeError` on ✓ again, visible under both "Warning+" and "Errors only" filters.
+
+**The filter itself was working correctly** — "Warning+"/"Errors only" both legitimately include `ERROR`
+level, so a genuine flood of ERROR-tagged crash entries was always going to show under either. Not a filter
+bug; just completely obscured by real errors flooding in.
+
+**The real bug: my earlier Unicode fix to `scripts/filemaker_extract_refactored.py` was incomplete.** Round
+1 today fixed three scripts' console-handler gating (`if debug_mode:` → always attached) and separately
+added UTF-8 stdout/stderr wrapping to two of them (`filemaker_extract.py`, `db_dml_loader.py`) — but
+`filemaker_extract_refactored.py`'s own fix only removed the debug-mode gate, **without** also adding the
+UTF-8 wrapping that made that safe elsewhere. Net effect: that fix made things *worse*, not better — the
+handler went from "off unless `--debug`" (never actually triggered by the GUI, which never passes
+`--debug`) to "always on, but still crashes on `✓`" — and this script is the one behind Test
+Connections/Migration Status/Update Dashboard, which log `f"✓ FileMaker: {message}"`/`f"✓ Target:
+{message}"` on every successful connection check. Confirmed by reproducing directly: `python.exe
+scripts/filemaker_extract_refactored.py --migration-status --json --target-profile oci` threw the exact
+same `UnicodeEncodeError: ...character '✓' in position 71` repeatedly. Fixed: added the same
+`codecs.getwriter('utf-8')(sys.stdout.buffer)` wrapping this file was missing, matching the other two
+scripts exactly.
+
+**Swept for other unfixed spots rather than wait for another report:** grepped every `StreamHandler(sys.stdout)`
+call site across `scripts/` and `gui/` (4 total). Found a 4th, in `gui/gui_logging.py`'s
+`toggle_console_logging()` — confirmed dead code (grepped, never called anywhere in `gui/`), but the exact
+same latent bug shape; fixed it too rather than leave a landmine for whenever it does get wired up.
+
+Verified the fix two ways: direct reproduction (`filemaker_extract_refactored.py --migration-status --json`
+now produces zero `Logging error` lines, previously produced dozens per run), and a live smoke test through
+the actual GUI code path (`run_python_command()`, watching for any `Logging error`/`UnicodeEncodeError`
+text in the streamed output — zero found, `result['success']` `True`).
+
+**Lesson for future Unicode-safety fixes in this codebase:** when the same fix needs applying to multiple
+files, verify each one got the *complete* pattern (both halves — degate AND encode-wrap), not just that the
+edit compiled. A partial fix that "looks the same" can be worse than no fix at all if it changes when the
+broken code path actually runs.
+
+`py_compile`/pyright clean both platforms (confirmed via `git stash` diff), no regressions.
+
+---
+
+### Round 6 (same session, same day) — the Delta Sync question, tooltips, startup connection check
+
+After confirming the staging cleanup, the user's next round of feedback, all from watching a real Delta
+Sync run: connection indicators only went green "at the very end" (not, as it turns out, a timing quirk —
+**confirmed nothing calls a connection test at startup at all**, only a config save or a manual click ever
+had); Stop Action "always disabled" (checked mechanically first rather than assumed — `show_progress()`/
+`hide_progress()` correctly cycle disabled→normal→disabled in isolation, so the mechanism itself is fine;
+the real gap is Test Connections/Update Dashboard never touch it, a separate code path bypassing the
+operation state machine entirely — per the user's choice, documented as a known limitation rather than
+fixed this round); a request for hover tooltips on the Quick Action buttons; and the substantive one — after
+hand-editing one FileMaker record and running Delta Sync, "should I have been told something like 1 update
+found and updated to the target database, or is Delta Sync not for this?"
+
+**The honest answer: yes, and the information already existed** — `run_incremental_sync.py`'s own `Report`
+already computes new/changed/verified/manifest-advanced counts, it just prints them as plain text with
+nothing for the GUI's already-built JSON extraction (`_extract_json_from_output()`, used by Test
+Connections/Migration Status) to find. Investigating this also surfaced why Migration Overview showed
+"302%... Partial" reading right after a clean, successful Delta Sync: its "Target" column has always meant
+"rows currently in `rat_migration` staging," which was a reasonable proxy back when only a full re-extract
+ever populated staging (staging ≈ full mirror) — but Delta Sync deliberately narrows staging to just the
+delta by design, so the same metric that made sense for Full Sync becomes actively misleading for Delta
+Sync. No clean fix exists this round (`ratcopyright`/`ratlabels`/`prompts` have no obvious 1:1 final-schema
+table to compare against instead) — asked the user, who chose the honest-relabel option over a deeper
+redesign.
+
+**Fixes:**
+- `gui/filemaker_gui.py`: `self.root.after(500, self.safe_test_all_connections)` added to `__init__`,
+  same pattern as the existing `start_auto_refresh` delay — connection cards now show real status within a
+  second of the window opening.
+- `gui/gui_widgets.py`: new `Tooltip` class (tkinter has none built in — standard `<Enter>`/`<Leave>` +
+  borderless `Toplevel` pattern) wired onto all 10 Quick Action buttons via a `QuickActions.BUTTON_TOOLTIPS`
+  dict, written specifically to clear up the "Incremental Sync" vs "Delta Sync" naming confusion ("...NOT
+  delta-driven despite the name -- see Delta Sync for that" / "...the recommended way to pick up recent
+  edits") and to correctly describe Load to Target's current (Session 11) behavior.
+- `scripts/run_incremental_sync.py`: added `import json`; every exit path (nothing-to-do, `--dry-run`, and
+  full success) now also prints a JSON summary line at the end — reusing the GUI's existing
+  `_extract_json_from_output()` scanning as-is, no new CLI flag or `gui_operations.py` parsing changes
+  needed, since that scanner already looks for a `{`-starting line anywhere in stdout.
+- `gui/gui_operations.py`: completion notification (`run_operation_thread()`) now also carries
+  `'data': command_result.get('data')`; `gui/filemaker_gui.py` passes it through to
+  `LiveStatusPanel.update_summary()`, which now (`gui/gui_widgets.py`) accepts an optional `data` param and
+  appends a detail clause (`" — 1 changed, 1 verified"` / `" — nothing to do"`) when it recognizes the
+  delta-sync summary shape (`'manifest_advanced' in data`) — a cheap, specific-enough check that leaves
+  every other operation's plain duration-only summary untouched.
+- `gui/gui_widgets.py`, `MigrationOverview`: `'Completion %'` stat relabeled `'Staging Match %'`, the
+  `'Target'` column's *displayed* heading (not its internal id — nothing else needed touching) relabeled
+  `'Staging'`, and a small persistent gray caption added below the table explaining what it actually shows
+  and pointing at the Delta Sync summary above it for the real answer.
+
+Verified: direct reproduction (`run_incremental_sync.py --target-profile oci --dry-run` now ends with a
+parseable JSON line); full headless smoke test covering all five pieces together, including the complete
+`run_python_command()` → `run_incremental_sync.py --dry-run` → parsed-`data` path (not just the unit-level
+pieces in isolation) — all passed. `py_compile`/pyright clean both platforms, no regressions (`git stash`
+diff empty).
+
+---
+
+### Round 7 (same session, same day) — the relabel wasn't enough; stop the misleading refresh instead
+
+The rich Delta Sync summary line from Round 6 worked exactly as intended live ("✓ Delta Sync completed in
+37.5s — 1 changed, 1 verified"). But the user pushed back on Round 6's Migration Overview fix: even
+relabeled and captioned, a large bold "2%" next to "⚠ Partial" is alarming at a glance regardless of what
+the fine print underneath says — people pattern-match the headline number, not the caption. Fair, and a
+real gap in Round 6's fix, not a new problem: relabeling explains *what* the number means but doesn't stop
+a wrong-looking number from appearing in the first place.
+
+**Root cause of the number appearing at all**: `on_operation_status_safe()`'s `'complete'` handler
+unconditionally scheduled `safe_refresh_migration_status()` after *every* operation, including Delta Sync —
+so the very act of a successful Delta Sync immediately overwrote whatever good, Full-Sync-representative
+numbers were on screen with delta-scoped staging counts. Fix: skip the auto-refresh specifically for
+`delta_sync` and the older `incremental_sync` (neither leaves staging holding a full mirror of FileMaker,
+by design — `incremental_sync` doesn't clear staging first either, so it has the same problem in kind).
+Leaves whatever was last shown (a real Full Sync's numbers, or the unset "not yet run" state) untouched —
+more honest than replacing it with a number that looks broken. "Update Dashboard" (manual) is unaffected —
+a user who explicitly asks for a staging snapshot still gets one, with Round 6's caption still explaining
+it.
+
+Verified with a targeted smoke test (spy on `root.after`, watching specifically for
+`safe_refresh_migration_status` calls) across all three operation kinds — confirmed `delta_sync`/
+`incremental_sync` correctly skip scheduling the refresh, `full_sync` still schedules it. One test-harness
+gotcha along the way: the first attempt asserted immediately after a single `root.update()` call and failed
+for `full_sync` even though the fix is correct — `on_operation_status_safe` runs through
+`schedule_gui_update()`'s async queue, processed by a periodic ~100ms `root.after` poll, so a single
+synchronous `update()` right after the call doesn't give that poll cycle time to fire. Fixed the test (not
+the code) with a short poll loop.
+
+`py_compile`/pyright clean both platforms, no new regressions (only the same pre-existing
+`ConfigurationWindow` import error, unrelated).
+
+---
+
+### Round 8 (same session, same day) — a delta-aware table breakdown instead of nothing
+
+Round 7's fix (skip the misleading auto-refresh after Delta Sync) worked as intended, but left Migration
+Overview showing "0/0, 0%" and an empty grid after a fresh app launch + Delta Sync — technically honest (no
+longer wrong), but the user pointed out it's now just less useful. Their own specific ask: show per-table
+stats, and for the table that actually changed, put something like "1 update" under Status and a
+success indicator under Progress — instead of either a misleading percentage or nothing.
+
+Built entirely from data already available — no new live queries, no changes to `run_incremental_sync.py`'s
+output. Delta Sync's own behavior is fixed and known: it always touches the same set of tables the same
+way (`ratcatalogue` gets the actual delta; `ratbuilders`/`ratroutes`/`ratcollections`/`prompts` get a full
+refresh every single run regardless of what changed; `ratcopyright`/`ratlabels` aren't touched at all) — so
+the already-parsed JSON summary (`new`/`changed`/`verified`/`manifest_advanced`) is enough to build an
+accurate, delta-specific table view without querying the database again.
+
+`gui/gui_widgets.py`, `MigrationOverview`: new `show_delta_result(data)` method — repurposes the two
+headline stat boxes ("Tables Migrated" → "Tables Touched", showing e.g. "5/7"; "Staging Match %" → "Rows
+Changed", showing the actual count) and populates the grid: `ratcatalogue` gets `Status="N update(s)"`,
+`Progress="✓ Success"` (or "⚠ Check log" if verified count doesn't match); the four always-refreshed
+reference tables get `Status="Refreshed (full)"`, `Progress="✓ Success"`; the two untouched tables get
+`Status="Not touched by Delta Sync"`. Needed to keep references to the stat `LabelFrame`s (not just their
+value labels) to relabel them — added `self.stat_frames` alongside the existing `self.stat_boxes`.
+`update_overview()` (the real Full-Sync-driven refresh) now resets both labels back to their normal text
+first, in case a delta view was showing.
+
+`gui/filemaker_gui.py`, `on_operation_status_safe()`: for `delta_sync` specifically, when `data` is present
+and shaped like the delta summary (`'manifest_advanced' in data` — same check `update_summary()` already
+uses), calls `show_delta_result()` instead of just skipping the refresh outright. `incremental_sync` (the
+older, non-delta operation) still just skips the refresh with no special view — it has no equivalent JSON
+summary to build one from.
+
+Verified with a headless smoke test: pushed a synthetic delta-sync-shaped `data` dict through
+`show_delta_result()` directly, confirmed every row and both relabeled headline stats match expectations;
+then called `update_overview()` with a normal full-sync-shaped payload and confirmed both labels reset back
+to "Tables Migrated"/"Staging Match %" correctly (proving the two views don't leak into each other).
+`py_compile`/pyright clean both platforms, no regressions (`git stash` diff empty).
+
+---
+
+### Round 9 (same session, same day) — a real app freeze: concurrent FileMaker ODBC access
+
+The app froze ("Not Responding") right after the user launched it and immediately clicked Delta Sync.
+Root-caused via the log files rather than guessed at (the child processes' own log files kept writing even
+while the GUI itself was frozen, since they're separate OS processes) — `logs/filemaker_extract_20260904.log`
+showed **two near-simultaneous, independent processes** both running `filemaker_extract_refactored.py
+--info-only --json`'s full connection-test sequence, timestamps only 5–70ms apart. Traced to a genuinely
+pre-existing bug in `ConnectionTester.test_all_connections()`: it has always called
+`test_filemaker_connection()` **and** `test_target_connection()` concurrently, each independently launching
+its own subprocess — even though a single `--info-only --json` response already reports *both* statuses in
+one payload. Wasteful but apparently harmless before today, since nothing made it fire reliably at exactly
+the moment a user might also start a real operation. Round 6's new startup auto-connection-test changed
+that: it now **guarantees** two concurrent FileMaker-touching subprocesses at every launch, and if the user
+acts quickly (exactly what happened — "launched, started demo"), Delta Sync's own FileMaker connection
+piles a third one on top. FileMaker Pro's ODBC driver does not reliably handle concurrent connections from
+a single desktop file, and apparently blocked badly enough to also stall the GUI's own Python process (a
+plausible mechanism: a native blocking ODBC call not releasing the GIL promptly during a real driver-level
+hang would starve the Tk main thread of GIL time too, not just the background thread that issued it).
+
+**Two fixes, addressing both the trigger and the root cause:**
+1. `gui/gui_operations.py`, `OperationManager`: new `self._subprocess_lock` — every `run_python_command()`
+   call now serializes through it before launching, regardless of caller (connection tests, status
+   refreshes, real sync operations all funnel through this one method). Always acquired from a background
+   thread (confirmed true for every current caller), so blocking here can never freeze the GUI itself — it
+   just makes a launch wait its turn instead of racing. This is the actual fix: no code path, present or
+   future, can trigger concurrent FileMaker/target subprocess access again.
+2. `ConnectionTester.test_all_connections()` rewritten to make exactly **one** `--info-only --json` call and
+   process both connection types from its single response (reusing the already-correctly-shaped
+   `_process_connection_result()`, which already reads `connection_status.filemaker`/`.target` from one
+   payload) — halves the FileMaker/target touch-time for every "Test Connections" click and the startup
+   auto-test, and removes a second, independent source of the same class of risk. `test_filemaker_connection()`/
+   `test_target_connection()` (used by the individual per-card "Test" buttons) are unchanged.
+
+Verified two ways: a live serialization test (two concurrent `run_python_command()` calls against a
+deliberately slow fake script, confirmed their execution windows never overlap — one fully finishes before
+the other starts) and a live call-count test (`test_all_connections()` now makes exactly 1 subprocess call,
+not 2, and both connection statuses still come back correctly from it). `py_compile`/pyright clean both
+platforms, no regressions.
+
+---
+
+### Session close — scope clarified; docs consolidated; committed
+
+Asked what the next big feature should be. First guess (cron/Task Scheduler automation for
+`run_incremental_sync.py`) was wrong — the user corrected it directly: **this repo is a transient,
+per-engagement migration tool**, not a permanent service. The real pattern: a client (RAT) provides desktop
+access to the FileMaker machine, the scripts get installed there, the migration runs during that on-site
+engagement. No persistent server context exists for automation to live in. The actual end goal is bigger
+than this repo: "getting the RAT people off old s/w onto the newer (Postgres/React Form/REST API/iOS,
+Android app)" — `filemaker_sync`'s job is the narrower "get the data in reliably" piece of that program.
+Whether/where the REST API/frontend work has started is genuinely unknown as of this session's close — asked
+the user, not yet answered. Saved to memory (`project_use_case_and_scope.md`) so this doesn't need
+re-explaining next session.
+
+Asked to commit everything and bring the docs current for both human and AI readers. Did three things:
+
+1. **Deleted two fully-stale handoff docs** (`HANDOFF_increment2.md`, `HANDOFF_loader_adoption.md`,
+   untracked, predating this worksheet) — both described work completed and superseded by Sessions 4–8;
+   keeping them around was exactly the kind of stale-duplicate clutter this project has already been bitten
+   by more than once this week.
+2. **Consolidated `CLAUDE.md`'s GUI section.** It had grown into nine near-duplicate "Session 13, same
+   day" paragraphs (one per round, chronologically appended) — accurate but unusable as a *current-state*
+   reference; a fresh reader had to read the whole chronological pile to find out where things actually
+   stand today. Rewrote it as a single "GUI status" summary organized by *topic* (script wiring, streaming,
+   layout, the two serious bugs, Migration Overview, polish, known limitations) instead of by session,
+   keeping the full blow-by-blow only in this file. Also refreshed the "Verified facts" row counts to
+   today's freshest live numbers (previously stale from Sessions 3–5) and fixed a couple of small
+   contradictions the day's changes had introduced (`config.toml`'s default profile description still said
+   `supabase` after Session 10 flipped it to `oci`).
+3. **This entry** — closing out Session 13's own header/focus to reflect all nine rounds, not just the
+   first three (which is what it said before this pass).
+
+No code changes in this entry — documentation and cleanup only. Committed and pushed at the user's request;
+see the commit message for the exact file list.
+
+---

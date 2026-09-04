@@ -40,6 +40,21 @@ class OperationManager:
         # Callback management
         self._callback_lock = threading.Lock()
         self._operation_callbacks = []
+
+        # Serializes every subprocess this manager launches -- connection
+        # tests (ConnectionTester), status refreshes (StatusManager), and
+        # real operations (run_operation_async) all funnel through
+        # run_python_command(), which acquires this before launching.
+        # FileMaker Pro's ODBC driver does not reliably handle concurrent
+        # connections from a single desktop file: confirmed live as a real
+        # app freeze when the new startup connection auto-test (itself
+        # launching two redundant subprocesses -- see test_all_connections())
+        # was still in flight when a Delta Sync was started, piling a third
+        # concurrent FileMaker-touching subprocess on top. Always acquired
+        # from a background thread (every run_python_command() caller already
+        # runs off the Tk main thread), so blocking here never freezes the GUI
+        # itself -- it just makes launches wait their turn.
+        self._subprocess_lock = threading.Lock()
         
         # Result queue for communication
         self._result_queue = queue.Queue(maxsize=10)
@@ -118,21 +133,26 @@ class OperationManager:
             # documented way these scripts are run outside the GUI.
             full_command = [sys.executable, str(script_path)] + cmd_args
             self.log_manager.log(LogLevel.DEBUG, "Command", f"Executing: {' '.join(full_command)}")
-            
+
             with PerformanceLogger(self.log_manager, "Command", description):
                 # Use shorter timeout for connection tests
                 actual_timeout = min(timeout, 60) if 'info-only' in cmd_args or 'migration-status' in cmd_args else timeout
-                
-                result = subprocess.run(
-                    full_command,
-                    capture_output=True,
-                    text=True,
-                    timeout=actual_timeout,
-                    cwd=Path.cwd()
-                )
-                
+
+                # Serialize against every other subprocess this manager might
+                # launch -- see _subprocess_lock's docstring in __init__ for
+                # why (confirmed live app freeze from concurrent FileMaker
+                # ODBC access otherwise). Safe to block: always called from a
+                # background thread, never the Tk main thread.
+                if not self._subprocess_lock.acquire(blocking=False):
+                    self.log_manager.log(LogLevel.DEBUG, "Command",
+                                          f"Waiting for another subprocess to finish before: {description}")
+                    self._subprocess_lock.acquire()
+                try:
+                    result = self._run_streaming(full_command, actual_timeout, description)
+                finally:
+                    self._subprocess_lock.release()
                 return self._process_command_result(result, description)
-        
+
         except subprocess.TimeoutExpired:
             error_msg = f"Command timed out after {timeout}s: {description}"
             self.log_manager.log(LogLevel.ERROR, "Command", error_msg)
@@ -141,24 +161,73 @@ class OperationManager:
             error_msg = f"Command exception: {description} - {str(e)}"
             self.log_manager.log(LogLevel.ERROR, "Command", error_msg)
             return {'success': False, 'error': str(e)}
-    
-    def _process_command_result(self, result: subprocess.CompletedProcess, description: str) -> Dict[str, Any]:
-        """Process command result with enhanced error handling"""
-        self.log_manager.log(LogLevel.DEBUG, "Command", f"Return code: {result.returncode}")
-        
-        # Log output (with length limits to prevent memory issues)
-        if result.stdout:
-            stdout_lines = result.stdout.split('\n')[:50]  # Limit to 50 lines
-            for line in stdout_lines:
+
+    def _run_streaming(self, full_command: List[str], timeout: int,
+                        description: str) -> subprocess.CompletedProcess:
+        """Run a subprocess and stream its output into the log system line-by-line
+        as it's produced, instead of buffering everything until the process exits
+        (the old subprocess.run(capture_output=True) approach -- a multi-minute
+        operation showed nothing at all in the log/progress UI until it finished).
+
+        stdout+stderr are merged (stderr=STDOUT): order doesn't matter for a live
+        feed, it avoids a two-pipe reader-thread deadlock, and it means normal
+        stderr chatter (tqdm's progress bar defaults to stderr and isn't an error)
+        no longer gets blanket-logged as ERROR -- log_subprocess_output() already
+        sniffs real severity from each line's own content.
+
+        Holds the live Popen on self._current_process so Stop Action
+        (cancel_current_operation) can actually terminate it -- previously that
+        attribute was never assigned, so Stop Action could never kill a running
+        subprocess.
+        """
+        process = subprocess.Popen(
+            full_command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, cwd=Path.cwd(),
+        )
+        assert process.stdout is not None  # guaranteed by stdout=PIPE above
+        self._current_process = process
+
+        timed_out = threading.Event()
+
+        def kill_on_timeout():
+            timed_out.set()
+            try:
+                process.terminate()
+                process.wait(timeout=5)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+
+        watchdog = threading.Timer(timeout, kill_on_timeout)
+        watchdog.start()
+        try:
+            lines: List[str] = []
+            # Text-mode pipes use universal-newline translation by default, which
+            # maps '\r' (tqdm's bar-update character) to '\n' on read same as a
+            # real line ending -- each tqdm tick naturally arrives as its own line.
+            for line in process.stdout:
+                line = line.rstrip('\n')
+                lines.append(line)
                 if line.strip():
                     self.log_manager.log_subprocess_output("Command-Output", line)
-        
-        if result.stderr:
-            stderr_lines = result.stderr.split('\n')[:20]  # Limit to 20 lines
-            for line in stderr_lines:
-                if line.strip():
-                    self.log_manager.log(LogLevel.ERROR, "Command-Error", line)
-        
+            returncode = process.wait()
+        finally:
+            watchdog.cancel()
+            self._current_process = None
+
+        if timed_out.is_set():
+            raise subprocess.TimeoutExpired(full_command, timeout)
+
+        return subprocess.CompletedProcess(full_command, returncode, stdout='\n'.join(lines), stderr='')
+
+    def _process_command_result(self, result: subprocess.CompletedProcess, description: str) -> Dict[str, Any]:
+        """Process command result with enhanced error handling. Output itself was
+        already streamed live by _run_streaming() -- this only handles the
+        return-code branch and JSON extraction."""
+        self.log_manager.log(LogLevel.DEBUG, "Command", f"Return code: {result.returncode}")
+
         if result.returncode == 0:
             self.log_manager.log(LogLevel.INFO, "Command", f"✓ Completed: {description}")
             
@@ -224,17 +293,6 @@ class OperationManager:
             self.log_manager.log(LogLevel.ERROR, "Command", f"Error extracting JSON: {e}")
             return None
     
-    def _load_export_path(self) -> str:
-        """Read export.path from config.toml (the same file the scripts read)."""
-        try:
-            import tomli
-            cfg = tomli.loads(Path('config.toml').read_text(encoding='utf-8'))
-            return str(cfg['export']['path'])
-        except Exception as e:
-            self.log_manager.log(LogLevel.WARNING, "Operation",
-                                 f"Could not read export.path from config.toml ({e}); defaulting to 'exports'")
-            return 'exports'
-
     def run_operation_async(self, operation: str, on_complete: Optional[Callable] = None) -> bool:
         """Run operation asynchronously"""
         # Check if already running
@@ -248,21 +306,35 @@ class OperationManager:
         
         # Operation commands
         # 'load_to_target' runs the second-stage normaliser (db_dml_loader.py) in
-        # dml_files mode against the export directory produced by 'Export to Files'.
+        # migration_schema mode -- reads whatever's currently in the rat_migration
+        # staging tables (populated by Full Sync/Incremental Sync/Delta Sync). The
+        # older dml_files mode (reading files from 'Export to Files') is NOT used
+        # here: it can't parse a realistic FileMaker export (see CLAUDE.md's Gotchas).
+        # --export-path is required by argparse regardless of mode but genuinely
+        # unused by migration_schema mode -- 'unused' matches how
+        # run_incremental_sync.py already calls this same entry point.
         # 'delta_sync' runs the real delta-driven sync (run_incremental_sync.py):
         # scan+diff -> extract just the new/changed rows -> load -> verify against
         # rat.catalog -> advance the manifest for exactly what committed. Distinct
         # from the older 'incremental_sync' above, which is just a plain extract
         # (no ddl regen) of the *whole* table -- not delta-driven at all.
-        export_path = self._load_export_path()
         operation_commands = {
-            'full_sync': ['--db-exp', '--ddl', '--dml'],
+            # --del-data: a "full" sync must start from an empty staging table,
+            # not append onto whatever's already there. Without it, repeated
+            # Full Sync runs silently accumulate duplicate rows in
+            # rat_migration.* (confirmed live: 3-4x row-count inflation after a
+            # few GUI test runs). The final rat.* schema is unaffected either
+            # way -- its upserts dedupe on natural keys -- but staging isn't
+            # protected the same way, and the GUI's own Migration Overview
+            # reads row counts straight from it, so the bloat was directly
+            # visible as a nonsensical "300%+ migrated".
+            'full_sync': ['--db-exp', '--ddl', '--dml', '--del-data'],
             'incremental_sync': ['--db-exp', '--dml'],
             'export_files': ['--fn-exp', '--ddl', '--dml'],
             'export_images': ['--get-images'],
             'test_connections': ['--info-only'],
             'migration_status': ['--migration-status', '--json'],
-            'load_to_target': ['--mode', 'dml_files', '--export-path', export_path,
+            'load_to_target': ['--mode', 'migration_schema', '--export-path', 'unused',
                                '--user-id', 'migration-gui'],
             'delta_sync': [],
         }
@@ -286,7 +358,9 @@ class OperationManager:
             """Thread function for running operations"""
             result = 'error'
             error_msg = None
-            
+            command_result = None
+            op_start_time = time.time()
+
             try:
                 cmd = operation_commands[operation]
                 self.log_manager.log(LogLevel.INFO, "Operation", f"Executing: {operation}")
@@ -303,11 +377,22 @@ class OperationManager:
                 else:
                     timeout = 60   # 1 minute for quick operations
 
+                # Data-moving operations (full_sync/incremental_sync/export_files/
+                # export_images) run the real, actively-maintained extract script.
+                # test_connections/migration_status stay on filemaker_extract_refactored.py
+                # deliberately -- its --info-only/--migration-status --json reporting
+                # layer has no equivalent in the real script. In practice the GUI's
+                # actual Test Connections/Update Dashboard buttons call
+                # ConnectionTester/StatusManager directly (bypassing operation_commands
+                # entirely), but these entries keep run_operation_async('test_connections'
+                # | 'migration_status') correct too, should anything ever call it that way.
                 operation_scripts = {
                     'load_to_target': 'db_dml_loader.py',
                     'delta_sync': 'run_incremental_sync.py',
+                    'test_connections': 'filemaker_extract_refactored.py',
+                    'migration_status': 'filemaker_extract_refactored.py',
                 }
-                script = operation_scripts.get(operation, 'filemaker_extract_refactored.py')
+                script = operation_scripts.get(operation, 'filemaker_extract.py')
                 command_result = self.run_python_command(cmd, f"{operation.replace('_', ' ').title()}", timeout, script=script)
                 
                 if command_result['success']:
@@ -333,8 +418,12 @@ class OperationManager:
                 self.log_manager.log(LogLevel.INFO, "Operation", f"🏁 {operation} finished: {result}")
                 
                 # Notify completion (safely)
+                duration = time.time() - op_start_time
+                op_data = command_result.get('data') if command_result else None
                 try:
-                    self._notify_callbacks_safe('complete', operation, {'result': result, 'error': error_msg})
+                    self._notify_callbacks_safe('complete', operation,
+                                                 {'result': result, 'error': error_msg,
+                                                  'duration': duration, 'data': op_data})
                 except Exception as e:
                     self.log_manager.log(LogLevel.ERROR, "Operation", f"Error in completion notification: {e}")
                 
@@ -579,31 +668,52 @@ class ConnectionTester:
                     self.log_manager.log(LogLevel.ERROR, "Connection", f"Error in callback: {cb_e}")
     
     def test_all_connections(self, callback: Optional[Callable] = None):
-        """Test both connections with proper sequencing"""
+        """Test both connections with a single --info-only --json call.
+
+        Was previously two separate, fully redundant subprocess launches
+        (test_filemaker_connection() + test_target_connection() run
+        concurrently) even though a single --info-only --json response
+        already reports both statuses in one payload -- confirmed live in
+        the log (near-identical timestamped duplicate lines from two
+        concurrent processes). Halves the FileMaker/target touch-time for
+        every "Test Connections" click and the startup auto-test, and
+        removes one whole source of concurrent-FileMaker-access risk (see
+        _subprocess_lock, which still protects against races with anything
+        else that might be running).
+        """
+        if not (self._test_locks['filemaker'].acquire(blocking=False)):
+            self.log_manager.log(LogLevel.WARNING, "Connection", "FileMaker test already in progress")
+            return
+        if not self._test_locks['target'].acquire(blocking=False):
+            self._test_locks['filemaker'].release()
+            self.log_manager.log(LogLevel.WARNING, "Connection", "Target test already in progress")
+            return
+
         self.log_manager.log(LogLevel.INFO, "Connection", "🔍 Testing all connections...")
-        
-        # Counter to track completion
-        completion_counter = {'count': 0}
-        completion_lock = threading.Lock()
-        
-        def on_test_complete(connection_type, status):
-            with completion_lock:
-                completion_counter['count'] += 1
-                
-                # Call callback for this connection
-                if callback:
-                    try:
-                        callback(connection_type, status)
-                    except Exception as e:
-                        self.log_manager.log(LogLevel.ERROR, "Connection", f"Error in callback: {e}")
-                
-                # If both tests completed, log summary
-                if completion_counter['count'] >= 2:
-                    self.log_manager.log(LogLevel.INFO, "Connection", "✓ All connection tests completed")
-        
-        # Start both tests concurrently (they have their own locking)
-        self.test_filemaker_connection(on_test_complete)
-        self.test_target_connection(on_test_complete)
+
+        def test_thread():
+            try:
+                result = self.operation_manager.run_python_command(
+                    ['--info-only', '--json'], "Test all connections", timeout=30,
+                )
+                for connection_type in ('filemaker', 'target'):
+                    self._process_connection_result(result, connection_type, callback)
+                self.log_manager.log(LogLevel.INFO, "Connection", "✓ All connection tests completed")
+            except Exception as e:
+                error_msg = f"Exception during connection test: {e}"
+                self.log_manager.log(LogLevel.ERROR, "Connection", error_msg)
+                for connection_type in ('filemaker', 'target'):
+                    self._update_connection_status(connection_type, False, error_msg)
+                    if callback:
+                        try:
+                            callback(connection_type, self.connection_status[connection_type])
+                        except Exception as cb_e:
+                            self.log_manager.log(LogLevel.ERROR, "Connection", f"Error in callback: {cb_e}")
+            finally:
+                self._test_locks['filemaker'].release()
+                self._test_locks['target'].release()
+
+        threading.Thread(target=test_thread, daemon=True, name="All-Connections-Test").start()
 
 
 class StatusManager:

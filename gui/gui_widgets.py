@@ -6,9 +6,12 @@ Custom widgets for the FileMaker Sync Dashboard
 """
 
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, scrolledtext
 from datetime import datetime
-from typing import Dict, Any, Callable
+from typing import Dict, Any, Callable, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from gui_logging import LogManager, LogEntry
 
 class StatusCard(ttk.Frame):
     """Custom widget for displaying connection status with test button and details"""
@@ -140,18 +143,20 @@ class MigrationOverview(ttk.Frame):
         
         # Create stat boxes - only Tables Done and Completion percentage
         self.stat_boxes = {}
+        self.stat_frames = {}  # kept so show_delta_result()/update_overview() can relabel them
         stat_configs = [
             ('tables_done', 'Tables Migrated'),
-            ('completion', 'Completion %')
+            ('completion', 'Staging Match %')
         ]
-        
+
         for i, (key, label) in enumerate(stat_configs):
             stat_frame = ttk.LabelFrame(stats_frame, text=label, padding=3)
             stat_frame.grid(row=0, column=i, padx=3, sticky='ew')
-            
+            self.stat_frames[key] = stat_frame
+
             value_label = ttk.Label(stat_frame, text="0", font=('Arial', 16, 'bold'))
             value_label.pack()
-            
+
             self.stat_boxes[key] = value_label
         
         # Configure grid weights for equal distribution
@@ -174,8 +179,14 @@ class MigrationOverview(ttk.Frame):
         self.table_tree.column('Status', width=100, minwidth=80)
         self.table_tree.column('Progress', width=80, minwidth=60)
         
+        # 'Target' is the internal column id (kept as-is -- it's referenced
+        # positionally elsewhere, e.g. update_overview()'s values= tuple);
+        # only the displayed heading text changes, to be honest about what
+        # this actually shows (rat_migration staging counts, not the final
+        # rat.* schema -- see the caption below the table).
+        column_headings = {'Target': 'Staging'}
         for col in columns:
-            self.table_tree.heading(col, text=col)
+            self.table_tree.heading(col, text=column_headings.get(col, col))
         
         # Scrollbar for treeview (only show when needed)
         scrollbar = ttk.Scrollbar(self.table_frame, orient='vertical', command=self.table_tree.yview)
@@ -183,13 +194,23 @@ class MigrationOverview(ttk.Frame):
         
         self.table_tree.pack(side='left', fill='both', expand=True)
         # Don't pack scrollbar initially - will show only when needed
-    
+
+        ttk.Label(
+            self, text="Reflects the last extract's staging snapshot -- Delta Sync intentionally narrows "
+                       "this to just the changed rows. See the summary above for what actually happened.",
+            font=('Arial', 8), foreground='gray', wraplength=460, justify='left',
+        ).pack(fill='x', padx=4, pady=(2, 0))
+
     def update_overview(self, data: Dict[str, Any]):
         """Update the overview with new data - AUTO-SIZING VERSION"""
         try:
+            # Restore the normal labels in case show_delta_result() last relabeled them.
+            self.stat_frames['tables_done'].configure(text='Tables Migrated')
+            self.stat_frames['completion'].configure(text='Staging Match %')
+
             # Extract summary data safely
             summary = data.get('summary', {})
-            
+
             # Update summary stats - ONLY essential ones
             tables_migrated = summary.get('tables_migrated', 0)
             total_tables = summary.get('total_tables', 0)
@@ -248,13 +269,104 @@ class MigrationOverview(ttk.Frame):
         except Exception as e:
             print(f"Error updating overview: {e}")
 
+    def show_delta_result(self, data: Dict[str, Any]):
+        """Populate with a Delta Sync-specific breakdown instead of the
+        source-vs-staging percentage view (which doesn't apply -- Delta Sync
+        deliberately doesn't leave staging as a full mirror). Built entirely
+        from run_incremental_sync.py's own already-parsed JSON summary, no
+        fresh query needed: Delta Sync always touches a known, fixed set of
+        tables -- ratcatalogue gets the actual delta, ratbuilders/ratroutes/
+        ratcollections/prompts get a full refresh every run regardless, and
+        ratcopyright/ratlabels aren't touched at all."""
+        try:
+            total_changed = data.get('new', 0) + data.get('changed', 0)
+            verified = data.get('verified', 0)
+            touched = 5 if total_changed or 'manifest_advanced' in data else 0
+
+            self.stat_frames['tables_done'].configure(text='Tables Touched')
+            self.stat_boxes['tables_done'].configure(text=f"{touched}/7")
+            self.stat_frames['completion'].configure(text='Rows Changed')
+            self.stat_boxes['completion'].configure(text=str(total_changed))
+
+            for item in self.table_tree.get_children():
+                self.table_tree.delete(item)
+            self.table_tree.configure(height=7)
+
+            cat_status = f"{total_changed} update(s)" if total_changed else "No changes"
+            cat_progress = "✓ Success" if verified == total_changed else "⚠ Check log"
+            self.table_tree.insert('', 'end', values=(
+                'ratcatalogue', '—', str(verified), cat_status, cat_progress))
+            for t in ('ratbuilders', 'ratroutes', 'ratcollections', 'prompts'):
+                self.table_tree.insert('', 'end', values=(t, '—', '—', 'Refreshed (full)', '✓ Success'))
+            for t in ('ratcopyright', 'ratlabels'):
+                self.table_tree.insert('', 'end', values=(t, '—', '—', 'Not touched by Delta Sync', '—'))
+        except Exception as e:
+            print(f"Error showing delta result: {e}")
+
+class Tooltip:
+    """Minimal hover tooltip -- tkinter has no built-in widget for this.
+    Shows a small borderless window near the cursor on <Enter>, destroys it
+    on <Leave>. Standard pattern, no external dependency."""
+
+    def __init__(self, widget, text: str):
+        self.widget = widget
+        self.text = text
+        self.tip_window = None
+        widget.bind('<Enter>', self.show)
+        widget.bind('<Leave>', self.hide)
+
+    def show(self, _event=None):
+        if self.tip_window or not self.text:
+            return
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 5
+        self.tip_window = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(
+            tw, text=self.text, background='#ffffe0', relief='solid', borderwidth=1,
+            font=('Arial', 9), padx=6, pady=3, wraplength=280, justify='left',
+        )
+        label.pack()
+
+    def hide(self, _event=None):
+        if self.tip_window:
+            self.tip_window.destroy()
+            self.tip_window = None
+
+
 class QuickActions(ttk.Frame):
     """Widget for quick action buttons - UPDATED WITH STOP ACTION AND UPDATE DASHBOARD"""
-    
+
+    BUTTON_TOOLTIPS = {
+        'Full Sync': "Full extract + load of every table. Clears staging first (--del-data), so it "
+                     "always ends up mirroring FileMaker exactly. Can take several minutes for the full "
+                     "catalogue.",
+        'Incremental Sync': "A plain re-extract of every table -- doesn't clear staging first or "
+                             "regenerate DDL. Despite the name, this is NOT delta-driven -- see Delta "
+                             "Sync for that.",
+        'Delta Sync': "Scans FileMaker for records new or changed since the last sync, extracts and "
+                      "loads only those rows, verifies them against the target, and advances the sync "
+                      "manifest. The recommended way to pick up recent edits.",
+        'Load to Target': "Runs the loader against whatever's currently in the staging tables -- doesn't "
+                           "touch FileMaker. Useful if a load step failed partway after an extract.",
+        'Export to Files': "Extracts FileMaker data to local DML/DDL files on disk, without touching the "
+                            "target database.",
+        'Export Images': "Extracts photo images from FileMaker to local files.",
+        'Test Connections': "Checks that both the FileMaker source and the target database are reachable "
+                             "right now.",
+        'View Logs': "Opens the full activity log viewer -- search, filter, and sort every log entry "
+                     "from this session.",
+        'Update Dashboard': "Refreshes the Migration Overview and connection status above.",
+        'Stop Action': "Cancels the currently running operation, if any. Only works for Full/Incremental/"
+                        "Delta Sync, Load to Target, and Export operations -- not Test Connections or "
+                        "Update Dashboard.",
+    }
+
     def __init__(self, parent, **kwargs):
         super().__init__(parent, **kwargs)
         self.create_widgets()
-    
+
     def create_widgets(self):
         # NO header/title - just buttons directly
         
@@ -288,7 +400,8 @@ class QuickActions(ttk.Frame):
                 button1 = ttk.Button(row_frame, text=text, width=18)
                 button1.pack(side='left', padx=(0, 5), fill='x', expand=True)
                 self.action_buttons[text] = button1
-                
+                Tooltip(button1, self.BUTTON_TOOLTIPS.get(text, ''))
+
                 # Special styling for Stop Action button
                 if text == 'Stop Action':
                     button1.configure(state='disabled')  # Initially disabled
@@ -299,7 +412,8 @@ class QuickActions(ttk.Frame):
                 button2 = ttk.Button(row_frame, text=text, width=18)
                 button2.pack(side='right', padx=(5, 0), fill='x', expand=True)
                 self.action_buttons[text] = button2
-                
+                Tooltip(button2, self.BUTTON_TOOLTIPS.get(text, ''))
+
                 # Special styling for Stop Action button
                 if text == 'Stop Action':
                     button2.configure(state='disabled')  # Initially disabled
@@ -387,13 +501,146 @@ class StatusBar(ttk.Frame):
     def update_health(self, error_count: int):
         """Update health indicator based on error count"""
         self.error_count_label.configure(text=f"{error_count} errors")
-        
+
         if error_count == 0:
             self.health_label.configure(text="● System Healthy", foreground='green')
         elif error_count < 5:
             self.health_label.configure(text="⚠ Minor Issues", foreground='orange')
         else:
             self.health_label.configure(text="✗ System Issues", foreground='red')
-        
+
         # Update timestamp
         self.last_update_label.configure(text=f"Updated: {datetime.now().strftime('%H:%M:%S')}")
+
+
+class LiveStatusPanel(ttk.Frame):
+    """Simple, always-live scrolling log view for the Status tab -- deliberately
+    no search/filter/sort (that stays in LogViewerWindow's separate popup, which
+    this doesn't replace), just a level filter (to cut volume) and a completed-
+    operation duration summary. Just: what's happening right now, auto-scrolled."""
+
+    MAX_LINES = 500
+    LEVEL_ORDER = {'DEBUG': 10, 'INFO': 20, 'WARNING': 30, 'ERROR': 40, 'CRITICAL': 50}
+    FILTER_OPTIONS = {'All': 0, 'Info+': 20, 'Warning+': 30, 'Errors only': 40}
+
+    def __init__(self, parent, log_manager: 'LogManager', **kwargs):
+        super().__init__(parent, **kwargs)
+        self.log_manager = log_manager
+        self._line_count = 0
+        self._filter_threshold = self.FILTER_OPTIONS['Info+']  # default: hide DEBUG chatter
+        self.create_widgets()
+        self._load_history()
+        self.log_manager.add_callback(self._on_new_entry)
+
+    def create_widgets(self):
+        header = ttk.Frame(self)
+        header.pack(fill='x', pady=(0, 4))
+
+        ttk.Label(header, text="Show:").pack(side='left')
+        self.filter_var = tk.StringVar(value='Info+')
+        filter_combo = ttk.Combobox(
+            header, textvariable=self.filter_var, values=list(self.FILTER_OPTIONS.keys()),
+            state='readonly', width=12,
+        )
+        filter_combo.pack(side='left', padx=(4, 0))
+        filter_combo.bind('<<ComboboxSelected>>', self._on_filter_changed)
+
+        self.summary_label = ttk.Label(header, text="", foreground='gray')
+        self.summary_label.pack(side='right')
+
+        self.text = scrolledtext.ScrolledText(
+            self, wrap=tk.WORD, state='disabled', font=('Consolas', 9),
+        )
+        self.text.pack(fill='both', expand=True)
+
+        # Same palette as LogViewerWindow's log_tree tag_configure(), for visual
+        # consistency between the popup and this panel.
+        self.text.tag_configure('ERROR', background='#ffcccc')
+        self.text.tag_configure('CRITICAL', background='#ff9999')
+        self.text.tag_configure('WARNING', background='#ffffcc')
+        self.text.tag_configure('DEBUG', foreground='gray')
+        self.text.tag_configure('INFO', foreground='black')
+
+    def _on_filter_changed(self, _event=None):
+        self._filter_threshold = self.FILTER_OPTIONS[self.filter_var.get()]
+        self.text.configure(state='normal')
+        self.text.delete('1.0', 'end')
+        self.text.configure(state='disabled')
+        self._line_count = 0
+        self._load_history()
+
+    def _load_history(self):
+        # get_recent_logs() returns newest-first; reverse for chronological append.
+        for entry in reversed(self.log_manager.get_recent_logs(limit=self.MAX_LINES)):
+            self._append(entry)
+
+    def _on_new_entry(self, entry: 'LogEntry'):
+        """Called from whatever thread produced the log entry -- marshal the
+        actual Text-widget mutation onto the Tk main loop, same principle
+        LogViewerWindow uses for its own callback. Catches broadly, not just
+        tk.TclError: this runs as a LogManager callback, and any exception
+        that escapes here propagates into LogManager's own error handling --
+        which must never happen (see gui_logging.py's _add_log_entry/
+        _notify_callbacks for why that path is deadlock-sensitive)."""
+        try:
+            self.after(0, lambda: self._append(entry))
+        except Exception:
+            pass  # widget destroyed, or a Tk threading edge case -- never let
+                   # this propagate back into LogManager's callback chain
+
+    def _append(self, entry: 'LogEntry'):
+        if self.LEVEL_ORDER.get(entry.level, 20) < self._filter_threshold:
+            return
+        try:
+            self.text.configure(state='normal')
+            timestamp = entry.timestamp.split('T')[-1].split('.')[0]  # HH:MM:SS
+            self.text.insert('end', f"{timestamp} [{entry.level}] {entry.message}\n", entry.level)
+            self._line_count += 1
+            if self._line_count > self.MAX_LINES:
+                self.text.delete('1.0', '2.0')
+                self._line_count -= 1
+            self.text.see('end')
+            self.text.configure(state='disabled')
+        except tk.TclError:
+            pass  # widget destroyed (window closing) -- nothing to update
+
+    @staticmethod
+    def _format_duration(duration: float) -> str:
+        if duration >= 60:
+            return f"{int(duration // 60)}m {duration % 60:.0f}s"
+        return f"{duration:.1f}s"
+
+    def set_running(self, operation: str):
+        """Called when an operation starts -- see FileMakerSyncGUI.on_operation_status_safe()."""
+        try:
+            self.summary_label.configure(
+                text=f"Running: {operation.replace('_', ' ').title()}...", foreground='#1a6fbd')
+        except tk.TclError:
+            pass
+
+    def update_summary(self, operation: str, result: str, duration: float, data: Optional[Dict] = None):
+        """Called when an operation completes -- see FileMakerSyncGUI.on_operation_status_safe().
+
+        data: the operation's parsed JSON result, if any (e.g. run_incremental_sync.py's
+        summary for delta_sync). Only used when it's shaped like that summary
+        (has 'manifest_advanced') -- a cheap, specific-enough check that won't
+        misfire on Test Connections/Migration Status's differently-shaped JSON.
+        Every other operation falls back to the plain duration-only text.
+        """
+        label = operation.replace('_', ' ').title()
+        duration_text = self._format_duration(duration)
+        detail = ""
+        if data and 'manifest_advanced' in data:
+            if data.get('delta', 0) == 0:
+                detail = " — nothing to do"
+            else:
+                detail = f" — {data.get('real_changes', 0)} changed, {data.get('verified', 0)} verified"
+        try:
+            if result == 'success':
+                self.summary_label.configure(
+                    text=f"✓ {label} completed in {duration_text}{detail}", foreground='#1a7f37')
+            else:
+                self.summary_label.configure(
+                    text=f"✗ {label} failed after {duration_text}{detail}", foreground='#c53030')
+        except tk.TclError:
+            pass

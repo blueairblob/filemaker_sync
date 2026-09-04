@@ -53,6 +53,7 @@ sync itself correct and runnable on demand, not automatic.
 """
 from __future__ import annotations
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -130,9 +131,18 @@ def main() -> int:
 
         if not delta:
             report.line("Nothing to do.")
+            print(json.dumps({
+                "new": len(result["new"]), "changed": len(result["changed"]), "delta": 0,
+                "verified": 0, "rejected": 0, "false_positives": 0, "real_changes": 0,
+                "manifest_advanced": 0,
+            }))
             return 0
         if args.dry_run:
             report.line(f"--dry-run: would extract/load {len(delta)} row(s), stopping here.")
+            print(json.dumps({
+                "new": len(result["new"]), "changed": len(result["changed"]), "delta": len(delta),
+                "dry_run": True,
+            }))
             return 0
 
         profile = dsm.resolve_active_profile(cfg, args.target_profile)
@@ -191,6 +201,11 @@ def main() -> int:
         report.kv("real changes:", len(verified) - false_positives)
         report.line("")
         report.line(f"Manifest advanced for {len(mark)} row(s).")
+        print(json.dumps({
+            "new": len(result["new"]), "changed": len(result["changed"]), "delta": len(delta),
+            "verified": len(verified), "rejected": len(rejected), "false_positives": false_positives,
+            "real_changes": len(verified) - false_positives, "manifest_advanced": len(mark),
+        }))
     finally:
         pg.close()
 

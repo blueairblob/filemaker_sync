@@ -28,7 +28,11 @@ class FileMakerMigrationManager:
         self.logger = self._setup_logging()
         
         # Initialize components
-        self.config_manager = ConfigManager(getattr(args, 'config_file', 'config.toml'))
+        self.config_manager = ConfigManager(
+            getattr(args, 'config_file', 'config.toml'),
+            target_profile=getattr(args, 'target_profile', None),
+            db_type=getattr(args, 'db_type', 'supabase'),
+        )
         self.config = self.config_manager.load_config()
         
         # Override DSN if provided in args
@@ -83,11 +87,23 @@ class FileMakerMigrationManager:
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
         
-        # Console handler for debug mode
-        if getattr(self.args, 'debug', False):
-            console_handler = logging.StreamHandler(sys.stdout)
-            console_handler.setFormatter(formatter)
-            logger.addHandler(console_handler)
+        # Console handler: always attached, independent of debug mode -- see
+        # filemaker_extract.py's setup_logging() for why (same fix, same reasoning).
+        # UTF-8 wrap on Windows -- MISSING from this file's first pass at this fix
+        # (Session 13), which removed the debug-mode gate but not the encoding
+        # fix that made that safe in filemaker_extract.py/db_dml_loader.py. That
+        # gap made things WORSE, not better: the handler went from "off by
+        # default" to "always on but crashes on any '✓'" -- confirmed live via
+        # `filemaker_extract_refactored.py --migration-status --json` reproducing
+        # UnicodeEncodeError on this file's own `logger.info(f"✓ FileMaker: ...")`
+        # calls (this file's only ✓ usage, unlike the other two scripts).
+        if sys.platform == 'win32':
+            import codecs
+            sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer)
+            sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer)
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
         
         logger.info(f"Logging initialized - {log_file}")
         return logger
@@ -924,6 +940,8 @@ def get_args():
     parser.add_argument("--get-schema", action="store_true", default=False, help="Get source database schema")
     parser.add_argument("-r", "--max-rows", type=str, default='all', help="Maximum rows to return")
     parser.add_argument("--db-type", type=str, choices=['mysql', 'supabase'], default='supabase', help="Target database type")
+    parser.add_argument("--target-profile", type=str, help="Target DB profile from config.toml's "
+                        "[database.target.<profile>] (overrides config/env RAT_TARGET_PROFILE)")
     parser.add_argument("--fn-fmt", type=str, choices=['single', 'multi'], default='multi', help="File export format")
     parser.add_argument("--start-from", type=str, help="Start migration from specific image_no")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")

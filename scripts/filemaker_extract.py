@@ -140,18 +140,23 @@ def setup_logging(debug_mode=False):
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
-    # Set up console handler with UTF-8 encoding if in debug mode
-    if debug_mode:
-        import sys
-        # Force UTF-8 encoding for stdout if on Windows
-        if sys.platform == 'win32':
-            import codecs
-            sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer)
-            sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer)
-        
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setFormatter(formatter)
-        logger.addHandler(console_handler)
+    # Console handler: always attached, independent of debug_mode -- that flag
+    # only controls the logger's overall level (DEBUG vs INFO). Without this,
+    # running the script directly (or from the GUI, which streams this output
+    # live) shows nothing but tqdm's progress bar; every logger.info() line
+    # ("Getting a query count", "Has N rows", "Inserted N rows", etc.) went
+    # only to the log file. Confirmed live: piping this script's own output
+    # without --debug showed no logger output at all.
+    import sys
+    # Force UTF-8 encoding for stdout if on Windows
+    if sys.platform == 'win32':
+        import codecs
+        sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer)
+        sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer)
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
 
     return logger, log_file
 

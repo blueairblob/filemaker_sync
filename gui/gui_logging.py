@@ -126,7 +126,16 @@ class LogManager:
         
         # Console handler - conditional
         if self.console_logging:
-            console_handler = logging.StreamHandler(sys.stdout)
+            # Force UTF-8 so a '✓'/em-dash/etc. in a log message doesn't crash
+            # the handler on Windows' default (cp1252/'charmap') console codepage
+            # -- confirmed live: this raised a UnicodeEncodeError repeatedly once
+            # Session 12's live output streaming started pushing every subprocess
+            # line (and this module's own '✓ ...' messages) through here.
+            console_stream = sys.stdout
+            if sys.platform == 'win32':
+                import codecs
+                console_stream = codecs.getwriter('utf-8')(sys.stdout.buffer)
+            console_handler = logging.StreamHandler(console_stream)
             console_handler.setLevel(numeric_level)
             console_handler.setFormatter(console_formatter)
             root_logger.addHandler(console_handler)
@@ -161,30 +170,46 @@ class LogManager:
     
     def _add_log_entry(self, entry: LogEntry):
         """Thread-safe method to add log entry to memory storage"""
+        should_notify = False
         with self._log_lock:
             # Check if we should include this log based on our filtering
             if self.should_log_level(entry.level):
                 self.memory_logs.append(entry)
-                
+
                 # Trim if too many logs
                 if len(self.memory_logs) > self.max_memory_logs:
                     self.memory_logs.pop(0)
-                
-                # Notify callbacks in a thread-safe way
-                self._notify_callbacks(entry)
-    
+                should_notify = True
+
+        # Notify callbacks OUTSIDE self._log_lock (was inside it before -- a
+        # callback that raises would hit _notify_callbacks' except-handler,
+        # which used to log via self.logger.error(...); that re-enters this
+        # same method through the standard logging module's handler chain and
+        # tries to reacquire self._log_lock (a plain, non-reentrant Lock) from
+        # the same thread -- a real deadlock, not hypothetical: this froze the
+        # whole app ("Not Responding") once Session 13's LiveStatusPanel added
+        # a second callback that could legitimately be invoked concurrently
+        # from two background threads (Test Connections runs FileMaker/target
+        # checks concurrently) for the first time.
+        if should_notify:
+            self._notify_callbacks(entry)
+
     def _notify_callbacks(self, entry: LogEntry):
         """Thread-safe callback notification"""
         with self._callback_lock:
             callbacks_to_call = self.log_callbacks.copy()
-        
+
         # Call callbacks outside the lock to avoid deadlocks
         for callback in callbacks_to_call:
             try:
                 callback(entry)
             except Exception as e:
-                # Use standard logging to avoid recursion
-                self.logger.error(f"Error in log callback: {e}")
+                # Deliberately NOT self.logger.error(...) here -- that would
+                # re-enter the standard logging module's handler chain, which
+                # calls back into this LogManager (see _add_log_entry above).
+                # Bypass logging entirely so a misbehaving callback can never
+                # cause recursion, regardless of where the lock is held.
+                print(f"Error in log callback: {e}", file=sys.stderr)
     
     def should_log_level(self, level: str) -> bool:
         """Check if a log level should be recorded based on current configuration"""
@@ -323,7 +348,11 @@ class LogManager:
         # Add console handler if enabled
         if enable:
             numeric_level = getattr(logging, self.log_level, logging.INFO)
-            console_handler = logging.StreamHandler(sys.stdout)
+            console_stream = sys.stdout
+            if sys.platform == 'win32':
+                import codecs
+                console_stream = codecs.getwriter('utf-8')(sys.stdout.buffer)
+            console_handler = logging.StreamHandler(console_stream)
             console_handler.setLevel(numeric_level)
             formatter = logging.Formatter(
                 '%(asctime)s %(levelname)-8s [%(name)s] %(message)s',

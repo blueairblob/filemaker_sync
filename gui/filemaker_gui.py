@@ -18,7 +18,7 @@ import time
 
 # Import our modules
 from gui_logging import LogManager, LogLevel, PerformanceLogger
-from gui_widgets import StatusCard, MigrationOverview, QuickActions, StatusBar
+from gui_widgets import StatusCard, MigrationOverview, QuickActions, StatusBar, LiveStatusPanel
 from gui_operations import OperationManager, ConnectionTester, StatusManager
 from gui_logviewer import LogViewerWindow, LogStatsWindow
 
@@ -63,6 +63,11 @@ class FileMakerSyncGUI:
         
         # Start auto-refresh with delay
         self.root.after(2000, self.start_auto_refresh)
+
+        # Check connections shortly after the window renders, rather than
+        # leaving both cards stuck on "Not tested" until a manual click or a
+        # config save incidentally triggers one.
+        self.root.after(500, self.safe_test_all_connections)
         
         # Log startup
         self.log_manager.log(LogLevel.INFO, "Application", "FileMaker Sync Dashboard started")
@@ -214,29 +219,48 @@ class FileMakerSyncGUI:
         self.target_status_card.pack(fill='x')
     
     def create_main_content(self, parent):
-        """Create main content area"""
-        content_frame = ttk.Frame(parent)
-        content_frame.pack(fill='both', expand=True)
-        
+        """Create main content area: an Actions tab (Quick Actions buttons) and a
+        Status tab (Migration Overview + a live-scrolling log panel). Starting any
+        action auto-switches to the Status tab -- see safe_run_operation()."""
         # Configure style for larger section fonts
         style = ttk.Style()
         style.configure('Large.TLabelframe.Label', font=('Arial', 12, 'bold'))
-        
-        # Migration Overview (removed internal refresh button)
-        migration_frame = ttk.LabelFrame(content_frame, text="Migration Overview", 
-                                        style='Large.TLabelframe', padding=5)
-        migration_frame.pack(fill='both', expand=True, pady=(0, 8))
-        
-        self.migration_overview = MigrationOverview(migration_frame)
-        self.migration_overview.pack(fill='both', expand=True)
-        
-        # Quick Actions (with new buttons)
-        actions_frame = ttk.LabelFrame(content_frame, text="Quick Actions", 
+
+        self.notebook = ttk.Notebook(parent)
+        self.notebook.pack(fill='both', expand=True)
+
+        # --- Actions tab ---
+        actions_tab = ttk.Frame(self.notebook, padding=5)
+        self.notebook.add(actions_tab, text='Actions')
+
+        # fill='both', expand=True (not just 'x'): with Migration Overview moved
+        # to the Status tab, this tab has nothing else to fill the window --
+        # letting the bordered box itself grow avoids a large dead void below it.
+        actions_frame = ttk.LabelFrame(actions_tab, text="Quick Actions",
                                       style='Large.TLabelframe', padding=5)
-        actions_frame.pack(fill='x')
-        
+        actions_frame.pack(fill='both', expand=True)
+
         self.quick_actions = QuickActions(actions_frame)
         self.quick_actions.pack(fill='x')
+
+        # --- Status tab ---
+        status_tab = ttk.Frame(self.notebook, padding=5)
+        self.notebook.add(status_tab, text='Status')
+        self.status_tab = status_tab
+
+        migration_frame = ttk.LabelFrame(status_tab, text="Migration Overview",
+                                        style='Large.TLabelframe', padding=5)
+        migration_frame.pack(fill='x', pady=(0, 8))
+
+        self.migration_overview = MigrationOverview(migration_frame)
+        self.migration_overview.pack(fill='both', expand=True)
+
+        activity_frame = ttk.LabelFrame(status_tab, text="Live Activity",
+                                       style='Large.TLabelframe', padding=5)
+        activity_frame.pack(fill='both', expand=True)
+
+        self.live_status_panel = LiveStatusPanel(activity_frame, self.log_manager)
+        self.live_status_panel.pack(fill='both', expand=True)
     
     def create_menu_bar(self):
         """Create the menu bar"""
@@ -304,10 +328,30 @@ class FileMakerSyncGUI:
             try:
                 if status == 'start':
                     self.quick_actions.show_progress(operation.replace('_', ' ').title())
+                    self.live_status_panel.set_running(operation)
                 elif status == 'complete':
                     self.quick_actions.hide_progress()
-                    # Schedule refresh after operation completes
-                    self.root.after(2000, self.safe_refresh_migration_status)
+                    op_result = result or {}
+                    self.live_status_panel.update_summary(
+                        operation, op_result.get('result', 'error'), op_result.get('duration', 0),
+                        op_result.get('data'))
+                    # Auto-refresh Migration Overview -- but NOT after delta_sync or the
+                    # older incremental_sync, since neither leaves staging holding a full
+                    # mirror of FileMaker (delta_sync deliberately narrows it to just the
+                    # changed rows; incremental_sync doesn't clear staging first either).
+                    # Refreshing after those would overwrite good, representative numbers
+                    # with a staging snapshot that looks broken at a glance (a big "2%"/
+                    # "Partial" reading right after a clean, successful Delta Sync) even
+                    # with the caption explaining it -- confirmed confusing live. Leaving
+                    # whatever was last shown (from a real Full Sync, or "not yet run") is
+                    # more honest than replacing it with a delta-scoped number.
+                    if operation not in ('delta_sync', 'incremental_sync'):
+                        self.root.after(2000, self.safe_refresh_migration_status)
+                    elif operation == 'delta_sync' and op_result.get('data') and \
+                            'manifest_advanced' in op_result['data']:
+                        # Show what Delta Sync actually touched instead of a
+                        # source-vs-staging percentage that doesn't apply here.
+                        self.migration_overview.show_delta_result(op_result['data'])
             except Exception as e:
                 self.log_manager.log(LogLevel.ERROR, "GUI", f"Error updating operation UI: {e}")
         
@@ -415,8 +459,9 @@ class FileMakerSyncGUI:
                 
                 # Confirm operation
                 def confirm_and_run():
-                    if messagebox.askyesno("Confirm Operation", 
+                    if messagebox.askyesno("Confirm Operation",
                                           f"Are you sure you want to run {operation.replace('_', ' ')}?"):
+                        self.notebook.select(self.status_tab)
                         self.operation_manager.run_operation_async(operation)
                 
                 self.schedule_gui_update(confirm_and_run)
@@ -588,7 +633,7 @@ class FileMakerSyncGUI:
                 results = {
                     'timestamp': datetime.now().isoformat(),
                     'config_file_exists': Path('config.toml').exists(),
-                    'script_file_exists': Path('filemaker_extract_refactored.py').exists(),
+                    'script_file_exists': Path('scripts/filemaker_extract.py').exists(),
                     'logs_dir_exists': Path('logs').exists(),
                     'thread_safe_mode': True
                 }
@@ -628,7 +673,7 @@ Timestamp: {results['timestamp']}
 
 File Checks:
 ✓ config.toml exists: {results['config_file_exists']}
-✓ filemaker_extract_refactored.py exists: {results['script_file_exists']}
+✓ scripts/filemaker_extract.py exists: {results['script_file_exists']}
 ✓ logs directory exists: {results['logs_dir_exists']}
 
 Connection Status:

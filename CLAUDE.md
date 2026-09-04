@@ -1,9 +1,7 @@
 # CLAUDE.md
 
 Operational guide for working in this repo with Claude Code. **Read this first every session.**
-For the running history and open threads, read `devlog/worksheet.md` (Sessions 1–8).
-Increment 2 (its handoff doc, `HANDOFF_increment2.md`) is complete as of Session 8 — see "Current focus"
-below and `devlog/worksheet.md` Session 8 for what's next.
+For the running history and open threads, read `devlog/worksheet.md` (Sessions 1–13).
 
 ---
 
@@ -11,8 +9,19 @@ below and `devlog/worksheet.md` Session 8 for what's next.
 
 The **Railway Archive Trust (RAT)** is a volunteer charity digitising a large railway-photograph
 archive. Volunteers hand-enter each photo's details into a bespoke **FileMaker Pro** app that has no
-formal support and an opaque form design. The brief: export that data into **Supabase (PostgreSQL)**
-and provide a way to browse it.
+formal support and an opaque form design. The brief: export that data into **Supabase (PostgreSQL)**.
+
+**This is a transient, per-engagement migration tool, not a permanent service** (clarified directly by the
+user, Session 13, correcting an assumption that cron/Task Scheduler automation was a natural next step).
+The typical use: a client (RAT) provides desktop access to the machine where FileMaker Pro lives, the
+scripts get installed there, and the migration runs during that on-site engagement — there's no persistent
+server context for this to live in as a background job. Delta Sync's value in that context is catching late
+edits during a multi-day engagement without repeating a full multi-hour sync, not "keep two systems in sync
+forever." The **real end goal**, per the user's own words: "getting the RAT people off old s/w onto the
+newer (Postgres/React Form/REST API/iOS, Android app)." This repo's job is narrower than that whole
+program — get FileMaker's data reliably into Postgres, with a GUI reliable enough to run during a transient
+on-site engagement. The REST API/React frontend/mobile apps RAT will actually use afterward are a separate,
+not-yet-scoped piece of work (not started in this repo as of Session 13) — don't assume it belongs here.
 
 **Internalise this — it drives every decision:** the source data is error-prone (hand-entered) and the
 source schema is partly opaque. We can't fully trust the source. This is a *data rescue*, not a clean
@@ -41,16 +50,80 @@ FileMaker Pro
 ```
 
 The tkinter GUI (`gui/`) is a `subprocess` wrapper around the CLIs. It contains **no** migration logic.
-**`gui/gui_operations.py`'s script-path resolution was broken from before this worksheet started until
-Session 9** — it resolved scripts as bare filenames relative to the GUI's launch directory, but every
-script lives under `scripts/`; fixed to `Path.cwd() / 'scripts' / script`. Has a "Delta Sync" button wired
-to `scripts/run_incremental_sync.py` (Session 9) — distinct from the older, differently-behaved
-"Incremental Sync" button (`operation_commands['incremental_sync']`, a plain full-table extract, not
-delta-driven despite the name). **The GUI still has no target-profile picker** (Session 9's finding) — every GUI operation runs against
-`config.toml`'s `active_profile`, which is now `oci` (flipped from `supabase` — see below), so this no
-longer silently fails, but there's still no way to pick `supabase` from the GUI if it's ever needed again.
-`gui/filemaker_extract_refactored.py` is a stale June-2025 fork, missing every Session 5–8 fix — known,
-deliberately untouched. See `devlog/worksheet.md` Session 9.
+
+### GUI status: reliable and demo-ready (Sessions 9–13)
+
+Every layer was broken or stale at some point across Sessions 9–13 and is now fixed and live-verified —
+not just code-reviewed, but confirmed against the real running app, several times catching a fix that
+looked right but wasn't. Full session-by-session blow-by-blow (each bug's exact reproduction and fix) lives
+in `devlog/worksheet.md` Sessions 9–13; this is the current-state summary.
+
+- **Script wiring & config resolution** (Session 9, 11): path resolution was resolving scripts as bare
+  filenames relative to launch directory instead of `scripts/`; `scripts/config_manager.py`'s
+  `_parse_config()` still read a pre-profile `config.toml` shape that stopped existing at Session 5
+  (confirmed live crash: `Missing required configuration key: 'db'`) — this, not staleness, was the real
+  reason Test Connections/Migration Status were broken. Data-moving operations
+  (`full_sync`/`incremental_sync`/`export_files`/`export_images`) now route to the real, maintained
+  `scripts/filemaker_extract.py`; `test_connections`/`migration_status` stay on
+  `filemaker_extract_refactored.py` (its class-based `--json` diagnostic layer has no equivalent in the
+  real script). "Load to Target" switched from the broken `--mode dml_files` to the working
+  `--mode migration_schema`. The dead `gui/config_manager.py` + `database_connections.py` +
+  `filemaker_extract_refactored.py` trio (confirmed unreachable — nothing imports them, subprocess
+  `sys.path[0]` always resolves to `scripts/`) was deleted outright.
+- **Live output streaming** (Session 12): operations used to buffer all subprocess output until
+  completion (a multi-minute Full Sync showed nothing but a progress bar). Now streams line-by-line via
+  `Popen` with merged stdout/stderr. Found a second, independent bug along the way: three scripts'
+  console log handlers only ever activated in `--debug` mode (which the GUI never passes), so even a live
+  stream had nothing to show — fixed to always attach, `debug_mode` now only affects logger *level*.
+  Side effect fixed for free: `OperationManager._current_process` was declared but never assigned, so Stop
+  Action could never actually kill a running subprocess.
+- **Tabbed layout + live panel** (Session 13): window split into an Actions tab (Quick Actions buttons)
+  and a Status tab (Migration Overview + new `LiveStatusPanel` — a color-coded, level-filterable, always-live
+  view fed by the same `LogManager` callback the streaming fix produces). Starting any action
+  auto-switches to the Status tab. Does **not** replace the separate `LogViewerWindow` popup
+  (search/filter/sort) — that's still available via "View Logs", the new tab is a simpler at-a-glance view.
+- **A real deadlock, found and fixed** (Session 13): `LiveStatusPanel` was the first `LogManager` callback
+  ever invoked concurrently from two background threads — exposed a latent bug where
+  `_add_log_entry()` called `_notify_callbacks()` **while holding** a non-reentrant `_log_lock`, and the
+  except-handler's own error logging re-entered the same method trying to reacquire it. Froze the whole
+  app on the first concurrent trigger. Reproduced mechanically (a standalone test hung at the exact
+  expected point on the old code, ran clean on the fix) before trusting it.
+- **A real app freeze, found and fixed** (Session 13): `ConnectionTester.test_all_connections()` has
+  always launched two fully redundant subprocesses (one `--info-only --json` call already reports both
+  statuses). Harmless before, but the new startup auto-connection-test (below) made it fire at every
+  launch, and an immediate operation click could pile a third concurrent FileMaker-touching subprocess on
+  top — FileMaker Pro's ODBC driver doesn't reliably handle concurrent access from one desktop file, and
+  the resulting hang stalled the GUI's own process too. Fixed at the root: `OperationManager` gained
+  `self._subprocess_lock`, serializing **every** subprocess launch (connection tests, status refreshes,
+  real operations — everything funnels through `run_python_command()`) regardless of caller, so this class
+  of bug can't recur; always acquired from a background thread, so it can never freeze the GUI itself. Also
+  fixed the redundancy: `test_all_connections()` now makes exactly one subprocess call.
+- **Migration Overview reflects reality, not a misleading percentage**: its "Target"/"Completion %"
+  always meant "current `rat_migration` staging row count vs FileMaker" — a fine proxy when only Full Sync
+  populated staging, actively misleading once Delta Sync deliberately narrows staging to just the delta.
+  Relabeled honestly (`'Target'` → `'Staging'`, `'Completion %'` → `'Staging Match %'`, with a caption);
+  no longer auto-refreshes with staging numbers after Delta Sync/Incremental Sync at all (leaves whatever
+  was last shown, which is more honest than a number that looks broken); and now shows a genuinely useful
+  **delta-aware breakdown** instead (`MigrationOverview.show_delta_result()`) — built entirely from Delta
+  Sync's own JSON summary, no new query: `ratcatalogue` shows `"N update(s)"`/`"✓ Success"`, the four
+  always-refreshed reference tables show `"Refreshed (full)"`, the two untouched tables are labeled as such.
+- **Delta Sync's own result is surfaced**: `run_incremental_sync.py` now emits a JSON summary
+  (new/changed/verified/manifest-advanced) on every exit path — the GUI's summary label shows it directly
+  ("✓ Delta Sync completed in 37.5s — 1 changed, 1 verified") instead of just a duration.
+- **Polish**: hover tooltips on every Quick Action button, written specifically to clear up "Incremental
+  Sync" (not delta-driven despite the name) vs "Delta Sync" (the real one) confusion; connection cards
+  self-test ~500ms after launch instead of staying "Not tested" until a manual click or config save;
+  `LiveStatusPanel` gained a level filter (`All`/`Info+`/`Warning+`/`Errors only`, default `Info+`) that
+  filters the *view* only, `LogManager`'s own history is untouched.
+
+**Known, accepted limitations** (deliberate choices, not bugs):
+- No GUI target-profile picker — every operation runs against `config.toml`'s `active_profile` (now `oci`,
+  see below); no way to pick `supabase` from the GUI without editing the file.
+- Stop Action only cancels Full/Incremental/Delta Sync, Load to Target, and Export operations — Test
+  Connections/Update Dashboard use a separate code path it doesn't touch.
+- Migration Overview's numbers reflect `rat_migration` staging, not the final `rat.*` schema — no clean
+  1:1 table mapping exists for `ratcopyright`/`ratlabels`/`prompts` to do a proper `rat.*`-comparison
+  redesign; parked as a separate, bigger piece of work.
 
 **`config.toml`'s `active_profile` is now `oci`** (was `supabase`). The old cloud project's pooler no
 longer resolves the tenant (`FATAL: tenant/user postgres.kmoehqdowgdupzdxtbei not found` — found live in
@@ -157,9 +230,15 @@ demand, not automatic.
 
 ## Verified facts (from live diagnostics - trust these)
 
-- **Migration is whole.** Exact counts: `catalog` / `catalog_metadata` / `usage` = **141,243**;
-  `builder` 516, `photographer` 270, `collection` 65, `country` 117, `route` 2863, `location` 14176,
-  `organisation` 1519, `catalog_builder` 116530, `picture_metadata` 141420, `rat_migration.sync_manifest` 141244.
+- **Migration is whole.** Freshest live counts on `oci` (Session 13, 2026-09-04, post-cleanup — supersedes
+  older per-session figures below, kept for historical context): `catalog` / `catalog_metadata` / `usage` =
+  **141,244**; `builder` 518 (517 real + `'UNK'` sentinel); `catalog_builder` 116,538; `organisation` 1,520;
+  `location` 14,178; `route` 2,874; `photographer` 270; `collection` 66; `picture_metadata` 0 (needs local
+  image files, none present in any session so far). `rat_migration.*` staging tables now exactly match the
+  live FileMaker source row-for-row (no accumulated duplication — see "GUI status" above for the bug that
+  caused and then fixed that). Older snapshot (Sessions 3–5, `catalog` **141,243**, `builder` 516, `route`
+  2863, `location` 14176, `organisation` 1519, `catalog_builder` 116530, `picture_metadata` 141420 — that
+  last figure was from the *original* `supabase` cloud target, not `oci`, and hasn't been reconciled).
   (Ignore `pg_stat_user_tables.n_live_tup` - reads 0 on never-analyzed tables; use exact `count(*)`.)
 - **Builder's natural key is `code`, NOT `name`.** `builder.code` is `NOT NULL UNIQUE` (already enforced);
   `name` is nullable. Config confirms: `ratbuilders = ['"Builder code"']`.
@@ -231,9 +310,11 @@ and committed. All `postgresql://` URLs must wrap the password in `url_quote()`.
   see the Windows System DSN (`rat`). **Postgres-only work runs fine from WSL directly, confirmed live
   (Session 5)** - the loader/manifest/probe's target-DB side needs no Windows detour, only the
   FileMaker-facing side does.
-- Two target profiles exist in `config.toml`: `supabase` (the original cloud project, default) and `oci`
-  (self-hosted, Tailscale). Pass `--target-profile oci` (or set `RAT_TARGET_PROFILE=oci`) to point any of
-  the three scripts at it. See Secrets above for the profile's password env var.
+- Two target profiles exist in `config.toml`: `supabase` (the original cloud project — unreachable as of
+  Session 9, pooler no longer resolves the tenant) and `oci` (self-hosted, Tailscale — **the default** since
+  Session 13, and the live-tested target since Session 5). Pass `--target-profile supabase` (or set
+  `RAT_TARGET_PROFILE=supabase`) to point any of the three scripts at the old cloud project if it's ever
+  revived. See Secrets above for each profile's password env var.
 - **WSL's `python.exe` interop genuinely works for a full live run** (Session 5, confirmed against the real
   FileMaker file and a live OCI load, not just theory) — no separate Windows session needed, this session's
   agent ran Stage 1 + Stage 2 directly via `python.exe scripts/...` from WSL.
@@ -300,15 +381,26 @@ python.exe scripts/fm_metadata_probe.py --selftest
 
 ## Current focus
 
-**The `oci` target bring-up is done (Session 5), fast (Session 6), and genuinely idempotent (Session 7).**
-Full archive loaded live, sync manifest baselined, `--preview` clean, both pipeline stages run in minutes
-instead of hours, and re-running Stage 2 no longer accumulates duplicates on unresolved natural-key
-lookups (see "Loader status" above). `python.exe` interop works directly from this WSL environment — no
-separate Windows session needed to drive Stage 1 against the real FileMaker file.
+**The pipeline is stable, fast, idempotent, and delta-sync-capable (Sessions 5–8) — and the GUI is now
+genuinely reliable on top of it (Sessions 9–13).** `oci` is the live, fully-loaded target. Both pipeline
+stages run in minutes, not hours. Re-running Stage 2 never accumulates duplicates on unresolved
+natural-key lookups. `scripts/run_incremental_sync.py` is a real, live-proven "sync now" (see
+"Delta-driven incremental sync" above). The GUI's every layer — script wiring, config resolution, output
+streaming, layout, and two genuinely serious bugs (a deadlock, a concurrent-ODBC-access freeze) — has been
+found and fixed against the real running app, not just reviewed; see "GUI status" above for the current
+state and `devlog/worksheet.md` Sessions 9–13 for the full history. As of Session 13 this has all been
+confirmed working live by the user, including the delta-aware Migration Overview breakdown.
 
-**Increment 2 is done (Sessions 5–8).** The real loader is adopted, `catalog_builder`'s incremental key is
-idempotent end-to-end, and `scripts/run_incremental_sync.py` is a real, live-proven "sync now" — see
-"Delta-driven incremental sync" above. Smaller threads: `picture_metadata` untested against real images (no
-local files); the 16 flagged source records (FileMaker-side, re-confirmed via the `oci` manifest baseline);
-cron/Task Scheduler wiring for the new orchestrator (deliberately out of scope). Detail in
-`devlog/worksheet.md`.
+**Scope reminder (Session 13): this repo is a transient, per-engagement migration tool**, not a permanent
+service — see "What this project is" above. Don't propose making it more "always-on" (cron, background
+services); that solves a problem this project doesn't have. The next big step for the *overall* RAT
+program is likely the REST API/React frontend/mobile apps RAT will actually use post-migration — but
+whether/where that work has started, or whether it belongs in this repo at all, is **not yet established**
+(asked the user, not yet answered as of Session 13's close).
+
+Smaller open threads: no GUI target-profile picker; Migration Overview's full `rat.*`-comparison redesign
+(parked, no clean table mapping); `picture_metadata` untested against real images (no local files); the 16
+flagged source records (FileMaker-side); `--mode dml_files` parser rewrite (low priority,
+`migration_schema` mode works); `requirements.txt`'s `pandas==2.1.4` pin (no Python 3.13 wheel);
+`PicaLocoBackend`/`picaloco` rebrand (explicitly gated until stable — arguably close now, still not done).
+Full detail in `devlog/worksheet.md`.
