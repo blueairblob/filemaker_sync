@@ -1348,3 +1348,158 @@ No code changes in this entry — documentation and cleanup only. Committed and 
 see the commit message for the exact file list.
 
 ---
+
+## Session 14 — 2026-09-06 — App-layer kickoff: `picaloco_web` planned; `mobile_catalog_view` and the missing images resolved
+
+**Focus:** Session 13 closed with the app-layer question open ("whether/where the REST API/frontend work has
+started... not yet answered"). This session answered it: the client wants a much simpler public web
+search/browse tool than the over-specced, unfinished `trainpixelfolio` mobile app, keyed on `image_no`. Planned
+and began Phase-0-verifying a new sibling repo, `picaloco_web`, to build it. **Note for future sessions:** an
+earlier attempt at this same conversation was lost to a desktop power outage before anything was written down
+— this entry, the updated plan file, and new memory files exist specifically so that doesn't happen again.
+**Status:** planning complete and user-approved; Phase 0 spike (verify the data/image story before writing UI
+code) mostly done, live DDL (recreating `mobile_catalog_view` on `oci`) approved but not yet executed as of
+this entry.
+
+---
+
+### Context
+
+Three sibling repos make up the whole picture, confirmed this session (not all previously documented here,
+since they live outside this repo):
+- `filemaker_sync` (this repo) — the migration pipeline, stable, not to be touched by this work.
+- `trainpixelfolio` — a React Native/Expo mobile app ("PicaLoco"), over-specced (cart, favourites, auth,
+  admin back-office) and unfinished; already has `ENABLE_AUTHENTICATION/CART/ADMIN: false` feature flags,
+  i.e. the mobile team independently reached the same "strip this down" conclusion.
+- `picaloco_rest` — not a custom backend, just a Vercel-hosted Swagger UI mirror of Supabase's OpenAPI spec.
+
+The client's actual ask, per the user: a simple public browser-based search/browse tool for the photo
+archive, keyed on `image_no`, styled cleanly ("akin to good Apple design policies"). Recommended building
+this as a new, much smaller web app rather than finishing the mobile app first — directly matches what was
+asked, sidesteps fixing cart/auth/admin scope nobody wants yet, and can reuse `trainpixelfolio`'s existing
+Supabase query logic as a reference.
+
+---
+
+### Decisions
+
+| Decision | Rationale | Alternatives Considered |
+|---|---|---|
+| New sibling repo `picaloco_web` (user-confirmed), not a subfolder of `trainpixelfolio` or a full replacement of it | Different tooling (web bundler vs Expo/RN metro); leaves the mobile app untouched in case it's revisited | Subfolder in trainpixelfolio (mixes RN/web deps); replace trainpixelfolio entirely (loses it as reference/fallback) |
+| Stack: Vite + React + TS + Tailwind + shadcn/ui + react-router + `@supabase/supabase-js` + `@tanstack/react-query` | Two routes, one data source, no SSR/SEO need that would justify Next.js; Vite deploys to Vercel same as `picaloco_rest` already does | Next.js (only worth it if indexable per-photo SEO pages become a real requirement later) |
+| Audience is **public** internet, not just RAT staff on Tailscale (user-confirmed) | Real infra consequence: `oci`'s backend is Tailscale-only today | Tailscale-only tool (would have been simpler, but isn't what was asked) |
+| Recreate `mobile_catalog_view` on `oci` from the **recovered original SQL** (found on the old cloud project's dashboard), not reconstructed from guesswork | User pulled the exact `pg_get_viewdef` output from the old `dev` schema on Supabase.com — every column matches `rat.*` 1:1 except `search_vector` (never migrated) | Guessing the join shape from `FilterModal.tsx`'s query usage alone (would have been close but not exact) |
+| Images: **split sources** — metadata/search stays on `oci`/`rat`; images load from a separate, already-public Supabase project's Storage, no file copying | That project (`tvucfqzldbcghtxddtmq`, found in `trainpixelfolio` git history) already has 1,003 real thumbnails, publicly fetchable with zero auth, right now | Copying files into `oci`'s (currently empty) Storage bucket first (unnecessary extra work for no benefit) |
+
+---
+
+### Findings
+
+- **`mobile_catalog_view` genuinely does not exist on `oci`** (confirmed live: zero views in the `rat`
+  schema). `trainpixelfolio` was built against a view that was apparently only ever created on the old cloud
+  project, never carried over when the data migrated to `oci`.
+- **The old cloud project (`kmoehqdowgdupzdxtbei`, `filemaker_sync`'s documented "supabase" profile) is
+  confirmed dead, not just paused** — direct-connect host `db.kmoehqdowgdupzdxtbei.supabase.co` doesn't even
+  resolve in DNS (stronger signal than the previously-known pooler "tenant not found" error). Its dashboard
+  is still reachable via browser login, though (different subsystem than direct Postgres).
+- **A third, previously-undocumented Supabase project exists**: `tvucfqzldbcghtxddtmq.supabase.co`, found via
+  `git log -p -- trainpixelfolio/.env` (commit "7. Add pictures working"). It's alive, has a `dev` schema
+  with the same catalog data (treat as a frozen early-development snapshot, not a live source), and — the
+  useful part — a public `picaloco` storage bucket with **1,003 real thumbnail `.webp` files** under
+  `images/`, fetchable with zero auth. Coverage: `arc`(591) `alb`(113) `ab`(128) `aj`(43) `ae`(30) `agb`(52)
+  `adgp`(28) `albsa`(18) — ~0.7% of the 141,244 catalog rows have a real image today; the rest need a
+  placeholder state, not a broken image.
+- **Concrete (not just theoretical) security finding on `oci`**: the `anon` Postgres role already has schema
+  `USAGE` on `rat` and table `SELECT` (read-only — no write grants, better than initially feared) on every
+  `rat` table, with **zero RLS anywhere**. `rat.catalog` includes `valuation` (numeric) and `owners_ref`
+  (varchar) columns that must never be exposed publicly. The recovered `mobile_catalog_view` SQL already
+  excludes both, confirming the original design was privacy-conscious — the fix is to expose only that view
+  publicly (via Tailscale Funnel, once stood up) and never grant `anon` direct access to raw `rat.catalog`.
+- `trainpixelfolio/.env`'s CRLF line endings broke naive `curl`/shell env-var use the same way this repo's
+  own docs already warn about elsewhere — strip `\r` before use.
+- A real, harmless pre-existing bug in `trainpixelfolio/src/components/FilterModal.tsx`: its builder/works-
+  number filter does a jsonb containment check on `builder_id`, but the view's `builders` array only ever
+  carries `builder_name`/`builder_code` — that filter could never have matched anything. Not fixed (out of
+  scope, mobile app untouched), just noted so `picaloco_web`'s port doesn't repeat it (filter on
+  `builder_code` instead).
+
+---
+
+### Outcome
+
+A full implementation plan for `picaloco_web` was designed (two Explore agents + one Plan agent), reviewed,
+and approved by the user; saved at `/home/trevour/.claude/plans/linked-puzzling-phoenix.md` (outside this
+repo — a Claude Code plan file, not a repo artifact) and kept updated as Phase 0 findings came in, so it's
+the authoritative next-step reference regardless of chat continuity. Two of Phase 0's four items are
+resolved (the view's real SQL recovered; the image story solved via the third project); the `CREATE VIEW`
+against live `oci` is written and user-approved but not yet run as of this entry (next action). Tailscale
+Funnel for public reachability and the anon-grant/RLS hardening remain outstanding. No code exists yet in a
+`picaloco_web` repo — that repo hasn't been created on disk yet.
+
+---
+
+### Open Threads
+
+- [ ] Run the recreated `mobile_catalog_view` + `GRANT SELECT ... TO anon` against live `oci`, then verify.
+- [ ] Stand up Tailscale Funnel on the `oci` host for public reachability; confirm Vercel's edge can actually
+  reach it once live (don't assume).
+- [ ] Harden `anon`'s grants so the public path only ever reaches `mobile_catalog_view`, not raw `rat.catalog`
+  (the raw-table `SELECT` grant already exists today and is currently only "protected" by Tailscale).
+- [ ] Confirm the `tvucfqzldbcghtxddtmq` project's plan won't auto-pause it from inactivity (Supabase free
+  tier does this) — check its dashboard.
+- [x] ~~Scaffold the actual `picaloco_web` repo~~ — **done, same day.** See update below.
+
+**Update, same session, continued:**
+- Tailscale Funnel stood up on `huey` (`tailscale funnel --bg http://100.124.0.62:8000`, run by the
+  user after the tailnet admin enabled Funnel at `login.tailscale.com/f/funnel`) — confirmed publicly
+  reachable via a fetch from outside the tailnet entirely (Anthropic's own infra got a real `401`,
+  not a connection failure).
+- `anon`'s grants hardened: `REVOKE SELECT ON rat.catalog, rat.catalog_metadata, rat.catalog_builder,
+  rat.usage, rat.picture_metadata FROM anon` (run by the user via Supabase Studio's SQL editor,
+  `http://huey.taila2eeb2.ts.net:3000` — confirmed running as a container on the same host). Verified
+  live: `anon` now only has `SELECT` on `mobile_catalog_view` + the small lookup tables.
+- `picaloco_web` scaffolded at `work_picaloco_dev/picaloco_web/` (Vite + React + TS + Tailwind 4 +
+  react-router + supabase-js + react-query) — not git-initialized yet, not deployed yet. Full
+  search/browse/detail flow built and type-checks/builds clean; **not yet visually verified in a
+  browser** — this sandbox has no usable Chrome for the Playwright MCP tool (needs `sudo` to install
+  at a fixed path), so the user needs to click through it themselves (`npm run dev`). Two
+  infra-changing commands (the `tailscale funnel` call and the `REVOKE`) were blocked by Claude
+  Code's auto-mode safety classifier when attempted directly (SSH / direct DB write) — the user ran
+  both manually instead, which is now the established pattern for this kind of change here.
+- Note for future sessions: `REVOKE`/`GRANT`/`CREATE VIEW` DDL against live `oci` and any command
+  that changes public network exposure (Funnel) reliably get blocked when attempted directly from a
+  Claude Code session — plan to hand the exact command to the user rather than expect to run it.
+- **Shipped and user-confirmed working live**, same day: git-initialized, pushed to
+  `github.com/blueairblob/picaloco_web` (public), deployed to Vercel
+  (`https://picaloco-web.vercel.app`, token-auth'd CLI deploy — GitHub auto-connect during `vercel
+  link` failed silently, so it's a one-off deploy, not yet auto-deploying on push). User's own
+  screenshot of the live site: searching `ab000` correctly returned 6 real archive photos with real
+  thumbnails rendering (`ab0002` "Kingham", `ab0006` "Ruabon 1962-09-29", etc.) — the first real
+  end-to-end proof, not just isolated API checks. `picaloco_web` Session 1 (its own devlog, if it
+  gets one) starts from here.
+- [ ] *(Carried, unchanged, `filemaker_sync`-side)* everything already open as of Session 13: `--mode
+  dml_files` parser rewrite; GUI target-profile picker; `picture_metadata` untested against real images;
+  `requirements.txt`'s `pandas==2.1.4` pin; the 16 flagged source records; `PicaLocoBackend`/`picaloco`
+  rebrand (still gated on stability, unaffected by this session's app-layer work).
+
+**Final update, same session — real-browser verification, one more bug found and fixed, and a
+DevOps manual written:** once a working Chrome was available for browser automation (`npx
+playwright install chrome`, run by the user — not `sudo npx ...`, which breaks nvm's PATH under
+`sudo`'s restricted `secure_path`), the live site was click-tested directly rather than just via
+curl. Found and fixed one real, plan-flagged bug: direct deep-links (e.g. sharing a link to
+`/photo/ab0002`, a fresh load rather than in-app navigation) 404'd on Vercel — a Vite SPA needs an
+explicit rewrite-to-`index.html` rule that wasn't present; added `picaloco_web/vercel.json`, pushed,
+reverified fixed. Found and **deferred** (not blocking, search unaffected): the `Location`/
+`Organisation`/`Route` facet-filter dropdowns are silently capped at ~1,000 options each by
+PostgREST's default row limit, against real counts of ~14,178/~1,520/~2,874 — `Category`/`Country`/
+`Collection`/`Photographer` are all small enough to be unaffected. Also wrote `picaloco_web/DEVOPS.md`,
+a comprehensive from-scratch rebuild/redeploy manual (system map across all three Supabase projects,
+the exact view/grants/Funnel SQL and commands, Vercel deploy gotchas actually hit, a troubleshooting
+table) — written deliberately secret-free since that repo is public.
+
+**`picaloco_web` is now live, git-connected for auto-deploy, and user-verified working**:
+https://picaloco-web.vercel.app. `filemaker_sync` itself had zero code changes this session — all
+work was on the shared `oci` database (additive view + tightened grants) and in the new sibling
+repo.
+
+---

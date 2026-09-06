@@ -393,10 +393,24 @@ confirmed working live by the user, including the delta-aware Migration Overview
 
 **Scope reminder (Session 13): this repo is a transient, per-engagement migration tool**, not a permanent
 service — see "What this project is" above. Don't propose making it more "always-on" (cron, background
-services); that solves a problem this project doesn't have. The next big step for the *overall* RAT
-program is likely the REST API/React frontend/mobile apps RAT will actually use post-migration — but
-whether/where that work has started, or whether it belongs in this repo at all, is **not yet established**
-(asked the user, not yet answered as of Session 13's close).
+services); that solves a problem this project doesn't have.
+
+**Update (Session 14): the app-layer question is answered, built, and shipped — in a sibling repo, not
+here.** The client's actual ask turned out to be much simpler than the existing `trainpixelfolio` mobile
+app (over-specced, unfinished): a public web search/browse tool for the archive, keyed on `image_no`. A new
+sibling repo, **`picaloco_web`**, is **live at https://picaloco-web.vercel.app** (Vite + React + TS +
+Tailwind + react-router + `@supabase/supabase-js` + React Query), querying `oci`'s `rat` schema through a
+recreated `rat.mobile_catalog_view` (it didn't exist on `oci`; recovered from the old cloud project's
+dashboard and recreated — see `picaloco_web/DEVOPS.md` for the exact SQL if it ever needs rebuilding). Two
+things worth knowing if you're touching `oci` from *this* repo's side: (1) that view now exists, additive,
+doesn't affect the migration pipeline; (2) `anon`'s grants on `rat` were **tightened this session** — it now
+only has `SELECT` on `mobile_catalog_view` + the small lookup tables, *not* raw `rat.catalog` (whose
+`valuation`/`owners_ref` columns must never be public) — if a future `filemaker_sync` change needs `anon`
+to read a different `rat` table directly, that's a deliberate grant now, not an accidental default. `oci`
+is also now publicly reachable (Tailscale Funnel), not Tailscale-only — factor that in if `oci`'s exposure
+surface ever matters to this repo's own work. Full detail in `devlog/worksheet.md`
+Session 14. `picaloco_rest` (a third sibling repo) is not a custom backend, just a Vercel-hosted Swagger UI
+mirror — not directly relevant to any of this.
 
 Smaller open threads: no GUI target-profile picker; Migration Overview's full `rat.*`-comparison redesign
 (parked, no clean table mapping); `picture_metadata` untested against real images (no local files); the 16
