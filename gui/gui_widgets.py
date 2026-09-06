@@ -353,6 +353,8 @@ class QuickActions(ttk.Frame):
         'Export to Files': "Extracts FileMaker data to local DML/DDL files on disk, without touching the "
                             "target database.",
         'Export Images': "Extracts photo images from FileMaker to local files.",
+        'Upload Images': "Uploads locally-exported images (run Export Images first) to the target's "
+                          "Supabase Storage bucket. Needs the target connection, not FileMaker.",
         'Test Connections': "Checks that both the FileMaker source and the target database are reachable "
                              "right now.",
         'View Logs': "Opens the full activity log viewer -- search, filter, and sort every log entry "
@@ -383,6 +385,7 @@ class QuickActions(ttk.Frame):
             ('Load to Target', 'target_only'),
             ('Export to Files', 'source_only'),
             ('Export Images', 'source_only'),
+            ('Upload Images', 'target_only'),
             ('Test Connections', 'none'),
             ('View Logs', 'none'),
             ('Update Dashboard', 'none'),  # NEW: Moved from refresh button
@@ -459,6 +462,7 @@ class QuickActions(ttk.Frame):
             'Load to Target': 'normal' if target_connected else 'disabled',
             'Export to Files': 'normal' if fm_connected else 'disabled',
             'Export Images': 'normal' if fm_connected else 'disabled',
+            'Upload Images': 'normal' if target_connected else 'disabled',
             'Test Connections': 'normal',
             'View Logs': 'normal',
             'Update Dashboard': 'normal',

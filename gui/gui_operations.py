@@ -332,6 +332,10 @@ class OperationManager:
             'incremental_sync': ['--db-exp', '--dml'],
             'export_files': ['--fn-exp', '--ddl', '--dml'],
             'export_images': ['--get-images'],
+            # Pushes whatever export_images already wrote locally up to oci's Storage.
+            # Run order matters: Export Images -> Upload Images -> Load to Target (see
+            # upload_images_oci.py's own docstring).
+            'upload_images': [],
             'test_connections': ['--info-only'],
             'migration_status': ['--migration-status', '--json'],
             'load_to_target': ['--mode', 'migration_schema', '--export-path', 'unused',
@@ -372,6 +376,8 @@ class OperationManager:
                     timeout = 300  # 5 minutes for long operations
                 elif operation == 'export_images':
                     timeout = 600  # 10 minutes for image export
+                elif operation == 'upload_images':
+                    timeout = 600  # 10 minutes: a few thousand small files over HTTP
                 elif operation == 'delta_sync':
                     timeout = 600  # 10 minutes: scan+diff, targeted extract, load, verify
                 else:
@@ -389,6 +395,7 @@ class OperationManager:
                 operation_scripts = {
                     'load_to_target': 'db_dml_loader.py',
                     'delta_sync': 'run_incremental_sync.py',
+                    'upload_images': 'upload_images_oci.py',
                     'test_connections': 'filemaker_extract_refactored.py',
                     'migration_status': 'filemaker_extract_refactored.py',
                 }

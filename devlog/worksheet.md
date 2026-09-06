@@ -1503,3 +1503,120 @@ work was on the shared `oci` database (additive view + tightened grants) and in 
 repo.
 
 ---
+
+## Session 15 — 2026-09-06 — Build the image-upload pipeline to sever the old cloud project
+
+**Focus:** `picaloco_web`'s images currently come from an old, unrelated Supabase.com cloud project.
+The client wants everything hosted on `oci` instead. Build both a one-off migration of what's already
+there and a durable pipeline for future FileMaker image exports to reach `oci` automatically.
+**Status:** `completed`. All 1,499 real archive images migrated to `oci`, verified byte-identical;
+`picaloco_web` switched over and redeployed; the old cloud project is retired from this system
+entirely. The durable "Upload Images" GUI pipeline is built and ready for future FileMaker exports.
+
+---
+
+### Context
+
+The user recalled writing "a script to push images up... using a postgres importer for speed" —
+investigation found the real explanation: `scripts/db_dml_loader.py` already contained
+`upload_images_to_supabase()`, a **dead, never-called, non-functional** stub (calls
+`SELECT storage.upload(...)`, which isn't a real Postgres function — Storage is an HTTP service) —
+plus an orphaned `--upload-images` CLI flag that was never wired to it either. That's almost
+certainly the abandoned attempt being half-remembered. No working upload tooling existed anywhere
+(confirmed via exhaustive search, including `trainpixelfolio` and deleted git history).
+
+---
+
+### Decisions
+
+| Decision | Rationale | Alternatives Considered |
+|---|---|---|
+| Two separate scripts: `migrate_storage_images_from_cloud.py` (one-off, not GUI-wired) and `upload_images_oci.py` (durable, GUI-wired) | Different lifecycles — the migration is a cutover run once; the upload step recurs every time images are exported | One combined script with a mode flag (would conflate a one-off tool with an ongoing pipeline step) |
+| Plain HTTPS REST for both, not the S3-compatible protocol | ~1,500 files at a few KB each is a trivial payload; S3 would need rotating `oci`'s still-default `dev`/`dev` S3 credentials first (deferred, user's call) plus new SDK/signing code, for no real benefit at this volume | S3 protocol (reserved for a hypothetical future bulk scenario) |
+| `service_role`, never `anon`, for all Storage writes | Matches this system's existing anon-is-read-only philosophy, already applied to `rat`'s Postgres grants this week | Using `anon` for uploads (would require loosening grants we just tightened) |
+| `db_dml_loader.py`'s `file_location` built deterministically from `image_no`, not confirmed against a live upload check | `image_no`→filename→URL is already a trusted 1:1 convention elsewhere in this exact function; a per-row Storage check would reintroduce the N+1 pattern Session 6 eliminated | Verifying each URL against Storage before writing it (correct-but-slow) |
+| Deleted the dead `upload_images_to_supabase()` and its orphaned `--upload-images` flag | Confirmed non-functional and unreferenced — a dead end, not a starting point | Trying to fix it in place (would still be the wrong approach — HTTP, not SQL) |
+
+---
+
+### Findings
+
+- **A real bug, found building the migration script, not guessed**: the old cloud project's Storage
+  `list` endpoint does **not** shrink its page size once an offset runs past the real end of the
+  data — it kept returning full 1000-item pages past offset 20,000+ in live testing, so an
+  offset-loop trusting "got fewer than `limit` back" as its stop condition spins forever. Confirmed
+  by direct testing, not inferred. Fixed by switching to a single request with a generous limit
+  (20,000) instead of paginating — the dataset is a few thousand short filenames, trivially small
+  for one JSON response.
+- **The old cloud bucket's image count changed mid-session**: first counted at ~1,003 real files
+  (Session 14), now confirmed at **~1,499**, entirely from growth in the `arc` prefix (591→1,087;
+  every other prefix unchanged). Something added ~496 more `arc`-prefixed images to that project
+  during the intervening hours — worth asking the user whether that was deliberate. `picaloco_web`'s
+  `README.md`/`DEVOPS.md` updated to reflect this and flag that the count may keep moving.
+- `oci`'s Storage: confirmed live via SSH — `STORAGE_BACKEND=file` (local disk backend), zero buckets
+  exist yet, a `service_role` key already exists for the instance (`SUPABASE_SERVICE_KEY` on the
+  `supabase-studio` container) but its value isn't in this repo. The S3-compatible protocol
+  (`/storage/v1/s3`) is available but still on Supabase's default `dev`/`dev` credentials — flagged
+  as a standing risk now the host is public via Funnel; user explicitly deferred rotating it as a
+  separate task, unrelated to this work (this plan doesn't use the S3 protocol at all).
+- `config.toml` gained a `[storage]` section (bucket, public_url, allowed_mime_types, file_size_limit
+  — secret-free, matches the project's existing config/secrets split). `.env` gained
+  `RAT_OCI_SERVICE_KEY` (blank, needs the user to fill in) and `RAT_OLD_CLOUD_ANON_KEY` (filled in —
+  already recovered from `trainpixelfolio`'s git history in Session 14, not a new secret).
+
+---
+
+### Outcome
+
+New: `scripts/upload_images_oci.py` (`--init` bootstraps the `picaloco` bucket; default mode uploads
+whatever's in the local webp export folder, skip-if-already-there; `--dry-run`/`--limit`/`--image-nos`
+for testing) and `scripts/migrate_storage_images_from_cloud.py` (one-off cutover, old cloud → `oci`,
+same test flags, plus `--fetch-limit`). Both use `env_secrets.resolve_secret()` for their credentials,
+matching every other script in this codebase. GUI gained an "Upload Images" button (`gui_operations.py`,
+`gui_widgets.py`, `filemaker_gui.py` — the standard three-file pattern), gated on target-connected,
+timeout 600s, routed through the existing `_subprocess_lock` automatically. `db_dml_loader.py`'s
+`process_image_folder()` now builds a real `file_location` URL instead of hardcoding `None`; the dead
+`upload_images_to_supabase()` and its orphaned CLI flag are gone. `requirements.txt` gained `requests`.
+
+Verified without live Storage access: all new/changed files compile cleanly; `process_image_folder()`'s
+URL construction checked against a throwaway local fixture (golden rule 4 — no live DB/Storage
+touched); `migrate_storage_images_from_cloud.py`'s listing fix verified live against the real old-cloud
+bucket (1,499 correct, ~1.5s, no hang); both scripts' credential-missing and bucket-missing error paths
+verified to fail fast with clear, actionable messages.
+
+**Update, same session — the user provided the key, ran to completion:** `RAT_OCI_SERVICE_KEY` added
+to `.env`; `upload_images_oci.py --init` created the `picaloco` bucket (public, `image/webp` only,
+900000-byte limit — matches the old project's own config); `migrate_storage_images_from_cloud.py`
+tested against 2 known files first (found and fixed one more real bug in the process — see below),
+then run in full: **1,497 migrated + 2 already-there = 1,499, zero failures**, independently
+reverified via a direct `oci` bucket listing (not just trusting the script's exit code) and a
+byte-size spot-check against the source (`arc01088.webp`: 4,076 bytes on both sides). Then
+`picaloco_web`'s `VITE_IMAGES_BASE_URL` was switched to `oci` (`.env.local`/`.env.example`, and
+Vercel's production env var), redeployed, and confirmed live: the deployed JS bundle now contains
+zero references to the old cloud project's hostname, and a real image URL from it resolves with a
+200. **The old cloud project (`tvucfqzldbcghtxddtmq`) is no longer used anywhere in this system.**
+
+**One more real bug, found testing before the full run**: `list_source_objects()`'s results came
+back as bare filenames (`"ab0002.webp"`), not full paths — Supabase's `list` API returns `name`
+relative to the `prefix` filter used in the request, not the full bucket path. The first test run
+against real files 400'd on every download because the code built URLs without the `images/`
+prefix the bucket actually uses. Fixed by re-attaching `images/` right where the list is built, so
+every downstream function treats these as full bucket-relative paths without needing to know that
+convention itself. Confirmed live afterward with a clean 2-file test before running the full batch.
+
+---
+
+### Open Threads
+
+- [x] ~~Get `RAT_OCI_SERVICE_KEY`, run the migration~~ — **done**, see update above.
+- [ ] Ask the user whether the `arc`-prefix growth (591→1,087, discovered mid-session) on the old
+  cloud project was deliberate — mostly historical curiosity now that the migration is complete and
+  that project is retired, but worth knowing whether more such growth should be expected elsewhere.
+- [x] ~~Update `picaloco_web`'s `VITE_IMAGES_BASE_URL` and docs~~ — **done**, see update above.
+- [ ] S3-protocol default `dev`/`dev` credential rotation on `oci` — deferred by the user, separate
+  task, independent of this work.
+- [ ] *(Carried, unchanged)* everything open as of Session 14: `picaloco_web`'s dropdown-truncation
+  deferral; `--mode dml_files` parser rewrite; GUI target-profile picker; the 16 flagged source
+  records; `PicaLocoBackend`/`picaloco` rebrand (still gated on stability).
+
+---

@@ -51,6 +51,16 @@ prefix = "rat"
 image_formats_supported = ['jpg', 'webp']
 image_path = "images"
 
+[storage]
+# oci's Supabase Storage -- where exported images get uploaded (scripts/upload_images_oci.py,
+# scripts/migrate_storage_images_from_cloud.py) and where db_dml_loader.py's
+# picture_metadata.file_location URLs point. Secret-free (the service_role key needed to
+# write here is RAT_OCI_SERVICE_KEY in .env, never here -- see scripts/env_secrets.py).
+public_url = "https://huey.taila2eeb2.ts.net"
+bucket = "picaloco"
+allowed_mime_types = ["image/webp"]
+file_size_limit = 900000
+
 [debug]
 log_level = "DEBUG"
 console_logging = true

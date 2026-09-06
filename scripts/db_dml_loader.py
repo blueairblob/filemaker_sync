@@ -159,7 +159,6 @@ def get_args():
     parser.add_argument("--batch-size", type=int, default=1000, help="Batch size for inserts")
     parser.add_argument("--user-id", help="User ID for audit columns")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    parser.add_argument("--upload-images", action="store_true", help="Upload images to Supabase storage")
     parser.add_argument("--target-profile", help="Target DB profile from config.toml's "
                         "[database.target.<profile>] (overrides config/env RAT_TARGET_PROFILE)")
     return parser.parse_args()
@@ -943,7 +942,14 @@ def process_image_folder():
                 metadata = {
                     'catalog_id': None,  # Will need to look this up based on image_no
                     'file_name': img_path.name,
-                    'file_location': None,
+                    # Deterministic, not upload-confirmed: 1:1 with the local file's presence
+                    # (matches update_picture_catalog_ids()'s own image_no-from-filename trust
+                    # just below). Can 404 if scripts/upload_images_oci.py hasn't uploaded this
+                    # file yet -- run order is Export Images -> Upload Images -> Load to Target.
+                    'file_location': (
+                        f"{config['storage']['public_url']}/storage/v1/object/public/"
+                        f"{config['storage']['bucket']}/images/{image_no}.webp"
+                    ),
                     'file_type': img.format.lower(),
                     'file_size': os.path.getsize(img_path),
                     'width': img.width,
@@ -976,54 +982,7 @@ def process_image_folder():
             
     return metadata_records
   
-def upload_images_to_supabase(storage_bucket="rat", storage_folder="images"):
-    """Upload webp images to Supabase storage."""
-    logger.info("Starting Supabase storage upload")
-    
-    # Get path to webp images from config
-    folder_path = Path(f"{config['export']['path']}/{config['export']['image_path']}/webp").resolve()
-    
-    # Get image files
-    image_files = list(folder_path.glob('*.webp'))
-    uploaded_count = 0
-    error_count = 0
-    
-    for img_path in tqdm(image_files, desc="Uploading images"):
-        file_name = img_path.name
-        try:
-            # Read file content
-            with open(img_path, 'rb') as f:
-                file_content = f.read()
-            
-            # Upload to Supabase storage
-            storage_path = f"{storage_folder}/{file_name}"
-            
-            # Use engine since we already have the SQLAlchemy connection
-            with engine.connect() as conn:
-                response = conn.execute(
-                    text("""
-                    SELECT storage.upload($1, $2, $3, $4)
-                    """),
-                    {
-                        "bucket": storage_bucket,
-                        "path": storage_path,
-                        "file": file_content,
-                        "content_type": "image/webp"
-                    }
-                )
-                
-            uploaded_count += 1
-            if debug:
-                logger.debug(f"Uploaded {file_name}")
-                
-        except Exception as e:
-            error_count += 1
-            logger.error(f"Error uploading {file_name}: {str(e)}")
-            continue
-    
-    logger.info(f"Supabase storage upload completed. Successfully uploaded {uploaded_count} images, {error_count} errors.")
-      
-# ---------- Target Schema Migration Functions ---------- 
+# ---------- Target Schema Migration Functions ----------
 
 def migrate_country(df):
     """Migrate country data to Supabase."""

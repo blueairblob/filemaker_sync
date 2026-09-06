@@ -304,6 +304,7 @@ class FileMakerSyncGUI:
         actions['Load to Target'].configure(command=lambda: self.safe_run_operation('load_to_target'))
         actions['Export to Files'].configure(command=lambda: self.safe_run_operation('export_files'))
         actions['Export Images'].configure(command=lambda: self.safe_run_operation('export_images'))
+        actions['Upload Images'].configure(command=lambda: self.safe_run_operation('upload_images'))
         actions['Test Connections'].configure(command=self.safe_test_all_connections)
         actions['View Logs'].configure(command=self.safe_open_log_viewer)
         actions['Update Dashboard'].configure(command=self.safe_refresh_migration_status)  # NEW: Moved from refresh button

@@ -18,6 +18,9 @@ PyMySQL>=1.1.0
 psycopg2-binary>=2.9.9
 python-dotenv>=1.0.0
 
+# Supabase Storage REST calls (upload_images_oci.py, migrate_storage_images_from_cloud.py)
+requests>=2.31.0
+
 # Core Python libraries (usually included but listed for completeness)
 greenlet>=3.0.0
 numpy>=1.25.0

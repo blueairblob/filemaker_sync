@@ -12,6 +12,13 @@ Environment variables:
     RAT_TARGET_PWD        Supabase / Postgres target password (legacy / 'supabase' profile)
     RAT_TARGET_PWD_<NAME> Password for target profile <NAME> (e.g. RAT_TARGET_PWD_OCI)
     RAT_TARGET_PROFILE    Which [database.target.<name>] profile is active
+    RAT_OCI_SERVICE_KEY   Supabase service_role key for the oci instance's Storage API
+                          (image upload scripts only -- never used for the anon-scoped
+                          read path; resolve via plain resolve_secret(), not
+                          resolve_target_pwd(), since only one instance has Storage today)
+    RAT_OLD_CLOUD_ANON_KEY  anon key for the old Supabase.com cloud project being migrated
+                          away from (migrate_storage_images_from_cloud.py's read side only
+                          -- a one-off migration tool, not part of the ongoing pipeline)
 
 Typical use:
     from env_secrets import resolve_secret, resolve_target_pwd, url_quote
