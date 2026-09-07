@@ -4,6 +4,53 @@
 
 ---
 
+## Reference: Disaster Recovery (a primary use case)
+
+**If `oci` (the self-hosted Supabase instance — Postgres `rat` schema + Storage) is ever lost
+entirely, it can be fully rebuilt from the FileMaker Pro source.** This isn't a hypothetical — every
+step below has been independently verified live (not assumed), most recently 2026-09-07 (Session
+17's same-session update has the full verification detail). Confirmed to the user directly on
+2026-09-07 and kept here as a standing reference, not buried inside one session's narrative.
+
+**The chain, in order:**
+
+1. **Rebuild the schema, view, and grants** — run
+   `supabase/schema/bootstrap_rat_schema.sql` against the fresh target (psql or the Supabase SQL
+   editor). Idempotent (every `CREATE TABLE`/`GRANT` is guarded or safely re-runnable). Creates all
+   12 `rat.*` tables, `rat.mobile_catalog_view` (`picaloco_web`'s only public read path), and scopes
+   `anon` to read-only access on that view plus the small lookup tables — nothing else. Verified live
+   2026-09-07 against a genuine throwaway schema on the real `oci` Postgres instance.
+2. **Rebuild the Storage bucket** — `python scripts/upload_images_oci.py --init` (idempotent; a 409
+   if it already exists is treated as success).
+3. **Rebuild the data** — `python.exe scripts/filemaker_extract.py --db-exp --ddl --dml
+   --target-profile oci` (Stage 1, needs native Windows Python + the FileMaker ODBC driver — see
+   "How to run" below) then `python scripts/db_dml_loader.py --mode migration_schema
+   --target-profile oci` (Stage 2, runs fine from WSL). Proven repeatedly across this project;
+   idempotent; quarantines bad rows rather than corrupting the load.
+4. **Rebuild the images** — `python.exe scripts/filemaker_extract.py --get-images --target-profile
+   oci` (writes local `.webp`/`.jpg` files) then `python scripts/upload_images_oci.py` (uploads
+   whatever's new to `oci`'s Storage). Proven at full scale: 141,197 of 141,243 images, Session 16.
+5. **Rebuild `rat_migration.sync_manifest`** (if incremental/delta sync is needed going forward, not
+   required just to repopulate `rat` itself) — `python scripts/db_sync_manifest.py --baseline --yes
+   --target-profile oci`.
+
+**Two honest caveats — don't treat this as unconditional:**
+
+- **This recovers *from* FileMaker Pro, not a backup *of* it.** If the FileMaker Pro file/database
+  itself were ever lost, none of the above helps — that's a separate risk, outside this pipeline's
+  scope, and worth confirming RAT's own backup practice for that file directly.
+- **A full HOST loss (not just data on the existing host) needs two manual steps no script covers**:
+  re-enabling Tailscale Funnel for the new node (a new host gets a new Tailscale identity/hostname —
+  needs the tailnet admin), and updating `picaloco_web`'s `VITE_SUPABASE_URL`/`VITE_IMAGES_BASE_URL`
+  env vars (Vercel + `.env.local`) to match, then redeploying.
+- Also note: each step above has been proven *individually*, at different times — not yet rehearsed
+  as one single, continuous, start-from-nothing drill in one sitting.
+
+See `picaloco_web/DEVOPS.md` §3 for the same schema/grants steps from that repo's own perspective,
+and Session 17 below for the exact verification performed.
+
+---
+
 ## Session 1 — 2026-08-18 — Wire the DML loader into the GUI
 
 **Focus:** Resolve whether the GUI hid a newer migration codebase, then close the gap it exposed — get the second-stage normaliser running behind the GUI so the full two-stage pipeline needs no terminal. Ship it as one verified patch.

@@ -371,7 +371,8 @@ python.exe scripts/fm_metadata_probe.py --selftest
 | FileMaker metadata probe | `scripts/fm_metadata_probe.py` |
 | Shared secret resolution | `scripts/env_secrets.py` |
 | Ground-truth schema (reference only, not re-appliable) | `rat_schema_original.sql` |
-| Fresh-target bootstrap DDL (idempotent, corrections baked in) | `supabase/schema/bootstrap_rat_schema.sql` |
+| Fresh-target bootstrap DDL (idempotent, corrections baked in, incl. `mobile_catalog_view`/`anon` grants) | `supabase/schema/bootstrap_rat_schema.sql` |
+| **Disaster recovery** — full rebuild of `oci` from FileMaker Pro, verified live, a primary use case | `devlog/worksheet.md`'s "Reference: Disaster Recovery" section, right after the intro |
 | Constraint DDL (already-applied patches, cloud target only) | `supabase/schema/fix_rat_constraints.sql`, `fix_rat_idempotency.sql` |
 | Sanitisation fixtures | `test/` |
 | Source field meanings / valid values | `FileMakerPro_source_details/` |
