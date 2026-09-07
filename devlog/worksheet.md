@@ -1620,3 +1620,113 @@ convention itself. Confirmed live afterward with a clean 2-file test before runn
   records; `PicaLocoBackend`/`picaloco` rebrand (still gated on stability).
 
 ---
+
+## Session 16 — 2026-09-07 — The real image source was local all along; full archive uploaded
+
+**Focus:** Continuation of Session 15. The "old cloud project → oci" migration (1,499 images) turned
+out to be migrating the wrong, small, partial source. The user pointed to the actual local export
+folder, which held the *entire* archive. Redid the upload from there instead.
+**Status:** `completed`. **141,197 of 141,243 local images are now on `oci`** (99.97%) — this
+supersedes every image-count figure in Session 15 and in `picaloco_web`'s docs, all now corrected.
+
+---
+
+### Context
+
+Mid-verification of Session 15's "completed" migration, a `picaloco_web` search for "dog" showed a
+mix of real photos and placeholders for `arc08xxx`-numbered rows — surprising, since those should
+have been covered if the old cloud project truly held everything relevant. Checking directly found
+those specific files 200'd on the *old* cloud project but 400'd on `oci`, and re-listing the old
+project properly (see below) revealed it held **69,004** images, not the ~1,003–1,499 first assumed
+— a different wrong number, not the same one. Mid-investigation, the user supplied the real answer:
+the original, complete local export sits at `C:\dev\RAT_Trains_Project_Exports\exports\images`
+(`/mnt/c/...` from WSL) — **141,243 files**, matching the catalog almost exactly (141,244 rows). The
+old cloud project was always just a partial, secondary copy someone made along the way, not the
+source of truth.
+
+---
+
+### Decisions
+
+| Decision | Rationale | Alternatives Considered |
+|---|---|---|
+| Upload from the local `webp_mobile` folder, not `webp` | `webp_mobile` (794MB, ~5.6KB/file avg) is confirmed byte-identical to what's already public via the old cloud project and matches picaloco_web's expected thumbnail size; `webp` (2.0GB, ~13KB/file) is a full-resolution variant not what the app wants at the `images/<image_no>.webp` path | Uploading `webp` instead (wrong size class, 2.5x the transfer for no benefit given current app usage) |
+| Fix `list`-endpoint pagination properly (page_size=1500, the confirmed real per-request cap) instead of trusting a single big-limit request | The single-request "fix" from Session 15 silently truncated at exactly 1,500 regardless of the `limit` value requested (confirmed: limit=2000/5000 both still returned 1,500) — a second, different pagination bug from Session 15's original one, not the same bug recurring | Assuming the earlier fix was sufficient (it looked complete, wasn't) |
+| Switch all Storage `list` calls to `curl` via subprocess, not `requests`/urllib3 | `requests` was observed to intermittently stall for minutes (no exception, past its own `timeout=`) against the old cloud project's host specifically, from this sandboxed environment — plain `curl` to the exact same endpoint was reliably fast on every attempt. Root cause not fully pinned down (plausibly a WSL/urllib3/Cloudflare TLS interaction); curl sidesteps it | Debugging the `requests` stall further (diminishing returns; curl just works) |
+| Diff a full destination listing against the local file list up front, not a per-file existence check | At 141,243 files, that would be 141,243 HEAD/GET requests on top of the uploads themselves — its own bottleneck at this scale | Per-file checks (fine at Session 15's assumed ~1,500 scale, wrong at the real scale) |
+| Parallelize uploads (`ThreadPoolExecutor`, default 16 workers, used 24 for the real run) | 141k sequential HTTP round-trips would take many hours; I/O-bound work parallelizes well | Sequential upload (Session 15's approach — fine at ~1,500 files, not at 141k) |
+| Quarantine the 46 files whose `image_no` contains characters Supabase Storage rejects as invalid object keys (a backtick, in 45 cases; one accented character), rather than sanitizing/renaming the key | Matches golden rule 1 (quarantine over silent coercion) — renaming would also break `db_dml_loader.py`'s deterministic `image_no`→URL convention unless threaded through there too, for a 0.03% edge case | Auto-sanitizing keys (extra complexity, breaks the deterministic-URL assumption, for very little gain) |
+| Did **not** touch `config.toml`'s `[export].path` (confirmed wrong/unusable — not a valid path on either Windows or WSL) despite now knowing the real location | Unclear how this value is actually consumed by the Windows-side `python.exe` extraction process vs WSL-side scripts; a hasty edit risks breaking something rather than fixing it | Fixing it blind (flagged as an open thread instead, see below) |
+
+---
+
+### Findings
+
+- **A second, distinct pagination bug**, not a recurrence of Session 15's first one: the old cloud
+  project's `object/list` endpoint silently clamps `limit` to exactly 1,500 server-side, confirmed by
+  directly testing limit values of 500/1000/1500/2000/5000 (the first three return exactly what was
+  asked; 2000 and 5000 both still return exactly 1,500). Session 15's "fix" (one request, a generous
+  `limit`) looked like a complete listing but wasn't — it just happened to return exactly the
+  server's cap. Real pagination (limit at or under 1,500, incrementing offset, stopping on a
+  shorter-than-requested page) does work correctly — confirmed by requesting offset=1500 directly and
+  seeing genuinely new, different filenames come back, then paginating properly through all 47 pages.
+- **The `requests`/curl split is real and reproducible, not a one-off**: multiple independent
+  attempts to page through the old cloud project's listing via Python's `requests` (with and without
+  a `Retry`/`HTTPAdapter` session, with varying timeouts) stalled indefinitely with no exception ever
+  surfacing, including past a 240-second wait on one attempt. The exact same request via `curl`
+  succeeded in under a second, every single time, throughout this entire investigation. Switched
+  both scripts' listing code to shell out to `curl` rather than keep fighting this.
+- **The 46 failures are a genuine, narrow data-quality issue**, not transient: re-running the upload
+  (idempotent, skip-existing) reproduced the exact same 46 failures both times. Direct testing
+  isolated the cause precisely: Supabase Storage's object-key validation rejects a literal backtick
+  character (45 files, mostly `mssacpe30xx`/`msbrp072x`/`merd113` series) and at least one accented
+  character (`jjw2415307Póvoaline`) with `{"error":"InvalidKey"}`. These are presumably stray
+  characters from FileMaker data entry — a new addition to this project's known source-data debris
+  list (alongside the existing 13 duplicate/3 NULL `image_no` records).
+- `config.toml`'s `[export].path` (`/dev/RAT_Trains_Project/Migration/exports`) is confirmed **not a
+  valid path on either system** — not a real Windows path (no drive letter) and not a real WSL path
+  either (`/dev/` is Linux's device-file namespace). It's been silently wrong/unusable this whole
+  time; nothing in this session's testing depended on it being correct (the new `--webp-dir` CLI
+  override on `upload_images_oci.py` was used instead throughout).
+
+---
+
+### Outcome
+
+`scripts/migrate_storage_images_from_cloud.py` and `scripts/upload_images_oci.py` were both
+substantially rewritten: real offset-based pagination (1,500-item pages) via `curl` subprocess calls
+instead of `requests`, a full destination-listing diff instead of per-file existence checks, and
+parallel transfer via `ThreadPoolExecutor` (`--workers`, default 16). `upload_images_oci.py` also
+gained `--webp-dir` to point at an arbitrary local folder, bypassing `config.toml`'s broken path.
+
+Ran the real upload against `/mnt/c/dev/RAT_Trains_Project_Exports/exports/images/webp_mobile`
+(141,243 files) with 24 workers: **139,693 newly uploaded + 1,504 already present (the earlier
+partial Session 15 migration + test runs) = 141,197 confirmed on `oci`**, independently reverified via
+a fresh full listing afterward (not just trusting the script's exit code) — **46 failed**, all
+confirmed as the `InvalidKey` character issue above, not worth chasing further at 0.03%.
+
+The old cloud project's 69,004-image partial copy is now entirely superseded and irrelevant — `oci`
+has more complete, more authoritative coverage than that project ever did.
+**All `picaloco_web`/`filemaker_sync` documentation that quoted the earlier ~1,499 figure has been
+corrected to 141,197 — that includes Session 15's own entry above, which is now historically
+superseded rather than rewritten (the corrected numbers live here, in Session 16).**
+
+---
+
+### Open Threads
+
+- [ ] `config.toml`'s `[export].path` is confirmed broken/unusable on both Windows and WSL — needs a
+  real fix, but requires understanding how the Windows-side `python.exe` FileMaker extraction process
+  and WSL-side Postgres/Storage scripts are meant to share (or not share) this value across the two
+  filesystem namespaces before changing it blind.
+- [ ] The 46 `InvalidKey`-quarantined `image_no` values (backtick/accented-character source data) —
+  add to the project's known source-data debris list; FileMaker-side cleanup, same category as the
+  existing 13 duplicate/3 NULL `image_no` records, not urgent.
+- [ ] `migrate_storage_images_from_cloud.py` is now effectively dead/unnecessary (the local export was
+  always the better source) — not deleted, since it's harmless and documents real, hard-won
+  pagination-bug knowledge, but don't reach for it again; use `upload_images_oci.py --webp-dir` instead.
+- [ ] *(Carried, unchanged)* everything open as of Session 14/15: `picaloco_web`'s dropdown-truncation
+  deferral; S3-protocol default-credential rotation on `oci`; `--mode dml_files` parser rewrite; GUI
+  target-profile picker; `PicaLocoBackend`/`picaloco` rebrand (still gated on stability).
+
+---
