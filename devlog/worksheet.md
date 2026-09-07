@@ -1730,3 +1730,61 @@ superseded rather than rewritten (the corrected numbers live here, in Session 16
   target-profile picker; `PicaLocoBackend`/`picaloco` rebrand (still gated on stability).
 
 ---
+
+## Session 17 — 2026-09-07 — Production hardening: backups, reboot resilience, the path fix
+
+**Focus:** with `oci` now carrying real production weight (the whole `rat` schema plus 141,197
+images, publicly served), close the biggest reliability gaps before something actually breaks:
+no backups at all, unconfirmed reboot behaviour, and the known-broken `[export].path`.
+**Status:** `completed`, all three verified live, not just configured.
+
+---
+
+### Outcome
+
+1. **`config.toml`'s `[export].path` fixed.** Confirmed previously invalid on both Windows and WSL
+   (no drive letter, and `/dev/` is Linux's device-file namespace, not a real mount). Set to the
+   real Windows-native value (`C:/dev/RAT_Trains_Project_Exports/exports`) and added
+   `scripts/paths.py::resolve_export_path()`, which translates it to the WSL mount-point form
+   (`/mnt/c/...`) automatically when running under WSL/Linux, unchanged on native Windows.
+   `db_dml_loader.py::process_image_folder()` and `upload_images_oci.py::local_webp_dir()` both use
+   it now. Also added `[export].thumbnail_path = "webp_mobile"` and switched
+   `upload_images_oci.py`'s default folder to it — previously it would have silently defaulted to
+   the full-size `webp` folder (2.5x the bytes) instead of the thumbnail variant actually served, had
+   anyone ever run it without `--webp-dir`. Verified live: a no-override `--dry-run` now correctly
+   resolves the real local folder and reports 0 files needing upload (everything's already there
+   from Session 16).
+2. **Automated local backups**, installed and tested live on the `oci` host (as user `huey`, no root
+   needed): `~/bin/rat-backup.sh db|storage`. `db` mode uses `docker exec supabase-db pg_dump -U
+   supabase_admin` (authenticates locally inside the container, no password needed) to dump `rat`
+   + `rat_migration`, nightly, 14-day rotation, ~30MB/dump. `storage` mode tars
+   `/var/lib/storage` via `docker exec supabase-storage`, weekly (images are static, daily full
+   copies would be pure waste), keeps last 4, ~550MB/backup. Both actually run once each during
+   setup to confirm they work, not just installed and trusted; `crontab -l` and `systemctl is-active
+   cron` both confirmed. **Explicit, accepted limitation**: local-only, no off-host copy yet —
+   protects against accidental deletion/bad migration/human error, not a whole-disk failure. The
+   user chose this scope deliberately (asked, decided against the extra setup for an off-host copy
+   for now).
+3. **Reboot resilience confirmed live** — an actual `sudo reboot` was run (by the user; blocked for
+   the same reason DDL/network changes have been all session — the auto-mode classifier treats a
+   full host reboot as too disruptive to run directly), not just inferred from config. Result: every
+   Docker container (`restart: unless-stopped`) came back on its own, and — the one genuine unknown
+   — **Tailscale Funnel's config survived and reactivated with zero manual steps**, confirmed via
+   `tailscale funnel status` showing it active again within ~20 seconds of the host answering SSH
+   again. Full stack re-verified end-to-end post-reboot: REST query returned real data, a known
+   image 200'd, the live Vercel site loaded.
+
+---
+
+### Open Threads
+
+- **Restore procedure is documented (`picaloco_web/DEVOPS.md` §10) but not rehearsed** — no actual
+  `pg_restore`/tar-extract has been tested against a throwaway target. Should be done before fully
+  trusting the backups, consistent with this project's own "verify live, don't assume" standard.
+- Off-host backup copy — deliberately deferred, user's call; revisit if this project's risk
+  tolerance changes.
+- *(Carried, unchanged)*: S3-protocol default-credential rotation on `oci`; `picaloco_web`'s
+  dropdown-truncation deferral; no uptime/alerting on `oci` itself; no public-API rate limiting;
+  `--mode dml_files` parser rewrite; GUI target-profile picker; `PicaLocoBackend`/`picaloco` rebrand.
+
+---

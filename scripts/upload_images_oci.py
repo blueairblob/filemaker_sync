@@ -79,6 +79,16 @@ except ImportError:                    # self-contained fallback (identical beha
         v = os.environ.get(env_key)
         return v if v else (cfg_val if cfg_val is not None else default)
 
+try:
+    from paths import resolve_export_path
+except ImportError:                    # self-contained fallback (identical behaviour)
+    import re as _re
+    def resolve_export_path(raw_path):
+        m = _re.match(r"^([A-Za-z]):[/\\](.*)$", raw_path)
+        if os.name != "nt" and m:
+            return f"/mnt/{m.group(1).lower()}/{m.group(2).replace('\\\\', '/')}"
+        return raw_path
+
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LIST_PAGE_SIZE = 1500  # oci's Storage list endpoint's real per-request cap -- see
                        # migrate_storage_images_from_cloud.py's module docstring for how this
@@ -97,7 +107,13 @@ def load_config(path: str = "config.toml") -> dict:
 
 
 def local_webp_dir(config: dict) -> Path:
-    return Path(f"{config['export']['path']}/{config['export']['image_path']}/webp").resolve()
+    """The thumbnail-sized webp variant (config's [export].thumbnail_path,
+    "webp_mobile") -- what's actually served publicly, not the full-size
+    "webp" folder db_dml_loader.py's process_image_folder() reads for
+    metadata. See config.toml's [export] section comments."""
+    export_path = resolve_export_path(config["export"]["path"])
+    thumb = config["export"].get("thumbnail_path", "webp_mobile")
+    return Path(f"{export_path}/{config['export']['image_path']}/{thumb}").resolve()
 
 
 def _list_page_curl(base_url: str, bucket: str, prefix: str, headers: dict, offset: int) -> list[dict]:

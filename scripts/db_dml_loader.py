@@ -96,7 +96,19 @@ except ImportError:                       # self-contained fallback (identical b
     def url_quote(value):
         return _qp(str(value or ""))
 
-        
+# --- Windows/WSL export path translation (see scripts/paths.py) --------------
+try:
+    from paths import resolve_export_path
+except ImportError:                       # self-contained fallback (identical behaviour)
+    import os as _os
+    import re as _re
+    def resolve_export_path(raw_path):
+        m = _re.match(r"^([A-Za-z]):[/\\](.*)$", raw_path)
+        if _os.name != "nt" and m:
+            return f"/mnt/{m.group(1).lower()}/{m.group(2).replace('\\\\', '/')}"
+        return raw_path
+
+
 # Global variables — populated by main() (via `global`) before any migration
 # function runs; declared here (without a None default) so their static type
 # is the real type, not Optional[...].
@@ -924,7 +936,8 @@ def update_picture_catalog_ids(metadata_records):
 def process_image_folder():
     """Process all images in a folder and return metadata records."""
     metadata_records = []
-    folder_path = Path(f"{config['export']['path']}/{config['export']['image_path']}/webp").resolve()
+    export_path = resolve_export_path(config['export']['path'])
+    folder_path = Path(f"{export_path}/{config['export']['image_path']}/webp").resolve()
     # Get all image files (adjust extensions as needed)
     image_files = []
     #'.jpg', '.jpeg', '.png', '.gif'

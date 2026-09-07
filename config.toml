@@ -46,10 +46,19 @@ pwd = "Ref .env: RAT_TARGET_PWD_OCI"
 port = "5432"
 
 [export]
-path = "/dev/RAT_Trains_Project/Migration/exports"
+# Windows-native form -- this is what filemaker_extract.py's --get-images actually writes to,
+# running under native Windows Python (python.exe). Confirmed the real location 2026-09-07 (was
+# previously a value valid on neither Windows nor WSL). Scripts reading this under WSL/Linux
+# translate it via scripts/paths.py::resolve_export_path() -- don't hand-edit for WSL use.
+path = "C:/dev/RAT_Trains_Project_Exports/exports"
 prefix = "rat"
 image_formats_supported = ['jpg', 'webp']
 image_path = "images"
+# Thumbnail-sized webp variant actually served publicly (matches picaloco_web's expected size and
+# what's already uploaded to oci) -- distinct from the plain "webp" subfolder (full-size originals,
+# ~2.5x the bytes), which db_dml_loader.py's process_image_folder() still reads for accurate
+# width/height/file_size metadata. See devlog/worksheet.md Session 16.
+thumbnail_path = "webp_mobile"
 
 [storage]
 # oci's Supabase Storage -- where exported images get uploaded (scripts/upload_images_oci.py,
