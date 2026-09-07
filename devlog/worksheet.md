@@ -1788,3 +1788,33 @@ no backups at all, unconfirmed reboot behaviour, and the known-broken `[export].
   `--mode dml_files` parser rewrite; GUI target-profile picker; `PicaLocoBackend`/`picaloco` rebrand.
 
 ---
+
+**Update, same session — full disaster-recovery chain verified, one real gap found and fixed:**
+asked directly whether a complete restore from FileMaker Pro (schema + data + images) is genuinely
+possible if `oci` were lost entirely. Found a real gap checking this properly rather than assuming:
+`supabase/schema/bootstrap_rat_schema.sql` (the fresh-target rebuild script) predates Session 14 and
+was missing `rat.mobile_catalog_view` and the `anon` grant scoping entirely — both were only ever
+applied ad hoc via psql and never folded back into this file. Rebuilding from it as it stood would
+have produced a schema with all the right tables but nothing `picaloco_web` could actually query.
+
+Fixed: added `CREATE OR REPLACE VIEW rat.mobile_catalog_view` (same definition already live) and the
+exact `anon` grants (`USAGE` on the schema, `SELECT` on the view + the seven small lookup tables,
+nothing on `catalog`/`catalog_metadata`/`catalog_builder`/`usage`/`picture_metadata`) directly into
+the bootstrap script. Verified for real, not just reviewed: ran the updated script against a genuine
+throwaway schema (`rat_drtest`/`rat_drtest_migration`) on the live `oci` Postgres instance — same
+server, zero risk to real data — confirmed it creates all 12 tables, the view, and exactly the
+intended grants from nothing, then dropped the test schemas.
+
+**Full disaster-recovery chain, each link independently proven (not all as one continuous drill)**:
+schema/view/grants bootstrap (just fixed and verified above) → FileMaker → `rat` schema via
+`filemaker_extract.py` + `db_dml_loader.py` (proven repeatedly, idempotent) → FileMaker → local
+export → `oci` Storage via `upload_images_oci.py` (proven at full 141,197-image scale, Session 16) →
+`upload_images_oci.py --init` for the bucket itself (proven, idempotent). Two caveats given
+honestly, not glossed over: (1) no single sitting has rehearsed wiping everything and rebuilding
+end-to-end in one continuous drill, only each piece separately; (2) this is a recovery path *from*
+FileMaker Pro, not a backup *of* it — if the FileMaker file itself were ever lost, none of this
+helps, and that's outside this pipeline's scope entirely. A *host* loss (not just data) needs two
+extra manual steps beyond any script: re-enabling Tailscale Funnel for the new node, and updating
+`picaloco_web`'s env vars to the new hostname.
+
+---

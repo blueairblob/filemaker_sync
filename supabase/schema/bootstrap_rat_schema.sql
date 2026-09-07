@@ -26,6 +26,19 @@
 -- Does NOT create the rat_migration staging tables (ratcatalogue, ratbuilders,
 -- ratroutes, ratcollections, prompts) -- those are self-generated from live
 -- FileMaker field metadata by `filemaker_extract.py --db-exp --ddl`.
+--
+-- Also creates (added 2026-09-07, Session 17 -- picaloco_web's dependency,
+-- previously only ever applied ad hoc via psql and NOT captured here until
+-- now, a real gap this closes): rat.mobile_catalog_view, and anon's grants
+-- (read-only, scoped to that view plus the small lookup tables -- never given
+-- direct access to rat.catalog or the other base tables). Does NOT touch
+-- PGRST_DB_SCHEMAS or any other Docker Compose / PostgREST config needed to
+-- actually expose the `rat` schema over the REST API -- that's host-level
+-- infra config, not database DDL; confirm it separately on a truly new host.
+-- Does NOT set up Tailscale Funnel or DNS -- also host-level, not DDL. A
+-- genuinely NEW host (not just restored data on the existing one) will get a
+-- new Tailscale hostname, needing Funnel re-enabled and picaloco_web's
+-- VITE_SUPABASE_URL/VITE_IMAGES_BASE_URL updated to match.
 
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
@@ -272,3 +285,71 @@ CREATE TABLE IF NOT EXISTS rat_migration.migration_log (
   last_migrated_id text,
   updated_at timestamptz DEFAULT now()
 );
+
+-- =============================================================================
+-- Public-facing view + anon grants (added 2026-09-07, Session 17 -- these were
+-- created ad hoc via psql in Sessions 14/15 and never folded back into this
+-- bootstrap script until now, which meant a fresh rebuild from this file alone
+-- would have left picaloco_web with nothing to query and anon's grants
+-- undefined. This is now the single source of truth for both.)
+--
+-- CREATE VIEW has no IF NOT EXISTS in Postgres -- CREATE OR REPLACE is the
+-- idempotent equivalent (safe to re-run; will not touch any table's data).
+-- =============================================================================
+
+CREATE OR REPLACE VIEW rat.mobile_catalog_view AS
+SELECT c.image_no,
+    c.category,
+    c.date_taken,
+    c.circa,
+    c.imprecise_date,
+    c.description,
+    c.gauge,
+    concat('https://cdn.example.com/thumbnails/', c.image_no, '.webp') AS thumbnail_url,
+    cnt.name AS country,
+    org.name AS organisation,
+    org.type AS organisation_type,
+    l.name AS location,
+    r.name AS route,
+    col.name AS collection,
+    p.name AS photographer,
+    u.prints_allowed,
+    u.internet_use,
+    u.publications_use,
+    array_agg(DISTINCT jsonb_build_object('builder_name', b.name, 'builder_code', b.code, 'works_number', cb.works_number, 'year_built', cb.year_built, 'plant_code', cb.plant_code, 'builder_order', cb.builder_order)) FILTER (WHERE b.id IS NOT NULL) AS builders,
+    pm.file_type,
+    pm.width,
+    pm.height,
+    pm.resolution,
+    pm.colour_space,
+    pm.colour_mode,
+    c.cd_no,
+    c.cd_no_hr,
+    c.bw_image_no,
+    c.bw_cd_no,
+    c.active_area,
+    c.corporate_body,
+    c.facility,
+    c.modified_date AS last_updated
+   FROM rat.catalog c
+     LEFT JOIN rat.catalog_metadata cm ON c.id = cm.catalog_id
+     LEFT JOIN rat.organisation org ON cm.organisation_id = org.id
+     LEFT JOIN rat.country cnt ON org.country_id = cnt.id
+     LEFT JOIN rat.location l ON cm.location_id = l.id
+     LEFT JOIN rat.route r ON cm.route_id = r.id
+     LEFT JOIN rat.collection col ON cm.collection_id = col.id
+     LEFT JOIN rat.photographer p ON cm.photographer_id = p.id
+     LEFT JOIN rat.usage u ON c.id = u.catalog_id
+     LEFT JOIN rat.catalog_builder cb ON c.id = cb.catalog_id
+     LEFT JOIN rat.builder b ON cb.builder_id = b.id
+     LEFT JOIN rat.picture_metadata pm ON c.id = pm.catalog_id
+  GROUP BY c.id, c.image_no, c.category, c.date_taken, c.circa, c.imprecise_date, c.description, c.gauge, cnt.name, org.name, org.type, l.name, r.name, col.name, p.name, u.prints_allowed, u.internet_use, u.publications_use, pm.file_type, pm.width, pm.height, pm.resolution, pm.colour_space, pm.colour_mode, c.cd_no, c.cd_no_hr, c.bw_image_no, c.bw_cd_no, c.active_area, c.corporate_body, c.facility, c.modified_date;
+
+-- anon is read-only, and only through this view + the small lookup tables below --
+-- never given direct access to rat.catalog itself (valuation/owners_ref are not
+-- public columns) or to catalog_metadata/catalog_builder/usage/picture_metadata
+-- (no public need, and picture_metadata.file_location would leak internal detail).
+GRANT USAGE ON SCHEMA rat TO anon;
+GRANT SELECT ON rat.mobile_catalog_view TO anon;
+GRANT SELECT ON rat.photographer, rat.location, rat.organisation,
+                rat.collection, rat.country, rat.route, rat.builder TO anon;
