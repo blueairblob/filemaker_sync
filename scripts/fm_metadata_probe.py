@@ -59,6 +59,14 @@ except ModuleNotFoundError:            # pragma: no cover
 NOW = datetime.now(timezone.utc)
 STAMP = NOW.strftime("%Y%m%d_%H%M%S")
 
+# Windows consoles often default to a legacy codepage (cp1252) that can't
+# encode the ✓/✗/• characters this report prints — crashes mid-run otherwise.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 
 # =============================================================================
 # Small output helper: prints to console AND accumulates a text transcript.
