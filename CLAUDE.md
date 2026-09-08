@@ -321,7 +321,9 @@ and committed. All `postgresql://` URLs must wrap the password in `url_quote()`.
 - **Run from the repo root** - scripts read `config.toml` and `.env` from the working directory.
 - **FileMaker (Stage 1, the probe, the sync scan) MUST run under native Windows Python**, invoked as
   `python.exe` from WSL, or from PowerShell. WSL's own Python has **no FileMaker ODBC driver** and can't
-  see the Windows System DSN (`rat`). **Postgres-only work runs fine from WSL directly, confirmed live
+  see the Windows DSN (`rat` — a **User** DSN under `HKCU`, confirmed live Session 18; despite this
+  doc previously saying "System DSN", the real one on the test machine is not). **Postgres-only work
+  runs fine from WSL directly, confirmed live
   (Session 5)** - the loader/manifest/probe's target-DB side needs no Windows detour, only the
   FileMaker-facing side does.
 - Two target profiles exist in `config.toml`: `supabase` (the original cloud project — unreachable as of
