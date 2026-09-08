@@ -1994,3 +1994,125 @@ yet, just proving the read path):**
   `PicaLocoBackend`/`picaloco` rebrand; restore procedure not rehearsed; off-host backup copy.
 
 ---
+
+**Update, same session — foot-in-the-door proven live; the full agent/relay direction narrowed to a
+much smaller, concrete build: `picaloco_agent`.**
+
+1. **`rat.sync_status` DDL applied and verified end-to-end**, including as the `anon` role (via
+   `SET ROLE anon` in-session, not just assumed from the grant). One real hiccup along the way:
+   Tailscale SSH started demanding a fresh interactive re-auth check mid-session (unrelated to the
+   permission classifier) — blocked two SSH-based lookups until the user approved it out-of-band.
+2. **`picaloco-web`'s `/admin` page built by a fresh subagent** (own session, no context carried over
+   beyond a self-contained brief), reading `rat.sync_status` via the existing `supabase-js`/`anon`
+   client — headline card (last non-dry-run sync, relative time, Up to date/Stale(>24h)/Sync issue
+   badge) plus a history table. No auth, no new dependencies, matches existing app conventions (its
+   CSS-variable theming, no footer existed so added a minimal one). Lint/typecheck/build all clean.
+   Committed and **pushed live**: https://picaloco-web.vercel.app/admin confirmed 200.
+3. **`filemaker_sync`'s own changes committed** (not pushed — no remote deploy tied to this repo):
+   `119e586` (the `cp1252` fix) and `e802416` (`rat.sync_status` writes + GUI admin link-out).
+4. **The bigger direction got a real pivot.** Presented with the full agent+relay+websocket shape,
+   the user wasn't persuaded to build that yet ("Not persuaded to do that yet") and instead specified
+   a much smaller, concrete downloadable tool: an admin visits `picaloco-web`'s downloads, installs a
+   double-click `.exe` on the FileMaker desktop, and gets exactly five things — Set/Config (FileMaker
+   connection only), Test FileMaker Connection, Test Supabase Connection (target hardcoded), Check
+   Sync (dry-run), Sync (the real delta sync). No websocket, no remote control, no relay, no auth —
+   smaller than even the earlier "foot in the door" framing anticipated.
+5. **New sibling repo scaffolded and built out same session**:
+   `/mnt/d/dev/PROJECTS/RAT_Trains_Project/work_picaloco_dev/picaloco_agent` (user's explicit choice
+   over a subfolder of `filemaker_sync`, asked directly). Source-complete:
+   - `vendor/` — unmodified copies of `env_secrets.py`/`filemaker_extract.py`/`db_dml_loader.py`/
+     `db_sync_manifest.py`/`run_incremental_sync.py`. Deliberately untouched so re-vendoring a future
+     `filemaker_sync` bugfix is a straight file copy, not a merge.
+   - `src/local_config.py` — the only thing the admin configures (FMP DSN/user/pwd), stored in
+     `%LOCALAPPDATA%\PicalocoAgent\config.json`.
+   - `src/target_config.py` — the hardcoded `oci` side. The password is deliberately never a literal
+     in source (resolved from a gitignored `src/_secret.py` or an env var) — this repo will ship a
+     compiled `.exe` to a remote desktop outside continuous control, and `filemaker_sync/CLAUDE.md`'s
+     golden rule 5 exists because a DB password already leaked into a commit once.
+   - `src/connections.py` — direct `pyodbc`/`psycopg2` connect-and-close checks for the two Test
+     buttons.
+   - `src/sync_runner.py` — regenerates `vendor/config.toml` from `local_config` + `target_config`
+     before every run and drives `vendor/run_incremental_sync.py` as a subprocess, streaming output
+     back to the UI — same reasoning `run_incremental_sync.py` itself gives for subprocess over
+     import (these scripts rely on `__main__`-block global state).
+   - `src/main.py` — the actual 5-button Tkinter window.
+   - `create_agent_role.sql` — a new scoped Postgres role, `picaloco_agent`, **not** the
+     `filemaker_sync` migration superuser (`postgres.default`). Had to work out real privilege
+     boundaries by reading `filemaker_extract.py`: its `--ddl`/`--del-data` path does
+     `DROP TABLE IF EXISTS` + `CREATE TABLE` against 5 `rat_migration` staging tables per run, and
+     Postgres has no separate "DROP" table privilege — that needs real ownership, not a GRANT. So the
+     role gets `ALTER TABLE ... OWNER TO` on exactly those 5 tables (`ratcatalogue`/`ratbuilders`/
+     `ratroutes`/`ratcollections`/`prompts`), plain `SELECT, INSERT, UPDATE` on `sync_manifest`/
+     `users`/`migration_log` (read+write, never dropped/recreated), and plain `SELECT, INSERT, UPDATE`
+     (no `DELETE`, no DDL, no ownership) on everything in `rat` including the new `sync_status` table
+     — confirmed the exact table list live against `information_schema.tables` before writing the
+     grants rather than guessing.
+   - Syntax-checked with both WSL Python and the real target runtime (`python.exe -m py_compile`) —
+     clean. Not yet run end-to-end; not yet committed (git-initialised and staged only, per this
+     project's "only commit when asked" rule).
+
+### Open Threads (this update)
+
+- `picaloco_agent` has no `build_exe.py`/installer yet. `filemaker_sync/scripts/build_exe.py` is a
+  starting template but looks stale/unverified (references a flat `filemaker_gui.py` path that
+  predates the current `gui/` layout) — adapt with care, don't trust as-is.
+- Packaging wrinkle flagged but not solved: PyInstaller `--onefile` means `sys.executable` inside the
+  frozen app is the app itself, not a general interpreter — `sync_runner.py`'s
+  `subprocess.run([sys.executable, ...])` works fine unfrozen but needs an argv-dispatch trick (or a
+  bundled portable Python) once actually frozen.
+- `picaloco_agent` not committed to git yet.
+- Never run through the actual Tkinter window by clicking buttons (all verified by calling the
+  underlying modules directly) — worth one real click-through before considering this "done."
+- `filemaker_extract.py` has a real, pre-existing, unrelated bug: an empty result set (0 matching
+  `image_no`s) produces a malformed `INSERT ... VALUES` with nothing after `VALUES`
+  (`psycopg2.errors.SyntaxError`), and the exception is caught and logged but doesn't fail the process
+  (exit code 0 regardless). Found while probing `picaloco_agent`'s role with a deliberately-fake
+  `image_no`; not fixed (out of scope for this thread, and the real sync path never hits it since
+  `run_incremental_sync.py` only ever extracts `image_no`s it already knows exist from the scan/diff).
+  Worth fixing someday so a genuinely empty extract doesn't log a scary-looking traceback.
+
+### Update, same session — role and full pipeline proven live end-to-end
+
+Rather than trust the grants from their definitions alone, ran the real thing against live `oci` as
+`picaloco_agent` (tenant-qualified as `picaloco_agent.default` for Supavisor — the bare role name gets
+`ENOIDENTIFIER`, same convention `postgres.default` already uses):
+
+1. `ALTER TABLE ... OWNER TO` initially failed live: `must be able to SET ROLE "picaloco_agent"` (PG
+   16+'s newer ownership-transfer safety check) — fixed with one extra line, `GRANT picaloco_agent TO
+   postgres;`, before the `ALTER TABLE` statements. `create_agent_role.sql` updated with the fix baked
+   in for next time.
+2. `target_config.py` had a real gap: it resolved the password from `os.environ` but never actually
+   loaded a local `.env` (unlike `vendor/env_secrets.py`, which does) — fixed with a `python-dotenv`
+   load at import time.
+3. `TARGET["user"]` needed the same `.default` tenant suffix as `postgres.default` — fixed.
+4. Both connection tests, then the real pipeline, run for real from native Windows Python:
+   - `Test FileMaker Connection` — OK.
+   - `Test Supabase Connection` — OK, as `picaloco_agent.default`.
+   - Direct read/write probe (rolled back, no data left behind): `SELECT` on `rat.catalog` (141,244),
+     `INSERT` into `rat.sync_status`, `SELECT` on `rat_migration.ratcatalogue` — all succeeded.
+   - `Check Sync` (`--dry-run`) through `sync_runner.py` exactly as the app would call it — full scan
+     → diff → manifest connect → 0/0 (correct, nothing's changed) → wrote a real `rat.sync_status` row
+     (confirmed landed, not rolled back this time).
+   - Forced a real extract cycle (one genuine `image_no`, `arc00001`) to exercise
+     `filemaker_extract.py --del-data` against the owned staging table — DELETE, fetch, INSERT all
+     succeeded under `picaloco_agent`. (First attempt used a fake `image_no` to avoid touching real
+     data and hit the unrelated empty-`VALUES` bug above instead — switched to a real, existing
+     `image_no` since re-extracting/re-loading it is a harmless, idempotent no-op per this project's
+     own established guarantees.)
+   - Forced a real load cycle (`db_dml_loader.py --mode migration_schema`) on that same row —
+     `country`/`organisation`/`location`/`route`/`collection`/`photographer`/517 `builder`s/`catalog`/
+     `catalog_metadata`/`catalog_builder`/`usage` all upserted cleanly. Surfaced one config gap on
+     `picaloco_agent`'s side (not a permission problem): `db_dml_loader.py`'s `picture_metadata` step
+     reads `config['export']['image_path']` unconditionally too — `KeyError` first time, fixed by
+     adding `image_path`/`thumbnail_path` to `sync_runner.py`'s generated `config.toml` (matching
+     `filemaker_sync`'s real config; `picture_metadata` itself still correctly reports 0 without local
+     image files, same as `filemaker_sync`'s own runs).
+5. Test artifacts (`vendor/logs/`, `logs/`) added to `.gitignore` — nothing sensitive was ever staged;
+   checked directly (`grep` for the password pattern across all tracked files) before saying so.
+
+**Every underlying piece the five buttons depend on is now proven against live `oci`/FileMaker with
+the real scoped role.** What's left before calling this done: one real click-through of the actual
+Tkinter window (everything so far called the underlying modules directly), a genuine `Sync` with a
+real delta (needs an actual FileMaker edit — nothing to fabricate here), packaging, and committing.
+
+---
