@@ -94,6 +94,34 @@ def fetch_verified(conn, image_nos: list) -> set:
         return {row[0] for row in c.fetchall()}
 
 
+def write_sync_status(conn, summary: dict) -> None:
+    """Best-effort freshness record for picaloco-web's admin page --
+    rat.sync_status must exist and grant anon SELECT (see devlog/worksheet.md
+    for the DDL); if it doesn't yet, don't fail the sync over it."""
+    try:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                INSERT INTO rat.sync_status
+                    (run_type, dry_run, new_count, changed_count, delta_count,
+                     verified_count, rejected_count, real_changes, manifest_advanced,
+                     ok, detail)
+                VALUES ('incremental_sync', %s, %s, %s, %s, %s, %s, %s, %s, true, %s)
+                """,
+                (
+                    bool(summary.get("dry_run", False)),
+                    summary.get("new"), summary.get("changed"), summary.get("delta"),
+                    summary.get("verified"), summary.get("rejected"),
+                    summary.get("real_changes"), summary.get("manifest_advanced"),
+                    json.dumps(summary),
+                ),
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"(sync-status write skipped: {e})", file=sys.stderr)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Incremental sync: scan -> extract delta -> load -> verify -> advance manifest")
     ap.add_argument("--config", default="config.toml")
@@ -131,18 +159,22 @@ def main() -> int:
 
         if not delta:
             report.line("Nothing to do.")
-            print(json.dumps({
+            summary = {
                 "new": len(result["new"]), "changed": len(result["changed"]), "delta": 0,
                 "verified": 0, "rejected": 0, "false_positives": 0, "real_changes": 0,
                 "manifest_advanced": 0,
-            }))
+            }
+            write_sync_status(pg.cnxn, summary)
+            print(json.dumps(summary))
             return 0
         if args.dry_run:
             report.line(f"--dry-run: would extract/load {len(delta)} row(s), stopping here.")
-            print(json.dumps({
+            summary = {
                 "new": len(result["new"]), "changed": len(result["changed"]), "delta": len(delta),
                 "dry_run": True,
-            }))
+            }
+            write_sync_status(pg.cnxn, summary)
+            print(json.dumps(summary))
             return 0
 
         profile = dsm.resolve_active_profile(cfg, args.target_profile)
@@ -201,11 +233,13 @@ def main() -> int:
         report.kv("real changes:", len(verified) - false_positives)
         report.line("")
         report.line(f"Manifest advanced for {len(mark)} row(s).")
-        print(json.dumps({
+        summary = {
             "new": len(result["new"]), "changed": len(result["changed"]), "delta": len(delta),
             "verified": len(verified), "rejected": len(rejected), "false_positives": false_positives,
             "real_changes": len(verified) - false_positives, "manifest_advanced": len(mark),
-        }))
+        }
+        write_sync_status(pg.cnxn, summary)
+        print(json.dumps(summary))
     finally:
         pg.close()
 

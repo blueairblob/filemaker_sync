@@ -15,6 +15,7 @@ import threading
 import subprocess
 import queue
 import time
+import webbrowser
 
 # Import our modules
 from gui_logging import LogManager, LogLevel, PerformanceLogger
@@ -284,6 +285,8 @@ class FileMakerSyncGUI:
         tools_menu.add_separator()
         tools_menu.add_command(label="Open Export Folder", command=self.safe_open_export_folder)
         tools_menu.add_command(label="Open Log Folder", command=self.safe_open_log_folder)
+        tools_menu.add_separator()
+        tools_menu.add_command(label="Open Admin Dashboard (picaloco-web)", command=self.safe_open_admin_dashboard)
         
         # Help menu
         help_menu = tk.Menu(self.menubar, tearoff=0)
@@ -755,6 +758,16 @@ For detailed logs, check Tools → View Activity Logs
         
         threading.Thread(target=open_folder, daemon=True, name="Open-Logs").start()
     
+    def safe_open_admin_dashboard(self):
+        """Open picaloco-web's admin/status page in the default browser -- a
+        link-out only, no local integration. Shows last-sync freshness read
+        straight from rat.sync_status via picaloco-web's own Supabase client."""
+        url = "https://picaloco-web.vercel.app/admin"
+        try:
+            webbrowser.open(url)
+        except Exception as e:
+            self.log_manager.log(LogLevel.ERROR, "GUI", f"Error opening admin dashboard: {e}")
+
     def safe_show_about(self):
         """About dialog"""
         def show_about():

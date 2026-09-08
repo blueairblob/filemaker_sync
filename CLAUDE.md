@@ -23,6 +23,20 @@ program — get FileMaker's data reliably into Postgres, with a GUI reliable eno
 on-site engagement. The REST API/React frontend/mobile apps RAT will actually use afterward are a separate,
 not-yet-scoped piece of work (not started in this repo as of Session 13) — don't assume it belongs here.
 
+**Update (Session 18): the "transient tool" framing above is deliberately being widened, not
+replaced.** The real deployment situation only became explicit this session: one desktop, one
+FileMaker database, at a remote site, operated by RAT volunteers — the user does not want to be
+physically present (or remoted in) for routine care like reopening FileMaker after a reboot. Agreed
+direction: evolve the current tkinter GUI into a small-footprint installable **agent** (not a classic
+"thin client" — Stage 1 extraction needs native FileMaker ODBC on Windows and can never move off that
+desktop) that runs as a background service, connects **outbound** over a persistent websocket to a
+relay hosted on `oci` (the desktop itself stays unreachable from outside, no inbound holes needed),
+and is monitored/controlled from a browser-based admin page reachable from anywhere. This is a real,
+deliberate scope expansion — the first server-side component beyond Supabase itself — agreed with the
+user, not backed into. Nothing beyond a small first step is built yet; see `devlog/worksheet.md`
+Session 18 for the full discussion and the agreed "foot in the door" first step (a `rat.sync_status`
+table + a GUI link-out button, proving the read path before any of the agent/relay/auth work).
+
 **Internalise this — it drives every decision:** the source data is error-prone (hand-entered) and the
 source schema is partly opaque. We can't fully trust the source. This is a *data rescue*, not a clean
 sync. That's why the loader **quarantines** dubious rows instead of coercing them, why the **live DB**
@@ -413,9 +427,16 @@ surface ever matters to this repo's own work. Full detail in `devlog/worksheet.m
 Session 14. `picaloco_rest` (a third sibling repo) is not a custom backend, just a Vercel-hosted Swagger UI
 mirror — not directly relevant to any of this.
 
+**Update (Session 18): remote-agent direction agreed, first step in progress — see "What this project
+is" above.** `run_incremental_sync.py` now writes each run's summary to `rat.sync_status` (DDL not yet
+applied to `oci`) and the GUI has a Tools-menu link-out to `picaloco-web`'s (not-yet-built) `/admin`
+page. Full agent/relay/websocket build not started — this is scoping/foot-in-the-door only. See
+`devlog/worksheet.md` Session 18 for the full discussion and open threads.
+
 Smaller open threads: no GUI target-profile picker; Migration Overview's full `rat.*`-comparison redesign
 (parked, no clean table mapping); `picture_metadata` untested against real images (no local files); the 16
 flagged source records (FileMaker-side); `--mode dml_files` parser rewrite (low priority,
 `migration_schema` mode works); `requirements.txt`'s `pandas==2.1.4` pin (no Python 3.13 wheel);
-`PicaLocoBackend`/`picaloco` rebrand (explicitly gated until stable — arguably close now, still not done).
+`PicaLocoBackend`/`picaloco` rebrand (explicitly gated until stable — arguably close now, still not done);
+`supabase-edge-functions` crash-loop fix handed to user, not yet confirmed run.
 Full detail in `devlog/worksheet.md`.
