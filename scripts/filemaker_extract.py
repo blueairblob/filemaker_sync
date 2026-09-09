@@ -1056,6 +1056,7 @@ def export_images(table):
    
     # export_images
     img_cnt_tot = 0
+    no_image_data_cnt = 0
     try:
         img_chk_data = table_data[dbs['dsn']][table]['data']
         img_row_cnt =  table_data[dbs['dsn']][table]['cnt']
@@ -1088,7 +1089,20 @@ def export_images(table):
             if isinstance(image_name, str) and image_name and image_data:
                 image_name = image_name.replace('\n', '').replace('\r', '').replace(' ', '')
             else:
-                if image_name and image_data:
+                if isinstance(image_name, str) and image_name and not image_data:
+                    # A valid image_no, but FileMaker's container field is
+                    # empty -- a real, common state for an archive still
+                    # being digitised (metadata entered, photo not yet
+                    # scanned/attached), not an error. Previously silent
+                    # entirely (the old guard only logged the non-string
+                    # case) -- logged now so "why is this image_no still
+                    # missing from Storage" has an answer instead of
+                    # nothing. Confirmed live, 2026-09-09: roughly 132 of a
+                    # 178-record Storage gap turned out to be exactly this.
+                    no_image_data_cnt += 1
+                    logger.debug(f"images: {image_name!r} has no attached photo "
+                                 f"(container field empty) -- skipping")
+                elif image_name and image_data:
                     logger.debug(f"images: skipping row with non-string image_no ({image_name!r})")
                 continue
             
@@ -1124,6 +1138,10 @@ def export_images(table):
             # one explicitly so the next log line always starts its own line.
             sys.stderr.write("\n")
             sys.stderr.flush()
+
+    if no_image_data_cnt:
+        logger.info(f"{table}: {no_image_data_cnt} row(s) had a valid image_no but no attached "
+                    f"photo (FileMaker container field empty) -- nothing to export for these.")
 
 def found_in(l1: list, l2: list) -> bool:
     """ Compares one list to another """
