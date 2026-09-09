@@ -1241,7 +1241,12 @@ if __name__ == "__main__":
     ins_err = {} 
     err_cnt = 0  
     chunk = 100
-    export_image_formats = ['jpg', 'webp']
+    # jpg dropped (2026-09-09): nothing downstream ever reads images/jpg/ --
+    # db_dml_loader.py's process_image_folder() and upload_images_oci.py both
+    # only ever look at images/webp/ -- so writing it was pure wasted local
+    # disk on the extracting machine (confirmed via grep: no other reference
+    # to jpg_pth/images/jpg anywhere in this codebase).
+    export_image_formats = ['webp']
     debug = False
     postgres_version = None
     dupe_entry_cnt = 0
