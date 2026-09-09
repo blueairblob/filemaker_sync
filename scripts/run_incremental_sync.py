@@ -16,7 +16,13 @@ Ties together the three existing tools instead of reinventing them:
 
 FLOW
   1. Skinny-scan FileMaker, diff against the manifest -> new + changed.
-     Nothing to do? Log and exit 0. (--dry-run stops here.)
+     ALSO check target completeness: any image_no the manifest believes is
+     already loaded, but that's actually missing from rat.catalog right now
+     (e.g. an accidental delete), gets added as "repaired" -- bypassing the
+     ROWMODID check entirely, since direct proof of absence beats "hasn't
+     changed since last load." Nothing to do (no new/changed/repaired)? Log
+     and exit 0. (--dry-run stops here, but still reports what it found,
+     repaired included.)
   2. Extract exactly those image_nos (filemaker_extract.py
      --image-nos-file) into rat_migration.ratcatalogue; refresh the small
      reference tables (ratbuilders/ratroutes/ratcollections/prompts) in
@@ -105,6 +111,21 @@ def fetch_verified(conn, image_nos: list) -> set:
         return {row[0] for row in c.fetchall()}
 
 
+def fetch_catalog_image_nos(conn) -> set:
+    """Every image_no actually present in rat.catalog right now -- used to
+    detect target-side data loss (e.g. an accidental delete) independent of
+    whether FileMaker's own ROWMODID has moved. The skinny-scan diff alone
+    is blind to this: it only compares FileMaker's current state against
+    the manifest's last-loaded state, so a row the manifest still believes
+    is loaded, but that's actually gone from rat.catalog, would otherwise
+    never be flagged as new/changed and would never get re-synced (confirmed
+    live, 2026-09-09: deleted a real catalog row, ran Check Sync, got
+    "new: 0, changed: 0" -- the row stayed missing)."""
+    with conn.cursor() as c:
+        c.execute('SELECT image_no FROM rat.catalog WHERE image_no IS NOT NULL')
+        return {row[0] for row in c.fetchall()}
+
+
 def write_sync_status(conn, summary: dict) -> None:
     """Best-effort freshness record for picaloco-web's admin page --
     rat.sync_status must exist and grant anon SELECT (see devlog/worksheet.md
@@ -166,15 +187,28 @@ def main() -> int:
                           "here -- mark_loaded() writes to the live DB).")
     try:
         result = dsm.classify_sync(by_image, unkeyed, dups, manifest)
-        delta = result["new"] + result["changed"]
+
+        # Target-completeness check: image_nos the manifest believes are
+        # already loaded, still present in FileMaker (nothing to extract
+        # otherwise), but missing from rat.catalog right now. Independent of
+        # the skinny-scan diff above -- catches target-side data loss that
+        # ROWMODID comparison alone is blind to. See fetch_catalog_image_nos()'s
+        # own docstring for how this was confirmed live.
+        already_covered = set(result["new"]) | set(result["changed"])
+        catalog_image_nos = fetch_catalog_image_nos(pg.cnxn)
+        repaired = sorted((set(manifest.keys()) & set(by_image.keys()))
+                           - catalog_image_nos - already_covered)
+
+        delta = result["new"] + result["changed"] + repaired
         report.kv("new:", len(result["new"]))
         report.kv("changed:", len(result["changed"]))
-        report.kv("delta (new+changed):", len(delta))
+        report.kv("repaired (in manifest, missing from rat.catalog):", len(repaired))
+        report.kv("delta (new+changed+repaired):", len(delta))
 
         if not delta:
             report.line("Nothing to do.")
             summary = {
-                "new": len(result["new"]), "changed": len(result["changed"]), "delta": 0,
+                "new": len(result["new"]), "changed": len(result["changed"]), "repaired": 0, "delta": 0,
                 "verified": 0, "rejected": 0, "false_positives": 0, "real_changes": 0,
                 "manifest_advanced": 0,
             }
@@ -184,8 +218,8 @@ def main() -> int:
         if args.dry_run:
             report.line(f"--dry-run: would extract/load {len(delta)} row(s), stopping here.")
             summary = {
-                "new": len(result["new"]), "changed": len(result["changed"]), "delta": len(delta),
-                "dry_run": True,
+                "new": len(result["new"]), "changed": len(result["changed"]), "repaired": len(repaired),
+                "delta": len(delta), "dry_run": True,
             }
             write_sync_status(pg.cnxn, summary)
             print(json.dumps(summary))
@@ -230,12 +264,21 @@ def main() -> int:
             report.kv("rejected/quarantined (not advanced):", len(rejected))
 
         # 6. Advance the manifest for exactly the verified set.
+        repaired_set = set(repaired)
         mark = {}
         false_positives = 0
+        repaired_verified = 0
         for img in verified:
             new_hash = dsm.row_hash(staging_rows.get(img, {}))
             old_hash = manifest.get(img, {}).get("row_hash")
-            if old_hash is not None and old_hash == new_hash:
+            if img in repaired_set:
+                # Content is expected to match (FileMaker never changed) --
+                # the row was just missing from the target, not stale. Kept
+                # out of false_positives so the two don't get conflated in
+                # the summary: one means "harmless re-verify," the other
+                # means "we just restored a deleted row."
+                repaired_verified += 1
+            elif old_hash is not None and old_hash == new_hash:
                 false_positives += 1
             mark[img] = {
                 "rowid": by_image[img]["rowid"],
@@ -244,8 +287,9 @@ def main() -> int:
             }
         pg.mark_loaded(mark)
 
+        report.kv("repaired (restored to rat.catalog):", repaired_verified)
         report.kv("false positives (ROWMODID moved, content didn't):", false_positives)
-        report.kv("real changes:", len(verified) - false_positives)
+        report.kv("real changes:", len(verified) - false_positives - repaired_verified)
         report.line("")
         report.line(f"Manifest advanced for {len(mark)} row(s).")
 
@@ -280,9 +324,12 @@ def main() -> int:
                 print(f"(image sync skipped: {e})", file=sys.stderr)
 
         summary = {
-            "new": len(result["new"]), "changed": len(result["changed"]), "delta": len(delta),
+            "new": len(result["new"]), "changed": len(result["changed"]), "repaired": len(repaired),
+            "delta": len(delta),
             "verified": len(verified), "rejected": len(rejected), "false_positives": false_positives,
-            "real_changes": len(verified) - false_positives, "manifest_advanced": len(mark),
+            "repaired_verified": repaired_verified,
+            "real_changes": len(verified) - false_positives - repaired_verified,
+            "manifest_advanced": len(mark),
             "images_uploaded": images_uploaded,
         }
         write_sync_status(pg.cnxn, summary)
