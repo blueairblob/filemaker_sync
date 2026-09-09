@@ -953,7 +953,17 @@ def export_data(tab: dict, name: str, header_req: bool = True, footer_req = True
                     i = ''
                     if not re.findall('INSERT INTO', tab[name]['dml'], re.IGNORECASE):
                         i = insert_header
-                    bulk_dml = adjust_sql_syntax(i + tab[name]['dml'], db_type)
+                    # NOT adjust_sql_syntax() here -- df_to_sql_bulk_insert() already
+                    # emits Postgres-style double-quoted column identifiers whenever
+                    # db_type != 'mysql', so by this point there's no legitimate
+                    # backtick-quoted identifier left for it to convert. Applying it
+                    # anyway blindly rewrote every literal backtick in the DATA too --
+                    # confirmed live, 2026-09-09: a genuine backtick typo in a real
+                    # image_no (e.g. "mssacpe3057`") landed in rat_migration.ratcatalogue
+                    # as "mssacpe3057"" (a double quote), corrupting the row's natural
+                    # key on the way in and making it silently un-matchable against the
+                    # FileMaker-side value everywhere downstream.
+                    bulk_dml = i + tab[name]['dml']
                     pk_col_list = dbt.get(mig_schema, {}).get('pk', {}).get(name)
                     if pk_col_list:
                         pk_cols = ', '.join(pk_col_list).replace('\\', '')
@@ -981,7 +991,9 @@ def export_data(tab: dict, name: str, header_req: bool = True, footer_req = True
                         if not re.findall('INSERT INTO', ins_sql, re.IGNORECASE):
                             i = insert_header
                         txt = i + ins_sql
-                        adjusted_dml = adjust_sql_syntax(txt, db_type)
+                        # Same reasoning as the bulk path above -- no adjust_sql_syntax()
+                        # here either, for the same reason.
+                        adjusted_dml = txt
                         
                         if start_from != None:
                             if name == 'ratcatalogue':
@@ -1149,6 +1161,19 @@ def get_table_export_list(export_tables: str = 'all') -> list:
     return table_list
 
 def adjust_sql_syntax(sql, dbt_type):
+    """MySQL-backtick -> Postgres-doublequote identifier-quoting adjustment,
+    for DDL text sourced from FileMaker's own schema description (which may
+    genuinely use backtick-quoted identifiers).
+
+    DO NOT call this on generated DML/INSERT text: df_to_sql_bulk_insert()
+    already emits Postgres-style double-quoted column identifiers whenever
+    db_type != 'mysql', so there's no legitimate backtick-quoted identifier
+    left in that text for this to fix -- the blind sql.replace() below can
+    only be corrupting a literal backtick inside an actual DATA value at
+    that point. Confirmed live, 2026-09-09: this exact bug silently turned a
+    real image_no typo ("mssacpe3057`") into a different, wrong value
+    ("mssacpe3057\"") on the way into rat_migration.ratcatalogue -- removed
+    from both DML call sites in export_data() for this reason."""
     if dbt_type == 'supabase':
         sql = sql.replace('`', '"')
         # Add more replacements as needed for PostgreSQL syntax
