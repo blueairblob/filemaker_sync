@@ -262,6 +262,46 @@ class InvalidKeyError(Exception):
     an expected, unactionable rejection as a fresh problem."""
 
 
+def write_invalid_key_report(invalid_key_names: list, cfg: dict) -> str | None:
+    """A browsable .xlsx of every image_no InvalidKeyError rejected this
+    run -- printing them to the log (as this script already did) isn't
+    enough on its own for a RAT volunteer to act on; they need something
+    they can actually open and work through. One column is enough here
+    (unlike run_incremental_sync.py's quarantine report, this script has no
+    access to the record's other FileMaker fields -- just the image_no and
+    why it's stuck) -- image_no is itself a unique, searchable key in
+    FileMaker Pro, so it's sufficient to find and fix the real record.
+
+    Best-effort: missing openpyxl or a write failure logs a warning and
+    doesn't fail the run -- these rows already aren't counted as failures
+    (see InvalidKeyError's docstring), this is purely an added convenience."""
+    if not invalid_key_names:
+        return None
+    try:
+        from openpyxl import Workbook
+    except ImportError:
+        print("(invalid-key report skipped: openpyxl not installed -- pip install openpyxl)", file=sys.stderr)
+        return None
+    try:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Needs FileMaker fix"
+        ws.append(["image_no", "issue"])
+        for img in sorted(invalid_key_names):
+            ws.append([img, "Contains a character Supabase Storage rejects (e.g. a backtick) -- "
+                             "open this Image no. in FileMaker Pro and retype it without that character."])
+
+        export_path = cfg.get("export", {}).get("path", "export")
+        out_dir = Path(export_path)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"invalid_key_report_{dsm.NOW.strftime('%Y%m%d_%H%M%S')}.xlsx"
+        wb.save(out_path)
+        return str(out_path)
+    except Exception as e:
+        print(f"(invalid-key report write failed: {e})", file=sys.stderr)
+        return None
+
+
 def upload_one(base_url: str, bucket: str, image_no: str, local_path: Path, headers: dict) -> None:
     upload_headers = dict(headers)
     upload_headers["Content-Type"] = "image/webp"
@@ -403,6 +443,9 @@ def main() -> int:
             print(f"  {n}")
         if len(invalid_key_names) > 20:
             print(f"  ... and {len(invalid_key_names) - 20} more")
+        invalid_key_report_path = write_invalid_key_report(invalid_key_names, config)
+        if invalid_key_report_path:
+            print(f"Report (for FileMaker-side correction): {invalid_key_report_path}")
     if failed_names:
         print("Failed (unexpected -- re-run the script; already-uploaded files are skipped, so this is cheap):")
         for n, err in failed_names[:20]:
