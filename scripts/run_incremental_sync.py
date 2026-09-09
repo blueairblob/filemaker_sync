@@ -147,6 +147,9 @@ def main() -> int:
     ap.add_argument("--manifest-snapshot", help="use a snapshot instead of the live manifest (offline test)")
     ap.add_argument("--user-id", default="incremental-sync", help="audit user id passed to the loader")
     ap.add_argument("--dry-run", action="store_true", help="scan+diff only; don't extract, load, or advance")
+    ap.add_argument("--debug", action="store_true", help="Pass --debug through to every filemaker_extract.py "
+                     "subprocess call this makes -- raises its own log level AND un-suppresses its per-image "
+                     "export progress bars (normally hidden since they flood a captured/streamed log).")
     args = ap.parse_args()
 
     cfg = dsm.load_toml(args.config) if os.path.exists(args.config) else {}
@@ -189,6 +192,7 @@ def main() -> int:
             return 0
 
         profile = dsm.resolve_active_profile(cfg, args.target_profile)
+        debug_flag = ["--debug"] if args.debug else []
 
         # 2. Extract exactly the delta, then refresh the small reference tables in full.
         fd, delta_file = tempfile.mkstemp(suffix=".txt", text=True)
@@ -199,14 +203,14 @@ def main() -> int:
                 "filemaker_extract.py", "--db-exp", "--ddl", "--dml",
                 "--tables-to-export", "ratcatalogue", "--del-data",
                 "--image-nos-file", delta_file, "--target-profile", profile,
-            ], "filemaker_extract.py (delta)")
+            ] + debug_flag, "filemaker_extract.py (delta)")
         finally:
             os.unlink(delta_file)
         run_subprocess([
             "filemaker_extract.py", "--db-exp", "--ddl", "--dml",
             "--tables-to-export", "ratbuilders,ratroutes,ratcollections,prompts", "--del-data",
             "--target-profile", profile,
-        ], "filemaker_extract.py (reference tables)")
+        ] + debug_flag, "filemaker_extract.py (reference tables)")
 
         # 3. Load (unmodified entry point; reads whatever's now in staging).
         run_subprocess([
@@ -259,7 +263,7 @@ def main() -> int:
                     run_subprocess([
                         "filemaker_extract.py", "--get-images",
                         "--image-nos-file", img_delta_file, "--target-profile", profile,
-                    ], "filemaker_extract.py (images, delta)")
+                    ] + debug_flag, "filemaker_extract.py (images, delta)")
                 finally:
                     os.unlink(img_delta_file)
 

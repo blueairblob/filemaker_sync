@@ -1056,7 +1056,16 @@ def export_images(table):
         img_cnt = len(img_data['data'])
         img_cnt_tot += img_cnt  
         logger.info(f"{table}: Exporting {img_cnt_tot}/{img_row_cnt} images")
-        for index, item in tqdm(enumerate(img_data['data'], start=0), total = img_cnt, desc="Exporting images"): 
+        # The per-image progress bar is suppressed unless --debug -- at full
+        # scale (141k+ images, ~1,400 chunks of 100) it floods a captured/
+        # streamed log with one update every few rows, badly outweighing the
+        # one line above that's actually useful (confirmed live, 2026-09-09:
+        # a GUI streaming this output became almost unreadable). Disabling it
+        # also sidesteps a related display glitch: tqdm updates in-place with
+        # bare '\r' (no '\n'), which runs straight into the next log line with
+        # no visible line break when read through a non-terminal pipe.
+        for index, item in tqdm(enumerate(img_data['data'], start=0), total = img_cnt,
+                                 desc="Exporting images", disable=not debug):  # type: ignore  # noqa: F821 -- injected by get_args()
             image_name = item[0]
             image_data = item[1]
             # Clean up -- image_name must be checked as a real string, not just
@@ -1096,6 +1105,13 @@ def export_images(table):
 
             # Convert to Base64
             #image_data_webp_b64 = base64.b64encode(webp_data.getvalue()).decode('utf-8')
+
+        if debug:  # type: ignore  # noqa: F821 -- injected by get_args()
+            # tqdm's own final '\n' (written on close()) can arrive out of
+            # order once merged into a piped, non-terminal stream -- write
+            # one explicitly so the next log line always starts its own line.
+            sys.stderr.write("\n")
+            sys.stderr.flush()
 
 def found_in(l1: list, l2: list) -> bool:
     """ Compares one list to another """
