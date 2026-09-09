@@ -20,9 +20,16 @@ FLOW
      already loaded, but that's actually missing from rat.catalog right now
      (e.g. an accidental delete), gets added as "repaired" -- bypassing the
      ROWMODID check entirely, since direct proof of absence beats "hasn't
-     changed since last load." Nothing to do (no new/changed/repaired)? Log
-     and exit 0. (--dry-run stops here, but still reports what it found,
-     repaired included.)
+     changed since last load." ALSO, independently, check image completeness
+     (get_missing_images(): a Postgres+Storage-only diff, same as the
+     standalone Upload Images action, no FileMaker involved) -- this runs
+     every time regardless of the catalog delta, since a record's catalog
+     row can be perfectly correct and stable while its photo has still never
+     uploaded (e.g. a permanently-quarantined InvalidKey image_no); without
+     this, such a record stops being reported the moment it stops being
+     new/changed/repaired, even though the photo is still missing. Nothing
+     to do (no new/changed/repaired AND no missing images)? Log and exit 0.
+     (--dry-run stops here, but still reports what it found, both kinds.)
   2. Extract exactly those image_nos (filemaker_extract.py
      --image-nos-file) into rat_migration.ratcatalogue; refresh the small
      reference tables (ratbuilders/ratroutes/ratcollections/prompts) in
@@ -47,17 +54,19 @@ FLOW
      with the new rowmodid/row_hash. Anything NOT verified is left
      untouched -- it naturally reappears as new/changed next run. Never
      advance from the scan/diff step itself.
-  7. Images, folded into the same run: extract + upload exactly the
-     verified set's images (filemaker_extract.py --get-images
-     --image-nos-file, upload_images_oci.py --image-nos --force). A new
-     record needs both metadata and image; a changed record's image may
-     or may not actually have changed alongside its metadata, and there's
-     no cheap way to tell without re-fetching it -- so every verified row
-     gets its image re-pulled and force-uploaded (x-upsert overwrites).
-     Proportional to the sync's own delta, not a full-catalog rescan --
-     see filemaker_extract.py's --get-images scoping. A separate, full-
-     catalog "Upload Images" pass (no --image-nos-file) still exists
-     for backfilling images that predate this step, or disaster recovery.
+  7. Images, folded into the same run: extract + upload this run's verified
+     rows' images UNION whatever get_missing_images() found missing at step
+     1 (filemaker_extract.py --get-images --image-nos-file, upload_images_oci.py
+     --image-nos --force). A new record needs both metadata and image; a
+     changed record's image may or may not actually have changed alongside
+     its metadata, and there's no cheap way to tell without re-fetching it --
+     so every verified row gets its image re-pulled and force-uploaded
+     (x-upsert overwrites). Still-missing images from step 1 get the same
+     treatment even with an empty catalog delta -- that's the whole point of
+     checking them independently. Proportional to the actual gap, not a
+     full-catalog rescan -- see filemaker_extract.py's --get-images scoping.
+     A separate, full-catalog "Upload Images" pass (no --image-nos-file for
+     the initial local export) still exists for disaster recovery.
 
 REQUIRES native Windows Python (python.exe) -- step 1's live FileMaker
 scan and step 2's extract both need the FileMaker ODBC driver, same
@@ -196,6 +205,36 @@ def fetch_catalog_image_nos(conn) -> set:
         return {row[0] for row in c.fetchall()}
 
 
+def get_missing_images(profile: str, debug_flag: list) -> list:
+    """Every image_no in rat.catalog missing a Storage object right now --
+    upload_images_oci.py --list-missing, the same gap-scoped check the
+    standalone Upload Images action uses (a Postgres query + a Storage
+    listing, no FileMaker touched). Run unconditionally on every Check
+    Sync/Sync, independent of whether there's a catalog delta this run --
+    otherwise a record whose catalog row is stable but whose image has
+    never successfully uploaded (e.g. a permanently-quarantined InvalidKey
+    image_no) never resurfaces in Sync's own output once it stops being
+    new/changed/repaired, even though the photo is still missing (confirmed
+    live, 2026-09-09: 45 known InvalidKey rows fell out of "repaired" once
+    their catalog data was fixed, and Check Sync/Sync went back to
+    reporting "Nothing to do" despite still having 0 photos in Storage).
+
+    Best-effort: a failure here (network, Storage auth) logs a warning and
+    returns [] rather than aborting an otherwise-healthy catalog sync."""
+    fd, out_file = tempfile.mkstemp(suffix=".txt", text=True)
+    os.close(fd)
+    try:
+        run_subprocess([
+            "upload_images_oci.py", "--list-missing", out_file, "--target-profile", profile,
+        ] + debug_flag, "upload_images_oci.py (list-missing)")
+        return [line.strip() for line in Path(out_file).read_text(encoding="utf-8").splitlines() if line.strip()]
+    except SystemExit as e:
+        print(f"(missing-images check skipped: {e})", file=sys.stderr)
+        return []
+    finally:
+        os.unlink(out_file)
+
+
 def write_sync_status(conn, summary: dict) -> None:
     """Best-effort freshness record for picaloco-web's admin page --
     rat.sync_status must exist and grant anon SELECT (see devlog/worksheet.md
@@ -275,10 +314,23 @@ def main() -> int:
         report.kv("repaired (in manifest, missing from rat.catalog):", len(repaired))
         report.kv("delta (new+changed+repaired):", len(delta))
 
-        if not delta:
+        profile = dsm.resolve_active_profile(cfg, args.target_profile)
+        debug_flag = ["--debug"] if args.debug else []
+
+        # Image completeness (Storage vs rat.catalog) -- ALWAYS checked, even
+        # with an empty catalog delta. See get_missing_images()'s own
+        # docstring for why: a record can be permanently missing its photo
+        # (e.g. a quarantined InvalidKey image_no) long after its catalog row
+        # itself stops being new/changed/repaired, and this is the only place
+        # left that would ever notice and report it again.
+        missing_images = get_missing_images(profile, debug_flag)
+        report.kv("images missing from Storage:", len(missing_images))
+
+        if not delta and not missing_images:
             report.line("Nothing to do.")
             summary = {
                 "new": len(result["new"]), "changed": len(result["changed"]), "repaired": 0, "delta": 0,
+                "missing_images": 0,
                 "verified": 0, "rejected": 0, "false_positives": 0, "real_changes": 0,
                 "manifest_advanced": 0,
             }
@@ -286,102 +338,118 @@ def main() -> int:
             print(json.dumps(summary))
             return 0
         if args.dry_run:
-            report.line(f"--dry-run: would extract/load {len(delta)} row(s), stopping here.")
+            parts = []
+            if delta:
+                parts.append(f"extract/load {len(delta)} row(s)")
+            if missing_images:
+                parts.append(f"sync {len(missing_images)} missing image(s) (known-InvalidKey rows "
+                              f"will still fail Storage -- see devlog/worksheet.md Session 16)")
+            report.line(f"--dry-run: would {' and '.join(parts)}, stopping here.")
             summary = {
                 "new": len(result["new"]), "changed": len(result["changed"]), "repaired": len(repaired),
-                "delta": len(delta), "dry_run": True,
+                "delta": len(delta), "missing_images": len(missing_images), "dry_run": True,
             }
             write_sync_status(pg.cnxn, summary)
             print(json.dumps(summary))
             return 0
 
-        profile = dsm.resolve_active_profile(cfg, args.target_profile)
-        debug_flag = ["--debug"] if args.debug else []
-
-        # 2. Extract exactly the delta, then refresh the small reference tables in full.
-        fd, delta_file = tempfile.mkstemp(suffix=".txt", text=True)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write("\n".join(delta))
-            run_subprocess([
-                "filemaker_extract.py", "--db-exp", "--ddl", "--dml",
-                "--tables-to-export", "ratcatalogue", "--del-data",
-                "--image-nos-file", delta_file, "--target-profile", profile,
-            ] + debug_flag, "filemaker_extract.py (delta)")
-        finally:
-            os.unlink(delta_file)
-        run_subprocess([
-            "filemaker_extract.py", "--db-exp", "--ddl", "--dml",
-            "--tables-to-export", "ratbuilders,ratroutes,ratcollections,prompts", "--del-data",
-            "--target-profile", profile,
-        ] + debug_flag, "filemaker_extract.py (reference tables)")
-
-        # 3. Load (unmodified entry point; reads whatever's now in staging).
-        run_subprocess([
-            "db_dml_loader.py", "--mode", "migration_schema",
-            "--export-path", "unused", "--user-id", args.user_id, "--target-profile", profile,
-        ], "db_dml_loader.py")
-
-        # 4. Verify against rat.catalog directly, and 5. row-hash compare against
-        # what's now in staging (exactly this run's freshly-extracted delta rows).
-        mig_schema = cfg["database"]["target"]["schema"][cfg["database"]["target"]["mig_schema"]]
-        verified = fetch_verified(pg.cnxn, delta)
-        # Fetch staging data for the WHOLE delta, not just verified -- rejected
-        # rows need their full freshly-extracted row too, for the quarantine
-        # report below (row_hash() below only ever looks up verified rows,
-        # unaffected by fetching the wider set).
-        staging_rows = fetch_staging_rows(pg.cnxn, mig_schema, delta)
-
-        rejected = set(delta) - verified
-        report.kv("verified (committed to rat.catalog):", len(verified))
+        verified: set = set()
+        staging_rows: dict = {}
+        rejected: set = set()
         quarantine_report_path = None
-        if rejected:
-            report.kv("rejected/quarantined (not advanced):", len(rejected))
-            quarantine_report_path = write_quarantine_report(staging_rows, rejected, by_image, cfg)
-            if quarantine_report_path:
-                report.line(f"Quarantine report (for FileMaker-side correction): {quarantine_report_path}")
-
-        # 6. Advance the manifest for exactly the verified set.
-        repaired_set = set(repaired)
-        mark = {}
+        mark: dict = {}
         false_positives = 0
         repaired_verified = 0
-        for img in verified:
-            new_hash = dsm.row_hash(staging_rows.get(img, {}))
-            old_hash = manifest.get(img, {}).get("row_hash")
-            if img in repaired_set:
-                # Content is expected to match (FileMaker never changed) --
-                # the row was just missing from the target, not stale. Kept
-                # out of false_positives so the two don't get conflated in
-                # the summary: one means "harmless re-verify," the other
-                # means "we just restored a deleted row."
-                repaired_verified += 1
-            elif old_hash is not None and old_hash == new_hash:
-                false_positives += 1
-            mark[img] = {
-                "rowid": by_image[img]["rowid"],
-                "rowmodid": by_image[img]["rowmodid"],
-                "row_hash": new_hash,
-            }
-        pg.mark_loaded(mark)
 
-        report.kv("repaired (restored to rat.catalog):", repaired_verified)
-        report.kv("false positives (ROWMODID moved, content didn't):", false_positives)
-        report.kv("real changes:", len(verified) - false_positives - repaired_verified)
-        report.line("")
-        report.line(f"Manifest advanced for {len(mark)} row(s).")
+        if delta:
+            # 2. Extract exactly the delta, then refresh the small reference tables in full.
+            fd, delta_file = tempfile.mkstemp(suffix=".txt", text=True)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write("\n".join(delta))
+                run_subprocess([
+                    "filemaker_extract.py", "--db-exp", "--ddl", "--dml",
+                    "--tables-to-export", "ratcatalogue", "--del-data",
+                    "--image-nos-file", delta_file, "--target-profile", profile,
+                ] + debug_flag, "filemaker_extract.py (delta)")
+            finally:
+                os.unlink(delta_file)
+            run_subprocess([
+                "filemaker_extract.py", "--db-exp", "--ddl", "--dml",
+                "--tables-to-export", "ratbuilders,ratroutes,ratcollections,prompts", "--del-data",
+                "--target-profile", profile,
+            ] + debug_flag, "filemaker_extract.py (reference tables)")
 
-        # 7. Images for exactly the verified set -- see module docstring point 7.
-        # Best-effort: catalog data is already committed and the manifest already
-        # advanced above, so a flaky image upload shouldn't fail an otherwise-
-        # successful sync. Logged, not silent -- worth noticing if it recurs.
+            # 3. Load (unmodified entry point; reads whatever's now in staging).
+            run_subprocess([
+                "db_dml_loader.py", "--mode", "migration_schema",
+                "--export-path", "unused", "--user-id", args.user_id, "--target-profile", profile,
+            ], "db_dml_loader.py")
+
+            # 4. Verify against rat.catalog directly, and 5. row-hash compare against
+            # what's now in staging (exactly this run's freshly-extracted delta rows).
+            mig_schema = cfg["database"]["target"]["schema"][cfg["database"]["target"]["mig_schema"]]
+            verified = fetch_verified(pg.cnxn, delta)
+            # Fetch staging data for the WHOLE delta, not just verified -- rejected
+            # rows need their full freshly-extracted row too, for the quarantine
+            # report below (row_hash() below only ever looks up verified rows,
+            # unaffected by fetching the wider set).
+            staging_rows = fetch_staging_rows(pg.cnxn, mig_schema, delta)
+
+            rejected = set(delta) - verified
+            report.kv("verified (committed to rat.catalog):", len(verified))
+            if rejected:
+                report.kv("rejected/quarantined (not advanced):", len(rejected))
+                quarantine_report_path = write_quarantine_report(staging_rows, rejected, by_image, cfg)
+                if quarantine_report_path:
+                    report.line(f"Quarantine report (for FileMaker-side correction): {quarantine_report_path}")
+
+            # 6. Advance the manifest for exactly the verified set.
+            repaired_set = set(repaired)
+            for img in verified:
+                new_hash = dsm.row_hash(staging_rows.get(img, {}))
+                old_hash = manifest.get(img, {}).get("row_hash")
+                if img in repaired_set:
+                    # Content is expected to match (FileMaker never changed) --
+                    # the row was just missing from the target, not stale. Kept
+                    # out of false_positives so the two don't get conflated in
+                    # the summary: one means "harmless re-verify," the other
+                    # means "we just restored a deleted row."
+                    repaired_verified += 1
+                elif old_hash is not None and old_hash == new_hash:
+                    false_positives += 1
+                mark[img] = {
+                    "rowid": by_image[img]["rowid"],
+                    "rowmodid": by_image[img]["rowmodid"],
+                    "row_hash": new_hash,
+                }
+            pg.mark_loaded(mark)
+
+            report.kv("repaired (restored to rat.catalog):", repaired_verified)
+            report.kv("false positives (ROWMODID moved, content didn't):", false_positives)
+            report.kv("real changes:", len(verified) - false_positives - repaired_verified)
+            report.line("")
+            report.line(f"Manifest advanced for {len(mark)} row(s).")
+        else:
+            report.line("No catalog delta this run -- only checking image completeness.")
+
+        # 7. Images: this run's own verified rows, PLUS any other image_no
+        # still missing from Storage right now (see get_missing_images()) --
+        # not just ones tied to this run's own catalog delta, so a record
+        # whose catalog data is already correct but whose photo has never
+        # uploaded (e.g. InvalidKey) keeps getting retried and reported.
+        # Best-effort: catalog data is already committed and the manifest
+        # already advanced above, so a flaky image upload shouldn't fail an
+        # otherwise-successful sync. Logged, not silent -- worth noticing if
+        # it recurs.
         images_uploaded = 0
-        if verified:
+        images_to_sync = sorted(set(verified) | (set(missing_images) - set(verified)))
+        if images_to_sync:
             try:
                 fd2, img_delta_file = tempfile.mkstemp(suffix=".txt", text=True)
                 try:
                     with os.fdopen(fd2, "w", encoding="utf-8") as f:
-                        f.write("\n".join(verified))
+                        f.write("\n".join(images_to_sync))
                     run_subprocess([
                         "filemaker_extract.py", "--get-images",
                         "--image-nos-file", img_delta_file, "--target-profile", profile,
@@ -393,9 +461,9 @@ def main() -> int:
                 webp_dir = os.path.join(export_path, "images", "webp")
                 run_subprocess([
                     "upload_images_oci.py", "--webp-dir", webp_dir,
-                    "--image-nos", ",".join(verified), "--force",
+                    "--image-nos", ",".join(images_to_sync), "--force",
                 ] + debug_flag, "upload_images_oci.py (images, delta)")
-                images_uploaded = len(verified)
+                images_uploaded = len(images_to_sync)
                 report.kv("images extracted + uploaded:", images_uploaded)
             except SystemExit as e:
                 report.line(f"WARNING: image sync step failed, catalog sync itself is unaffected: {e}")
@@ -403,7 +471,7 @@ def main() -> int:
 
         summary = {
             "new": len(result["new"]), "changed": len(result["changed"]), "repaired": len(repaired),
-            "delta": len(delta),
+            "delta": len(delta), "missing_images": len(missing_images),
             "verified": len(verified), "rejected": len(rejected), "false_positives": false_positives,
             "repaired_verified": repaired_verified,
             "real_changes": len(verified) - false_positives - repaired_verified,
