@@ -7,7 +7,7 @@ For the running history and open threads, read `devlog/worksheet.md` (Sessions 1
 
 ## What this project is (and why it's shaped this way)
 
-The **Railway Archive Trust (RAT)** is a volunteer charity digitising a large railway-photograph
+The **Restoration and Archive Trust (RAT)** is a volunteer charity digitising a large railway-photograph
 archive. Volunteers hand-enter each photo's details into a bespoke **FileMaker Pro** app that has no
 formal support and an opaque form design. The brief: export that data into **Supabase (PostgreSQL)**.
 
