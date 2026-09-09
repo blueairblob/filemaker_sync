@@ -121,13 +121,20 @@ def _xlsx_safe(v):
     return str(v)
 
 
-def write_quarantine_report(staging_rows: dict, rejected: set, cfg: dict) -> str | None:
+def write_quarantine_report(staging_rows: dict, rejected: set, by_image: dict, cfg: dict) -> str | None:
     """A browsable .xlsx of every rejected/quarantined row's full
     freshly-extracted data (every ratcatalogue column, not just image_no) --
     so whoever has FileMaker access can actually find and correct the real
     record instead of squinting at a bare id in a log. .xlsx, not legacy
     .xls -- opens identically in Excel, and .xls's writer (xlwt) is
-    unmaintained and caps out at 65,536 rows.
+    unmaintained and caps out at 65,536 rows. Same generic "rejects_*.xlsx"
+    name and image_no/id/reason lead-in columns as upload_images_oci.py's
+    own rejects report -- one report shape a volunteer needs to learn,
+    regardless of which pipeline stage caught the problem.
+
+    `id` here is FileMaker's own ROWID (from by_image, the live skinny
+    scan), not a rat.catalog UUID -- these rows never made it into
+    rat.catalog, so no UUID exists yet.
 
     Best-effort: openpyxl not installed, or the write itself failing, never
     fails the sync over it -- the row stays correctly un-advanced in the
@@ -137,25 +144,28 @@ def write_quarantine_report(staging_rows: dict, rejected: set, cfg: dict) -> str
     try:
         from openpyxl import Workbook
     except ImportError:
-        print("(quarantine report skipped: openpyxl not installed -- pip install openpyxl)", file=sys.stderr)
+        print("(rejects report skipped: openpyxl not installed -- pip install openpyxl)", file=sys.stderr)
         return None
 
-    rows = [staging_rows[img] for img in sorted(rejected) if img in staging_rows]
+    rows = [(img, staging_rows[img]) for img in sorted(rejected) if img in staging_rows]
     if not rows:
         return None
     try:
-        cols = list(rows[0].keys())
+        extra_cols = [c for c in rows[0][1].keys() if c != 'image_no']
         wb = Workbook()
         ws = wb.active
-        ws.title = "Quarantined records"
-        ws.append(cols)
-        for row in rows:
-            ws.append([_xlsx_safe(row.get(c)) for c in cols])
+        ws.title = "Rejected records"
+        ws.append(["image_no", "id", "reason"] + extra_cols)
+        for img, row in rows:
+            reason = ("Rejected by the catalog loader (db_dml_loader.py) -- extracted from "
+                      "FileMaker but did not verify in rat.catalog after Sync attempted to load it.")
+            ws.append([img, _xlsx_safe(by_image.get(img, {}).get('rowid')), reason]
+                      + [_xlsx_safe(row.get(c)) for c in extra_cols])
 
         export_path = cfg.get("export", {}).get("path", "export")
         out_dir = Path(export_path)
         out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"quarantine_report_{dsm.NOW.strftime('%Y%m%d_%H%M%S')}.xlsx"
+        out_path = out_dir / f"rejects_{dsm.NOW.strftime('%Y%m%d_%H%M%S')}.xlsx"
         wb.save(out_path)
         return str(out_path)
     except Exception as e:
@@ -327,7 +337,7 @@ def main() -> int:
         quarantine_report_path = None
         if rejected:
             report.kv("rejected/quarantined (not advanced):", len(rejected))
-            quarantine_report_path = write_quarantine_report(staging_rows, rejected, cfg)
+            quarantine_report_path = write_quarantine_report(staging_rows, rejected, by_image, cfg)
             if quarantine_report_path:
                 report.line(f"Quarantine report (for FileMaker-side correction): {quarantine_report_path}")
 

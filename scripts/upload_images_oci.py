@@ -192,6 +192,22 @@ def list_dest_objects(base_url: str, bucket: str, headers: dict, debug: bool = F
     return {f"images/{n}" for n in names}
 
 
+def _connect_target(cfg: dict, target_profile: str | None):
+    """A plain psycopg2 connection to the active [database.target.<profile>],
+    resolved the same way every other script in this pipeline does (shared
+    with compute_missing_image_nos() and write_invalid_key_report(), the two
+    callers that need to query rat.catalog directly)."""
+    profile = dsm.resolve_active_profile(cfg, target_profile)
+    tconf = dsm.target_conf(cfg, profile)
+    pwd = resolve_target_pwd(profile, tconf.get("pwd", ""))
+    import psycopg2
+    return psycopg2.connect(
+        host=tconf["host"], port=tconf.get("port") or 5432,
+        user=tconf["user"], password=pwd or "",
+        dbname=tconf.get("dbname") or "postgres", sslmode="prefer", connect_timeout=30,
+    )
+
+
 def compute_missing_image_nos(base_url: str, bucket: str, headers: dict, cfg: dict,
                                target_profile: str | None, debug: bool = False) -> list[str]:
     """Every image_no in rat.catalog that doesn't already have an object in
@@ -205,17 +221,8 @@ def compute_missing_image_nos(base_url: str, bucket: str, headers: dict, cfg: di
     Deliberately reads rat.catalog directly rather than rat_migration's
     staging tables or sync_manifest -- catalog is what's actually live, and
     is what picaloco_web/the mobile_catalog_view serve from."""
-    profile = dsm.resolve_active_profile(cfg, target_profile)
-    tconf = dsm.target_conf(cfg, profile)
-    pwd = resolve_target_pwd(profile, tconf.get("pwd", ""))
     schema = cfg["database"]["target"]["schema"][cfg["database"]["target"]["tgt_schema"]]
-
-    import psycopg2
-    conn = psycopg2.connect(
-        host=tconf["host"], port=tconf.get("port") or 5432,
-        user=tconf["user"], password=pwd or "",
-        dbname=tconf.get("dbname") or "postgres", sslmode="prefer", connect_timeout=30,
-    )
+    conn = _connect_target(cfg, target_profile)
     try:
         with conn.cursor() as c:
             c.execute(f"SELECT image_no FROM {schema}.catalog WHERE image_no IS NOT NULL")
@@ -262,43 +269,65 @@ class InvalidKeyError(Exception):
     an expected, unactionable rejection as a fresh problem."""
 
 
-def write_invalid_key_report(invalid_key_names: list, cfg: dict) -> str | None:
+def write_invalid_key_report(invalid_key_names: list, cfg: dict, target_profile: str | None) -> str | None:
     """A browsable .xlsx of every image_no InvalidKeyError rejected this
     run -- printing them to the log (as this script already did) isn't
     enough on its own for a RAT volunteer to act on; they need something
-    they can actually open and work through. One column is enough here
-    (unlike run_incremental_sync.py's quarantine report, this script has no
-    access to the record's other FileMaker fields -- just the image_no and
-    why it's stuck) -- image_no is itself a unique, searchable key in
-    FileMaker Pro, so it's sufficient to find and fix the real record.
+    they can actually open and work through. Same generic "rejects_*.xlsx"
+    name and image_no/id/reason shape as run_incremental_sync.py's own
+    quarantine report (a different script, so this can't literally be the
+    same file, but a volunteer shouldn't have to learn two different report
+    formats depending on which pipeline stage caught the problem).
 
-    Best-effort: missing openpyxl or a write failure logs a warning and
-    doesn't fail the run -- these rows already aren't counted as failures
-    (see InvalidKeyError's docstring), this is purely an added convenience."""
+    `id` here is rat.catalog's own UUID -- unlike a loader-rejected row,
+    these DID land in rat.catalog (their only failure is the Storage
+    upload), so a real id is available with one extra query.
+
+    Best-effort: missing openpyxl, the DB lookup failing, or the write
+    itself failing all log a warning and don't fail the run -- these rows
+    already aren't counted as failures (see InvalidKeyError's docstring),
+    this is purely an added convenience."""
     if not invalid_key_names:
         return None
     try:
         from openpyxl import Workbook
     except ImportError:
-        print("(invalid-key report skipped: openpyxl not installed -- pip install openpyxl)", file=sys.stderr)
+        print("(rejects report skipped: openpyxl not installed -- pip install openpyxl)", file=sys.stderr)
         return None
+
+    ids: dict = {}
+    try:
+        schema = cfg["database"]["target"]["schema"][cfg["database"]["target"]["tgt_schema"]]
+        conn = _connect_target(cfg, target_profile)
+        try:
+            with conn.cursor() as c:
+                c.execute(f"SELECT image_no, id FROM {schema}.catalog WHERE image_no = ANY(%s)",
+                          (invalid_key_names,))
+                ids = {row[0]: row[1] for row in c.fetchall()}
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"(rejects report: couldn't look up rat.catalog ids: {e})", file=sys.stderr)
+
     try:
         wb = Workbook()
         ws = wb.active
-        ws.title = "Needs FileMaker fix"
-        ws.append(["image_no", "issue"])
+        ws.title = "Rejected records"
+        ws.append(["image_no", "id", "reason"])
         for img in sorted(invalid_key_names):
-            ws.append([img, "Contains a character Supabase Storage rejects (e.g. a backtick) -- "
-                             "open this Image no. in FileMaker Pro and retype it without that character."])
+            ws.append([img, str(ids[img]) if img in ids else None,
+                       "Supabase Storage rejected this image_no as an object key (a backtick or "
+                       "similar character) -- open this record in FileMaker Pro (search by Image no.) "
+                       "and retype the field without that character."])
 
         export_path = cfg.get("export", {}).get("path", "export")
         out_dir = Path(export_path)
         out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"invalid_key_report_{dsm.NOW.strftime('%Y%m%d_%H%M%S')}.xlsx"
+        out_path = out_dir / f"rejects_{dsm.NOW.strftime('%Y%m%d_%H%M%S')}.xlsx"
         wb.save(out_path)
         return str(out_path)
     except Exception as e:
-        print(f"(invalid-key report write failed: {e})", file=sys.stderr)
+        print(f"(rejects report write failed: {e})", file=sys.stderr)
         return None
 
 
@@ -443,7 +472,7 @@ def main() -> int:
             print(f"  {n}")
         if len(invalid_key_names) > 20:
             print(f"  ... and {len(invalid_key_names) - 20} more")
-        invalid_key_report_path = write_invalid_key_report(invalid_key_names, config)
+        invalid_key_report_path = write_invalid_key_report(invalid_key_names, config, args.target_profile)
         if invalid_key_report_path:
             print(f"Report (for FileMaker-side correction): {invalid_key_report_path}")
     if failed_names:
