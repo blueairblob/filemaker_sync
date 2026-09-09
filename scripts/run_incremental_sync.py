@@ -33,7 +33,10 @@ FLOW
      just the delta.
   4. Verify against rat.catalog directly (DB truth, not an assumption
      from the loader's exit code) -- whatever image_no actually landed
-     is the verified set. Anything else was rejected/quarantined.
+     is the verified set. Anything else was rejected/quarantined --
+     written out as a browsable .xlsx (write_quarantine_report(), every
+     ratcatalogue column, not just image_no) so whoever has FileMaker
+     access can find and correct the real record.
   5. For each verified row, compare its freshly-extracted content hash
      (from rat_migration.ratcatalogue, which now holds exactly this
      row's newly-extracted data) against the manifest's stored hash. A
@@ -70,11 +73,14 @@ sync itself correct and runnable on demand, not automatic.
 """
 from __future__ import annotations
 import argparse
+import datetime
 import json
 import os
 import subprocess
 import sys
 import tempfile
+from decimal import Decimal
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import db_sync_manifest as dsm
@@ -101,6 +107,60 @@ def fetch_staging_rows(conn, mig_schema: str, image_nos: list) -> dict:
         c.execute(f'SELECT * FROM {mig_schema}.ratcatalogue WHERE image_no = ANY(%s)', (image_nos,))
         cols = [d[0] for d in c.description]
         return {row[cols.index('image_no')]: dict(zip(cols, row)) for row in c.fetchall()}
+
+
+def _xlsx_safe(v):
+    """openpyxl writes str/int/float/bool/None/date/datetime natively but
+    chokes on other DB types (e.g. Decimal) -- coerce anything else to
+    something it can hold rather than letting the whole report fail over
+    one odd cell."""
+    if v is None or isinstance(v, (str, int, float, bool, datetime.date, datetime.datetime)):
+        return v
+    if isinstance(v, Decimal):
+        return float(v)
+    return str(v)
+
+
+def write_quarantine_report(staging_rows: dict, rejected: set, cfg: dict) -> str | None:
+    """A browsable .xlsx of every rejected/quarantined row's full
+    freshly-extracted data (every ratcatalogue column, not just image_no) --
+    so whoever has FileMaker access can actually find and correct the real
+    record instead of squinting at a bare id in a log. .xlsx, not legacy
+    .xls -- opens identically in Excel, and .xls's writer (xlwt) is
+    unmaintained and caps out at 65,536 rows.
+
+    Best-effort: openpyxl not installed, or the write itself failing, never
+    fails the sync over it -- the row stays correctly un-advanced in the
+    manifest either way and will show up again next run."""
+    if not rejected:
+        return None
+    try:
+        from openpyxl import Workbook
+    except ImportError:
+        print("(quarantine report skipped: openpyxl not installed -- pip install openpyxl)", file=sys.stderr)
+        return None
+
+    rows = [staging_rows[img] for img in sorted(rejected) if img in staging_rows]
+    if not rows:
+        return None
+    try:
+        cols = list(rows[0].keys())
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Quarantined records"
+        ws.append(cols)
+        for row in rows:
+            ws.append([_xlsx_safe(row.get(c)) for c in cols])
+
+        export_path = cfg.get("export", {}).get("path", "export")
+        out_dir = Path(export_path)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"quarantine_report_{dsm.NOW.strftime('%Y%m%d_%H%M%S')}.xlsx"
+        wb.save(out_path)
+        return str(out_path)
+    except Exception as e:
+        print(f"(quarantine report write failed: {e})", file=sys.stderr)
+        return None
 
 
 def fetch_verified(conn, image_nos: list) -> set:
@@ -256,12 +316,20 @@ def main() -> int:
         # what's now in staging (exactly this run's freshly-extracted delta rows).
         mig_schema = cfg["database"]["target"]["schema"][cfg["database"]["target"]["mig_schema"]]
         verified = fetch_verified(pg.cnxn, delta)
-        staging_rows = fetch_staging_rows(pg.cnxn, mig_schema, list(verified))
+        # Fetch staging data for the WHOLE delta, not just verified -- rejected
+        # rows need their full freshly-extracted row too, for the quarantine
+        # report below (row_hash() below only ever looks up verified rows,
+        # unaffected by fetching the wider set).
+        staging_rows = fetch_staging_rows(pg.cnxn, mig_schema, delta)
 
         rejected = set(delta) - verified
         report.kv("verified (committed to rat.catalog):", len(verified))
+        quarantine_report_path = None
         if rejected:
             report.kv("rejected/quarantined (not advanced):", len(rejected))
+            quarantine_report_path = write_quarantine_report(staging_rows, rejected, cfg)
+            if quarantine_report_path:
+                report.line(f"Quarantine report (for FileMaker-side correction): {quarantine_report_path}")
 
         # 6. Advance the manifest for exactly the verified set.
         repaired_set = set(repaired)
@@ -331,6 +399,7 @@ def main() -> int:
             "real_changes": len(verified) - false_positives - repaired_verified,
             "manifest_advanced": len(mark),
             "images_uploaded": images_uploaded,
+            "quarantine_report": quarantine_report_path,
         }
         write_sync_status(pg.cnxn, summary)
         print(json.dumps(summary))
