@@ -182,6 +182,18 @@ def ensure_bucket(base_url: str, bucket: str, headers: dict, cfg_storage: dict) 
     print(f"Created bucket '{bucket}': {body}")
 
 
+class InvalidKeyError(Exception):
+    """A known, permanent, un-fixable-here rejection: Supabase Storage's
+    object-key validation refuses image_nos containing certain characters
+    (a literal backtick, in most cases; at least one accented character).
+    See devlog/worksheet.md Session 16 -- deliberately quarantined rather
+    than sanitized, since renaming the key would break db_dml_loader.py's
+    deterministic image_no -> URL convention for a 0.03% edge case. This
+    will reproduce identically on every future run for the same rows; kept
+    distinct from a generic failure so callers don't have to keep treating
+    an expected, unactionable rejection as a fresh problem."""
+
+
 def upload_one(base_url: str, bucket: str, image_no: str, local_path: Path, headers: dict) -> None:
     upload_headers = dict(headers)
     upload_headers["Content-Type"] = "image/webp"
@@ -194,6 +206,8 @@ def upload_one(base_url: str, bucket: str, image_no: str, local_path: Path, head
         data=data,
         timeout=30,
     )
+    if r.status_code == 400 and "InvalidKey" in r.text:
+        raise InvalidKeyError(image_no)
     r.raise_for_status()
 
 
@@ -264,8 +278,10 @@ def main() -> int:
         return 0
 
     uploaded = 0
+    known_invalid_key = 0
     failed = 0
-    failed_names: list[str] = []
+    invalid_key_names: list[str] = []
+    failed_names: list[tuple[str, str]] = []
     lock = threading.Lock()
 
     def _worker(f: Path) -> tuple[str, Exception | None]:
@@ -282,15 +298,29 @@ def main() -> int:
             with lock:
                 if err is None:
                     uploaded += 1
+                elif isinstance(err, InvalidKeyError):
+                    known_invalid_key += 1
+                    invalid_key_names.append(image_no)
                 else:
                     failed += 1
-                    failed_names.append(image_no)
+                    failed_names.append((image_no, str(err)))
 
-    print(f"\nDone. uploaded={uploaded} skipped(existing)={skipped} failed={failed}")
-    if failed_names:
-        print("Failed (re-run the script -- already-uploaded files are skipped, so this is cheap):")
-        for n in failed_names[:20]:
+    print(f"\nDone. uploaded={uploaded} skipped(existing)={skipped} "
+          f"known_invalid_key={known_invalid_key} failed={failed}")
+    if invalid_key_names:
+        # Expected, permanent, not actionable here -- see InvalidKeyError's docstring.
+        # Printed every run for transparency (quarantine, not hide), never counted
+        # toward `failed`/the exit code -- there's nothing to "fix" by re-running.
+        print(f"{known_invalid_key} image_no(s) have a Storage-rejected character "
+              f"(known issue, not new -- see devlog/worksheet.md Session 16):")
+        for n in invalid_key_names[:20]:
             print(f"  {n}")
+        if len(invalid_key_names) > 20:
+            print(f"  ... and {len(invalid_key_names) - 20} more")
+    if failed_names:
+        print("Failed (unexpected -- re-run the script; already-uploaded files are skipped, so this is cheap):")
+        for n, err in failed_names[:20]:
+            print(f"  {n}: {err}")
         if len(failed_names) > 20:
             print(f"  ... and {len(failed_names) - 20} more")
     return 1 if failed else 0
