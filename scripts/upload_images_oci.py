@@ -67,7 +67,7 @@ from urllib3.util.retry import Retry
 from tqdm import tqdm
 
 try:
-    from env_secrets import resolve_secret
+    from env_secrets import resolve_secret, resolve_target_pwd
 except ImportError:                    # self-contained fallback (identical behaviour)
     def resolve_secret(env_key, cfg_val=None, cli_val=None, default=""):
         if cli_val is not None:
@@ -79,6 +79,18 @@ except ImportError:                    # self-contained fallback (identical beha
         v = os.environ.get(env_key)
         return v if v else (cfg_val if cfg_val is not None else default)
 
+    def resolve_target_pwd(profile, cfg_val=None, cli_val=None, default=""):
+        if cli_val is not None:
+            return cli_val
+        pwd = resolve_secret(f"RAT_TARGET_PWD_{profile.upper()}", cfg_val=None)
+        if pwd:
+            return pwd
+        if profile == "supabase":
+            pwd = resolve_secret("RAT_TARGET_PWD", cfg_val=None)
+            if pwd:
+                return pwd
+        return cfg_val if cfg_val is not None else default
+
 try:
     from paths import resolve_export_path
 except ImportError:                    # self-contained fallback (identical behaviour)
@@ -88,6 +100,12 @@ except ImportError:                    # self-contained fallback (identical beha
         if os.name != "nt" and m:
             return f"/mnt/{m.group(1).lower()}/{m.group(2).replace('\\\\', '/')}"
         return raw_path
+
+# db_sync_manifest.py is always vendored alongside this script (same convention
+# run_incremental_sync.py relies on) -- reused here purely for its config-parsing
+# helpers (resolve_active_profile/target_conf), not its FileMaker-facing code, so
+# this script stays importable/runnable from WSL with no ODBC dependency.
+import db_sync_manifest as dsm
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LIST_PAGE_SIZE = 1500  # oci's Storage list endpoint's real per-request cap -- see
@@ -174,6 +192,44 @@ def list_dest_objects(base_url: str, bucket: str, headers: dict, debug: bool = F
     return {f"images/{n}" for n in names}
 
 
+def compute_missing_image_nos(base_url: str, bucket: str, headers: dict, cfg: dict,
+                               target_profile: str | None, debug: bool = False) -> list[str]:
+    """Every image_no in rat.catalog that doesn't already have an object in
+    oci's Storage -- the actual gap a caller needs to fill, computed WITHOUT
+    touching FileMaker at all. On a healthy system this is just the
+    permanently-quarantined InvalidKey rows (see InvalidKeyError's
+    docstring), not the whole archive -- letting a caller (e.g.
+    picaloco_agent's Upload Images) extract+upload only these instead of
+    walking all 141k+ rows over ODBC every single run.
+
+    Deliberately reads rat.catalog directly rather than rat_migration's
+    staging tables or sync_manifest -- catalog is what's actually live, and
+    is what picaloco_web/the mobile_catalog_view serve from."""
+    profile = dsm.resolve_active_profile(cfg, target_profile)
+    tconf = dsm.target_conf(cfg, profile)
+    pwd = resolve_target_pwd(profile, tconf.get("pwd", ""))
+    schema = cfg["database"]["target"]["schema"][cfg["database"]["target"]["tgt_schema"]]
+
+    import psycopg2
+    conn = psycopg2.connect(
+        host=tconf["host"], port=tconf.get("port") or 5432,
+        user=tconf["user"], password=pwd or "",
+        dbname=tconf.get("dbname") or "postgres", sslmode="prefer", connect_timeout=30,
+    )
+    try:
+        with conn.cursor() as c:
+            c.execute(f"SELECT image_no FROM {schema}.catalog WHERE image_no IS NOT NULL")
+            catalog_image_nos = {row[0] for row in c.fetchall()}
+    finally:
+        conn.close()
+    if debug:
+        print(f"  {len(catalog_image_nos)} image_no(s) in {schema}.catalog")
+
+    existing = list_dest_objects(base_url, bucket, headers, debug=debug)
+    existing_stems = {e[len("images/"):-len(".webp")] for e in existing}
+    return sorted(catalog_image_nos - existing_stems)
+
+
 def ensure_bucket(base_url: str, bucket: str, headers: dict, cfg_storage: dict) -> None:
     r = _session.get(f"{base_url}/storage/v1/bucket/{bucket}", headers=headers, timeout=15)
     if r.status_code == 200:
@@ -242,6 +298,14 @@ def main() -> int:
     ap.add_argument("--debug", action="store_true", help="Show per-page destination-listing progress "
                      "(normally just a one-line total, since ~95 pages at full catalog scale floods a "
                      "captured/streamed log) and the per-file upload progress bar.")
+    ap.add_argument("--target-profile", help="Target DB profile from config.toml's "
+                     "[database.target.<profile>] (overrides config/env RAT_TARGET_PROFILE) -- only "
+                     "used by --list-missing, to query rat.catalog.")
+    ap.add_argument("--list-missing", metavar="OUTFILE", help="Don't upload anything -- instead, compute "
+                     "every image_no in rat.catalog that doesn't already have an object in oci's Storage "
+                     "(a Postgres query + a bucket listing, no local files or FileMaker involved) and "
+                     "write that list to OUTFILE, one per line. Lets a caller extract+upload only the "
+                     "actual gap instead of walking the whole archive every run.")
     args = ap.parse_args()
 
     os.chdir(REPO_ROOT)
@@ -260,6 +324,13 @@ def main() -> int:
 
     if args.init:
         ensure_bucket(base_url, bucket, headers, storage)
+        return 0
+
+    if args.list_missing:
+        missing = compute_missing_image_nos(base_url, bucket, headers, config,
+                                             args.target_profile, debug=args.debug)
+        Path(args.list_missing).write_text("\n".join(missing), encoding="utf-8")
+        print(f"{len(missing)} image_no(s) missing from oci Storage -- written to {args.list_missing}")
         return 0
 
     webp_dir = Path(args.webp_dir).resolve() if args.webp_dir else local_webp_dir(config)
