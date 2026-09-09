@@ -38,6 +38,17 @@ FLOW
      with the new rowmodid/row_hash. Anything NOT verified is left
      untouched -- it naturally reappears as new/changed next run. Never
      advance from the scan/diff step itself.
+  7. Images, folded into the same run: extract + upload exactly the
+     verified set's images (filemaker_extract.py --get-images
+     --image-nos-file, upload_images_oci.py --image-nos --force). A new
+     record needs both metadata and image; a changed record's image may
+     or may not actually have changed alongside its metadata, and there's
+     no cheap way to tell without re-fetching it -- so every verified row
+     gets its image re-pulled and force-uploaded (x-upsert overwrites).
+     Proportional to the sync's own delta, not a full-catalog rescan --
+     see filemaker_extract.py's --get-images scoping. A separate, full-
+     catalog "Upload Images" pass (no --image-nos-file) still exists
+     for backfilling images that predate this step, or disaster recovery.
 
 REQUIRES native Windows Python (python.exe) -- step 1's live FileMaker
 scan and step 2's extract both need the FileMaker ODBC driver, same
@@ -233,10 +244,42 @@ def main() -> int:
         report.kv("real changes:", len(verified) - false_positives)
         report.line("")
         report.line(f"Manifest advanced for {len(mark)} row(s).")
+
+        # 7. Images for exactly the verified set -- see module docstring point 7.
+        # Best-effort: catalog data is already committed and the manifest already
+        # advanced above, so a flaky image upload shouldn't fail an otherwise-
+        # successful sync. Logged, not silent -- worth noticing if it recurs.
+        images_uploaded = 0
+        if verified:
+            try:
+                fd2, img_delta_file = tempfile.mkstemp(suffix=".txt", text=True)
+                try:
+                    with os.fdopen(fd2, "w", encoding="utf-8") as f:
+                        f.write("\n".join(verified))
+                    run_subprocess([
+                        "filemaker_extract.py", "--get-images",
+                        "--image-nos-file", img_delta_file, "--target-profile", profile,
+                    ], "filemaker_extract.py (images, delta)")
+                finally:
+                    os.unlink(img_delta_file)
+
+                export_path = cfg.get("export", {}).get("path", "export")
+                webp_dir = os.path.join(export_path, "images", "webp")
+                run_subprocess([
+                    "upload_images_oci.py", "--webp-dir", webp_dir,
+                    "--image-nos", ",".join(verified), "--force",
+                ], "upload_images_oci.py (images, delta)")
+                images_uploaded = len(verified)
+                report.kv("images extracted + uploaded:", images_uploaded)
+            except SystemExit as e:
+                report.line(f"WARNING: image sync step failed, catalog sync itself is unaffected: {e}")
+                print(f"(image sync skipped: {e})", file=sys.stderr)
+
         summary = {
             "new": len(result["new"]), "changed": len(result["changed"]), "delta": len(delta),
             "verified": len(verified), "rejected": len(rejected), "false_positives": false_positives,
             "real_changes": len(verified) - false_positives, "manifest_advanced": len(mark),
+            "images_uploaded": images_uploaded,
         }
         write_sync_status(pg.cnxn, summary)
         print(json.dumps(summary))

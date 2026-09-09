@@ -206,6 +206,12 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="Show counts; upload nothing")
     ap.add_argument("--limit", type=int, help="Only process the first N local files (testing)")
     ap.add_argument("--image-nos", help="Comma-separated image_no list -- only process these")
+    ap.add_argument("--force", action="store_true", help="Skip the destination-existence check "
+                     "(which only tells you a name is present, not whether its content changed) and "
+                     "upload every selected file unconditionally -- x-upsert overwrites. For a small, "
+                     "already-known set (e.g. a sync's own new+changed image_nos) this is cheaper than "
+                     "listing the whole bucket AND is the only way a changed image whose image_no "
+                     "already exists in Storage actually gets re-uploaded.")
     ap.add_argument("--workers", type=int, default=16, help="Concurrent uploads (default 16)")
     args = ap.parse_args()
 
@@ -239,12 +245,16 @@ def main() -> int:
         files = files[: args.limit]
 
     print(f"{len(files)} local file(s) under {webp_dir}")
-    print("Listing destination (oci)...")
-    existing = list_dest_objects(base_url, bucket, headers)
-
-    to_upload = [f for f in files if f"images/{f.stem}.webp" not in existing]
-    skipped = len(files) - len(to_upload)
-    print(f"{skipped} already on oci, {len(to_upload)} to upload")
+    if args.force:
+        to_upload = files
+        skipped = 0
+        print(f"--force: skipping destination listing, uploading all {len(to_upload)} selected file(s)")
+    else:
+        print("Listing destination (oci)...")
+        existing = list_dest_objects(base_url, bucket, headers)
+        to_upload = [f for f in files if f"images/{f.stem}.webp" not in existing]
+        skipped = len(files) - len(to_upload)
+        print(f"{skipped} already on oci, {len(to_upload)} to upload")
 
     if args.dry_run:
         for f in to_upload[:20]:

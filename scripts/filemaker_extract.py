@@ -362,20 +362,28 @@ def convert_create_table_to_dict(create_table_sql: str) -> dict:
     
     return table_dict
   
+def read_delta_image_nos():
+    """--image-nos-file scopes a query to exactly these image_nos (the
+    incremental-sync delta). Shared by get_table_data_set() (ratcatalogue's
+    DML) and the --get-images block below (the images blob query) -- both
+    need to filter on the same delta list so a sync's image fetch is
+    proportional to what actually changed, not a full-catalog scan."""
+    if not image_nos_file:  # type: ignore  # noqa: F821 -- injected by get_args()
+        return None
+    with open(image_nos_file, 'r', encoding='utf-8') as f:  # type: ignore
+        return [line.strip() for line in f if line.strip()]
+
+
 def get_table_data_set():
     global dupe_entry_cnt
 
-    # --image-nos-file scopes ratcatalogue to exactly these image_nos (the
-    # incremental-sync delta) -- every other table (ratbuilders, ratroutes,
-    # ratcollections, prompts) still gets its normal full extract; they're
-    # small, cheap, and aren't image_no-scoped data to begin with.
-    delta_image_nos = None
-    if image_nos_file:  # type: ignore  # noqa: F821 -- injected by get_args()
-        with open(image_nos_file, 'r', encoding='utf-8') as f:  # type: ignore
-            delta_image_nos = [line.strip() for line in f if line.strip()]
-        if max_rows != 'all':  # type: ignore
-            logger.warning("--image-nos-file and --max-rows both set -- ignoring --max-rows; "
-                            "the delta list is the row selection, capping it would silently drop rows.")
+    # Every other table (ratbuilders, ratroutes, ratcollections, prompts)
+    # still gets its normal full extract; they're small, cheap, and aren't
+    # image_no-scoped data to begin with.
+    delta_image_nos = read_delta_image_nos()
+    if delta_image_nos is not None and max_rows != 'all':  # type: ignore
+        logger.warning("--image-nos-file and --max-rows both set -- ignoring --max-rows; "
+                        "the delta list is the row selection, capping it would silently drop rows.")
 
     for table in table_list:
         #, 'ratlabels', 'ratroutes'
@@ -1166,8 +1174,9 @@ def get_args ():
     parser.add_argument("--fn-fmt", type = str, choices = ['single', 'multi'], default = 'multi', help = "Single or Multi File export")
     parser.add_argument("--start-from", type=str, help="Start migration from this image_no in the ratcatalogue table")
     parser.add_argument("--image-nos-file", type=str, help="Path to a file of image_nos (one per line) -- "
-                        "scopes ratcatalogue to exactly these rows (incremental-sync delta); other tables "
-                        "still get a full extract. Ignores --max-rows if both are set.")
+                        "scopes ratcatalogue's DML and --get-images' blob query to exactly these rows "
+                        "(incremental-sync delta); other tables still get a full extract. Ignores "
+                        "--max-rows if both are set.")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     
     try:
@@ -1323,10 +1332,25 @@ if __name__ == "__main__":
             db_type = 'mysql' # This is required to structure the Pandas data in memory
             # This table does not exist in the source Db
             actions = get_actions(cnt, ddl, True)
-            sql="SELECT image_no, GetAs(picture,'JPEG') picture, entry_date, date_taken FROM RATCatalogue"
-            table_data[dbs['dsn']] = get_table_data(table, actions, sql=sql, rows=max_rows, purge=False, parse_dates=False)
-            export_data(table_data[dbs['dsn']], table)
-            export_images(table)
+            # --image-nos-file scopes this blob query the same way it scopes
+            # ratcatalogue's DML query -- lets a sync's image fetch cost stay
+            # proportional to its delta instead of always walking all 141k+
+            # container fields over ODBC.
+            delta_image_nos = read_delta_image_nos()
+            if delta_image_nos is not None and not delta_image_nos:
+                logger.info(f"{table}: --image-nos-file was empty, nothing to extract.")
+            else:
+                if delta_image_nos is not None:
+                    placeholders = ','.join(['?'] * len(delta_image_nos))
+                    sql = (f"SELECT image_no, GetAs(picture,'JPEG') picture, entry_date, date_taken "
+                           f"FROM RATCatalogue WHERE image_no IN ({placeholders})")
+                    table_data[dbs['dsn']] = get_table_data(table, actions, sql=sql, params=tuple(delta_image_nos),
+                                                             purge=False, parse_dates=False)
+                else:
+                    sql="SELECT image_no, GetAs(picture,'JPEG') picture, entry_date, date_taken FROM RATCatalogue"
+                    table_data[dbs['dsn']] = get_table_data(table, actions, sql=sql, rows=max_rows, purge=False, parse_dates=False)
+                export_data(table_data[dbs['dsn']], table)
+                export_images(table)
                 
         # Export Source Schema
         # The Databases internal data dictionary or schema data. Keep this data for reference.
