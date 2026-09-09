@@ -272,7 +272,7 @@ def main() -> int:
                 run_subprocess([
                     "upload_images_oci.py", "--webp-dir", webp_dir,
                     "--image-nos", ",".join(verified), "--force",
-                ], "upload_images_oci.py (images, delta)")
+                ] + debug_flag, "upload_images_oci.py (images, delta)")
                 images_uploaded = len(verified)
                 report.kv("images extracted + uploaded:", images_uploaded)
             except SystemExit as e:

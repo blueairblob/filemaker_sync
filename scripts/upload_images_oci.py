@@ -136,12 +136,20 @@ def _list_page_curl(base_url: str, bucket: str, prefix: str, headers: dict, offs
     return json.loads(result.stdout)
 
 
-def list_dest_objects(base_url: str, bucket: str, headers: dict) -> set[str]:
+def list_dest_objects(base_url: str, bucket: str, headers: dict, debug: bool = False) -> set[str]:
     """Every object already on oci's bucket under images/, as bucket-relative
     paths -- diffed against the local file list up front instead of a
-    HEAD-per-file existence check (which would itself be 141k+ requests)."""
+    HEAD-per-file existence check (which would itself be 141k+ requests).
+
+    At full scale this is ~95 pages (141k objects / 1,500-item pages) -- the
+    per-page print is real progress evidence for a call that otherwise looks
+    hung for a while, but it flooded a captured/streamed log the same way
+    export_images()'s tqdm bar did (see filemaker_extract.py), so it's now
+    gated behind --debug too. A retry failure is a genuine anomaly, not
+    routine progress, so it always prints regardless."""
     names: list[str] = []
     offset = 0
+    pages = 0
     while True:
         page = None
         last_err = None
@@ -155,10 +163,14 @@ def list_dest_objects(base_url: str, bucket: str, headers: dict) -> set[str]:
         if page is None:
             raise RuntimeError(f"page at offset={offset} failed after retries: {last_err}")
         names.extend(item["name"] for item in page if item["name"] != ".emptyFolderPlaceholder")
-        print(f"  offset={offset}: {len(page)} items ({len(names)} total so far)", flush=True)
+        pages += 1
+        if debug:
+            print(f"  offset={offset}: {len(page)} items ({len(names)} total so far)", flush=True)
         if len(page) < LIST_PAGE_SIZE:
             break
         offset += LIST_PAGE_SIZE
+    if not debug:
+        print(f"  {len(names)} object(s) across {pages} page(s)")
     return {f"images/{n}" for n in names}
 
 
@@ -227,6 +239,9 @@ def main() -> int:
                      "listing the whole bucket AND is the only way a changed image whose image_no "
                      "already exists in Storage actually gets re-uploaded.")
     ap.add_argument("--workers", type=int, default=16, help="Concurrent uploads (default 16)")
+    ap.add_argument("--debug", action="store_true", help="Show per-page destination-listing progress "
+                     "(normally just a one-line total, since ~95 pages at full catalog scale floods a "
+                     "captured/streamed log) and the per-file upload progress bar.")
     args = ap.parse_args()
 
     os.chdir(REPO_ROOT)
@@ -265,7 +280,7 @@ def main() -> int:
         print(f"--force: skipping destination listing, uploading all {len(to_upload)} selected file(s)")
     else:
         print("Listing destination (oci)...")
-        existing = list_dest_objects(base_url, bucket, headers)
+        existing = list_dest_objects(base_url, bucket, headers, debug=args.debug)
         to_upload = [f for f in files if f"images/{f.stem}.webp" not in existing]
         skipped = len(files) - len(to_upload)
         print(f"{skipped} already on oci, {len(to_upload)} to upload")
@@ -293,7 +308,7 @@ def main() -> int:
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = [pool.submit(_worker, f) for f in to_upload]
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Uploading"):
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Uploading", disable=not args.debug):
             image_no, err = future.result()
             with lock:
                 if err is None:
