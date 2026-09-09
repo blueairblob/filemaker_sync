@@ -323,8 +323,20 @@ def main() -> int:
         # (e.g. a quarantined InvalidKey image_no) long after its catalog row
         # itself stops being new/changed/repaired, and this is the only place
         # left that would ever notice and report it again.
-        missing_images = get_missing_images(profile, debug_flag)
+        missing_images_raw = get_missing_images(profile, debug_flag)
+        # get_missing_images() only ever compares rat.catalog against Storage --
+        # it has no idea whether a catalog row still corresponds to anything
+        # actually in FileMaker right now. Confirmed live, 2026-09-09: a chunk
+        # of that gap turned out to be stale/garbage catalog rows (values like
+        # "Class 1400 (102)", "Porto Tram") with no live source row at all --
+        # nothing this tool can ever fix, so don't report on them here. by_image
+        # (this run's own live skinny scan, above) is the source of truth for
+        # "does this image_no still exist in FileMaker."
+        missing_images = sorted(set(missing_images_raw) & set(by_image.keys()))
+        stale_catalog_only = len(missing_images_raw) - len(missing_images)
         report.kv("images missing from Storage:", len(missing_images))
+        if stale_catalog_only:
+            report.kv("  (of which, no longer in FileMaker at all -- not reported):", stale_catalog_only)
 
         if not delta and not missing_images:
             report.line("Nothing to do.")

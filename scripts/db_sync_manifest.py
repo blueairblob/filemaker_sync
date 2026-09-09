@@ -591,6 +591,11 @@ def main() -> int:
                     help="seed manifest from current source (asserts target holds them)")
     ap.add_argument("--preview", action="store_true", help="dry-run delta (default)")
     ap.add_argument("--snapshot", action="store_true", help="write a source snapshot and exit")
+    ap.add_argument("--list-image-nos", metavar="FILE", help="scan the live source and write just its "
+                    "current image_no list to FILE, one per line -- for a caller that needs to filter a "
+                    "target-side list down to what's actually still in the source right now (e.g. "
+                    "upload_images_oci.py's Storage-gap list can include catalog rows with no matching "
+                    "live source row any more -- confirmed live, 2026-09-09).")
     ap.add_argument("--diff-snapshots", nargs=2, metavar=("PREV", "CURR"),
                     help="offline: diff two snapshots, no DB")
     ap.add_argument("--selftest", action="store_true")
@@ -648,6 +653,19 @@ def main() -> int:
         report.kv("rows:", len(records))
         report.kv("snapshot written:", path)
         _emit(report, args)
+        return 0
+
+    # ---- list-image-nos only -----------------------------------------------
+    if args.list_image_nos:
+        dsn, user, pwd = resolve_source(args, cfg)
+        if not dsn or not user:
+            print("ERROR: no source DSN/user."); return 2
+        print(f"scanning: DSN={dsn} UID={user}")
+        records = scan_source(dsn, user, pwd, args.table, args.key_col)
+        by_image, unkeyed, dups = build_scan(records)
+        with open(args.list_image_nos, "w", encoding="utf-8") as f:
+            f.write("\n".join(sorted(by_image.keys())))
+        print(f"{len(by_image)} image_no(s) currently in the source -- written to {args.list_image_nos}")
         return 0
 
     # ---- init -------------------------------------------------------------
