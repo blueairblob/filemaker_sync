@@ -1059,10 +1059,16 @@ def export_images(table):
         for index, item in tqdm(enumerate(img_data['data'], start=0), total = img_cnt, desc="Exporting images"): 
             image_name = item[0]
             image_data = item[1]
-            # Clean up 
-            if image_name and image_data:
+            # Clean up -- image_name must be checked as a real string, not just
+            # truthy: a NULL image_no (known source debris, e.g. ROWIDs 42279/
+            # 47343/145873) comes back from pandas as float('nan'), which IS
+            # truthy, so a bare `if image_name` let it through to .replace()
+            # and crashed the whole export mid-run (confirmed live, 2026-09-09).
+            if isinstance(image_name, str) and image_name and image_data:
                 image_name = image_name.replace('\n', '').replace('\r', '').replace(' ', '')
             else:
+                if image_name and image_data:
+                    logger.debug(f"images: skipping row with non-string image_no ({image_name!r})")
                 continue
             
             
