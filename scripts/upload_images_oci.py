@@ -55,6 +55,7 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from urllib.parse import quote
 
 try:
     import tomllib as _toml            # Python 3.11+
@@ -337,8 +338,17 @@ def upload_one(base_url: str, bucket: str, image_no: str, local_path: Path, head
     upload_headers["x-upsert"] = "true"
     with open(local_path, "rb") as f:
         data = f.read()
+    # Explicit percent-encoding (safe="" -- encode everything but unreserved
+    # chars), not relying on `requests` to normalize this implicitly. This is
+    # transport encoding, not key sanitization -- Storage decodes %20 back to
+    # a real space; the stored object key (and image_no/catalog/manifest
+    # everywhere else) is unchanged. Matters now that a space-containing
+    # image_no can actually reach this function (export_images() used to
+    # strip spaces from the local filename before it ever got here -- fixed
+    # 2026-09-10 -- so this path was never previously exercised with one).
+    encoded_image_no = quote(image_no, safe="")
     r = _session.post(
-        f"{base_url}/storage/v1/object/{bucket}/images/{image_no}.webp",
+        f"{base_url}/storage/v1/object/{bucket}/images/{encoded_image_no}.webp",
         headers=upload_headers,
         data=data,
         timeout=30,

@@ -1087,7 +1087,19 @@ def export_images(table):
             # truthy, so a bare `if image_name` let it through to .replace()
             # and crashed the whole export mid-run (confirmed live, 2026-09-09).
             if isinstance(image_name, str) and image_name and image_data:
-                image_name = image_name.replace('\n', '').replace('\r', '').replace(' ', '')
+                # NOT stripping spaces (used to, via .replace(' ', '')) -- that
+                # made the local filename diverge from the real image_no, which
+                # is used unmodified everywhere else (rat.catalog, the manifest,
+                # --image-nos matching, Storage's key). A space-containing
+                # image_no (e.g. "Class 1400 (11)", confirmed live via a real
+                # FileMaker screenshot, 2026-09-10) extracted its photo to
+                # "Class1400(11).webp" -- a file that then silently never
+                # matched any --image-nos filter built from the real value
+                # "Class 1400 (11)", so the photo just sat there locally,
+                # correctly extracted, never uploaded, with nothing to explain
+                # why. \n/\r still stripped -- those genuinely can't be part of
+                # a filename, unlike a plain space.
+                image_name = image_name.replace('\n', '').replace('\r', '')
             else:
                 if isinstance(image_name, str) and image_name and not image_data:
                     # A valid image_no, but FileMaker's container field is
