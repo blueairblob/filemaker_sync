@@ -2686,13 +2686,51 @@ and code signing (a real cost, not yet budgeted) becomes the actual next lever. 
 installer runs, check Norton's own History/Quarantine for the actual detection name rather than
 assuming either outcome.
 
+### Update, same session — confirmed: `--onedir` did NOT fix the Norton problem
+
+The user re-ran the `--onedir` rebuild for real. **Norton quarantined it too, on the first
+attempt** — confirmed directly by the user ("it was norton, after it clear I had to install it
+again"), not inferred. So the theory that `--onefile`'s self-extraction-to-`%TEMP%` was the
+specific trigger is wrong, or at least incomplete: Norton's heuristic is flagging something
+broader — most likely just "unsigned, unknown-reputation PyInstaller-built exe" in general, which
+`--onedir` doesn't change. The app works fine once the quarantine is cleared and the install
+retried — this is purely a distribution-friction problem, not a functional bug in the app itself.
+
+**Worth understanding for next time this comes up: "Norton keeps forgetting" (the user's words)
+isn't Norton malfunctioning.** PyInstaller embeds build-specific bytes (timestamps, absolute
+build-machine paths) into its output, so every single rebuild is a genuinely different file by
+hash — there is no cumulative reputation being built across dev iterations, and no
+quarantine-clear or exclusion granted for one build has any bearing on the next. This will recur
+on literally every fresh build, forever, under the current approach.
+
+**Real options going forward, not yet decided:**
+1. **Code signing** — the only mitigation that actually generalizes across machines and rebuilds
+   (signed binaries are trusted based on the signing identity, not the exact file hash, and build
+   reputation over time). Real, currently unbudgeted cost (a code-signing certificate, roughly
+   $100-400/year depending on issuer/type) — a decision for the user/RAT to make, not something to
+   just do.
+2. **A durable, path-based Norton exclusion** on whichever machine runs this — free, but
+   machine-specific (helps the dev machine's own iteration loop; does nothing for a RAT
+   volunteer's own machine, who won't know how to configure this and won't have anyone walking
+   them through a quarantine-clear either).
+3. **Submit each shipped build to Norton/NortonLifeLock's false-positive review queue** before
+   handing it to a real volunteer — free, but manual, slow, and (per the hash problem above) only
+   ever covers the exact build submitted, not the next rebuild.
+4. **Accept the friction as a documented, expected first-run hurdle** for whoever installs it —
+   consistent with this being a small-scale, per-engagement tool, but this session's experience
+   shows it's not "click through a warning," it's "the file vanishes and you have to know to check
+   Norton's quarantine" — a much worse first-run experience for a non-technical volunteer than for
+   this session's own testing.
+
+`--onedir` is being kept regardless (smaller `PicalocoAgent.exe`, no runtime self-extraction — a
+real improvement on its own technical merits), but it does not by itself solve distribution to a
+real RAT volunteer's machine.
+
 ### Open Threads (revised)
 
-- **Next concrete step: re-run `PicalocoAgent-Setup-0.2.0.exe` (the `--onedir` rebuild) and confirm
-  the installed app survives this time** — check `%LOCALAPPDATA%\Programs\PicalocoAgent` and the
-  uninstall registry key exist *after* the wizard finishes, not just that the wizard finished.
-  If it still vanishes, pull the detection name from Norton's own History/Quarantine before
-  deciding whether `--onedir` wasn't enough or something else is going on.
+- **Decision needed, not yet made: how to handle the Norton/AV false-positive for real
+  distribution** — see the four options above. Nothing further to build until this is decided;
+  building more packaging polish on top of an unsigned exe doesn't address the actual blocker.
 - *(Carried, unchanged)*: thumbnail size gap; wider backtick-corruption data audit; GUI
   target-profile picker; Migration Overview's full `rat.*`-comparison redesign; the 16 flagged
   source records; `--mode dml_files` parser rewrite; `PicaLocoBackend`/`picaloco` rebrand (still
