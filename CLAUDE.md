@@ -505,10 +505,11 @@ one diagnostic row before the process exits non-zero. Data ref is deliberately t
 nullable columns (`image_no`/`fm_rowid`/`catalog_id`), not one — this codebase already has real
 cases where `image_no` itself is the broken thing (NULL/duplicate rows, see "Verified facts"
 above). Table lives in `rat_migration`, not `rat` — same reasoning as `sync_manifest`, direct
-Postgres access only, never PostgREST. **Not yet applied to live `oci`** — DDL is auto-blocked for
-Claude to run directly, so the exact `--init` command needs to be run by a human first; see
-`devlog/worksheet.md` Session 20 for that command and the full design discussion. Vendored into
-`picaloco_agent` already, but not yet live-tested end-to-end (needs the table to exist first).
+Postgres access only, never PostgREST. **`--init` run against live `oci` and confirmed live
+end-to-end (2026-09-12)**: the real `upload_images_oci.py` InvalidKeyError path was exercised
+against two genuine backtick image_nos (not a synthetic call) and landed correctly in
+`rat_migration.reject_log` with the right `catalog_id`/`run_id`/reason; `log_crash()` was also
+confirmed against a real exception. See `devlog/worksheet.md` Session 20 for the full trace.
 
 Smaller open threads: no GUI target-profile picker; Migration Overview's full `rat.*`-comparison redesign
 (parked, no clean table mapping); `picture_metadata` untested against real images (no local files); the 16

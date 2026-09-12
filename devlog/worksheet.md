@@ -2363,8 +2363,8 @@ inputs" — every reject in this pipeline only ever exists as a one-off local fi
 invisible on a remote install unless someone finds and forwards it. Designed and built a persisted,
 DB-backed reject history to fix that.
 **Status:** Storage relay — `done, committed, not yet live-tested`. `picaloco_agent` GitHub remote —
-`done, pushed, confirmed clean of secrets`. `reject_log.py` — `built, vendored, not yet applied to
-live oci` (the one-time `--init` DDL needs a human to run it — see below).
+`done, pushed, confirmed clean of secrets`. `reject_log.py` — `done, --init run against live oci,
+confirmed live end-to-end` (user ran `--init`, then we tested it together — see "Live test" below).
 
 ---
 
@@ -2492,25 +2492,46 @@ the `filemaker_sync` originals (`diff -rq`, ignoring `__pycache__`). `build_exe.
 — it already `shutil.copytree()`s the whole `vendor/scripts/` directory, so the new file is picked
 up automatically on the next build.
 
+**Live test (2026-09-12, same session) — confirmed working end-to-end against real `oci`:**
+user ran `python scripts/reject_log.py --init --target-profile oci`, then we tested it together,
+from WSL (confirmed reachable: this environment has direct network access to `oci`'s Tailscale
+host, no Windows detour needed for the Postgres-only side of this test):
+1. `--list --target-profile oci` against the freshly-created table — empty, as expected.
+2. A synthetic `log_reject()` call (`severity="ambiguous"`) — wrote clean, including a `NaN` value
+   in `source_data` (confirms `_json_safe()` actually prevents the RFC-7159 violation it exists to
+   prevent, not just in a unit test against a mock). Read back correctly via `--list`, exported
+   correctly via `--export` (verified the real `.xlsx` columns/values with `openpyxl`), resolved
+   correctly via `--resolve`, and correctly excluded from a follow-up `--unresolved-only --list`.
+3. **The real wired code, not a synthetic call:** `upload_images_oci.py --list-missing` (read-only)
+   found 48 image_nos missing from Storage — mostly the known backtick set. Ran a real, scoped
+   `--target-profile oci --image-nos "merd113\`,msbrp0721\`" --force` against two of them (local
+   `.webp` files for these already existed in the real export cache, `/mnt/c/dev/
+   RAT_Trains_Project_Exports/exports/images/webp_mobile/` — reachable from WSL, same machine).
+   Both hit `InvalidKeyError` exactly as expected, and `write_invalid_key_report()`'s new
+   `log_reject()` call landed both in `rat_migration.reject_log` for real: correct `severity="reject"`,
+   correct `source_script`/`stage`, correct canned reason, and — confirming the `rat.catalog` id
+   lookup this function already did got reused correctly — real `catalog_id` UUIDs for both, sharing
+   one `run_id`.
+4. `log_crash()` against a genuine raised exception (not a fake one) also confirmed against real
+   `oci` — a `severity="crash"` row landed with the actual traceback text.
+
+Left the two real InvalidKey rows **unresolved** on purpose (they're a real, standing, permanent
+issue — that's exactly what the table is for); resolved only the two synthetic test rows, each with
+a clear note explaining what they were.
+
 **Not yet done:**
-- **The `--init` DDL has not been run against live `oci`** — DDL/grants on the live DB are
-  auto-blocked for Claude to run directly (established this session as a general pattern, not new).
-  The exact command (`python scripts/reject_log.py --init --target-profile oci`, or
-  `--print-ddl` first to inspect) needs a human to run it before any of this is live.
-- No end-to-end live test yet (needs the table to exist first) — once `--init` is run, the natural
-  next step is a real Sync/Upload Images run and confirming rows actually land, then `--list`/
-  `--export` against them.
 - No GUI surface anywhere (`picaloco_agent`, `picaloco_web`) for reviewing rejects — CLI only, by
   deliberate scope choice for this first build.
 - `migrate_organisation`/`migrate_location`/`migrate_route`/`migrate_builder`'s own per-row error
   paths were not instrumented this session (only `catalog`/`catalog_metadata`/`catalog_builder`,
   the three most directly tied to `image_no`) — a natural follow-up if those turn out to need it too.
+- The Storage relay's own live test (below) is still separately outstanding — different feature,
+  don't conflate the two.
 
 ---
 
 ### Open Threads
 
-- `rat_migration.reject_log`'s `--init` not yet run against live `oci` — the immediate next step.
 - Storage relay (this session's other half) not yet live-tested end-to-end.
 - *(Carried, unchanged)*: `picaloco_agent` not yet repackaged/distributed; thumbnail size gap;
   whether other already-migrated fields have latent backtick corruption (wider data audit); GUI
