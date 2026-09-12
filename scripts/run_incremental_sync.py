@@ -93,6 +93,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import db_sync_manifest as dsm
+import reject_log
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -130,7 +131,13 @@ def _xlsx_safe(v):
     return str(v)
 
 
-def write_quarantine_report(staging_rows: dict, rejected: set, by_image: dict, cfg: dict) -> str | None:
+QUARANTINE_REASON = ("Rejected by the catalog loader (db_dml_loader.py) -- extracted from "
+                     "FileMaker but did not verify in rat.catalog after Sync attempted to load it.")
+
+
+def write_quarantine_report(staging_rows: dict, rejected: set, by_image: dict, cfg: dict,
+                             target_profile: str | None = None, run_id: str | None = None,
+                             conn=None) -> str | None:
     """A browsable .xlsx of every rejected/quarantined row's full
     freshly-extracted data (every ratcatalogue column, not just image_no) --
     so whoever has FileMaker access can actually find and correct the real
@@ -143,13 +150,26 @@ def write_quarantine_report(staging_rows: dict, rejected: set, by_image: dict, c
 
     `id` here is FileMaker's own ROWID (from by_image, the live skinny
     scan), not a rat.catalog UUID -- these rows never made it into
-    rat.catalog, so no UUID exists yet.
+    rat.catalog, so no UUID exists yet. Also feeds each row into
+    rat_migration.reject_log (severity="ambiguous" -- QUARANTINE_REASON is a
+    catch-all, not db_dml_loader.py's own actual per-row reason, which isn't
+    threaded back to this caller today; see reject_log.py's module
+    docstring). Reuses the caller's already-open `conn` (pg.cnxn) rather
+    than opening a second connection to write these.
 
     Best-effort: openpyxl not installed, or the write itself failing, never
     fails the sync over it -- the row stays correctly un-advanced in the
     manifest either way and will show up again next run."""
     if not rejected:
         return None
+
+    for img in sorted(rejected):
+        reject_log.log_reject(
+            cfg, target_profile, source_script="run_incremental_sync.py", stage="verify",
+            severity="ambiguous", image_no=img, fm_rowid=by_image.get(img, {}).get('rowid'),
+            reason=QUARANTINE_REASON, source_data=staging_rows.get(img), run_id=run_id, conn=conn,
+        )
+
     try:
         from openpyxl import Workbook
     except ImportError:
@@ -166,9 +186,7 @@ def write_quarantine_report(staging_rows: dict, rejected: set, by_image: dict, c
         ws.title = "Rejected records"
         ws.append(["image_no", "id", "reason"] + extra_cols)
         for img, row in rows:
-            reason = ("Rejected by the catalog loader (db_dml_loader.py) -- extracted from "
-                      "FileMaker but did not verify in rat.catalog after Sync attempted to load it.")
-            ws.append([img, _xlsx_safe(by_image.get(img, {}).get('rowid')), reason]
+            ws.append([img, _xlsx_safe(by_image.get(img, {}).get('rowid')), QUARANTINE_REASON]
                       + [_xlsx_safe(row.get(c)) for c in extra_cols])
 
         export_path = cfg.get("export", {}).get("path", "export")
@@ -283,6 +301,7 @@ def main() -> int:
     args = ap.parse_args()
 
     cfg = dsm.load_toml(args.config) if os.path.exists(args.config) else {}
+    run_id = reject_log.new_run_id()
     report = dsm.Report()
     report.line("Incremental sync")
     report.line(f"Run at {dsm.NOW.isoformat()}")
@@ -412,7 +431,13 @@ def main() -> int:
             report.kv("verified (committed to rat.catalog):", len(verified))
             if rejected:
                 report.kv("rejected/quarantined (not advanced):", len(rejected))
-                quarantine_report_path = write_quarantine_report(staging_rows, rejected, by_image, cfg)
+                # conn=pg.cnxn reuses the connection already open for this run rather than
+                # opening a second one -- safe to let log_reject() commit on it here: every
+                # statement against pg.cnxn up to this point has been a read (scan/verify/
+                # staging fetch), nothing pending that a commit could prematurely finalize.
+                quarantine_report_path = write_quarantine_report(staging_rows, rejected, by_image, cfg,
+                                                                  target_profile=profile, run_id=run_id,
+                                                                  conn=pg.cnxn)
                 if quarantine_report_path:
                     report.line(f"Quarantine report (for FileMaker-side correction): {quarantine_report_path}")
 
@@ -500,4 +525,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception:
+        reject_log.log_crash("run_incremental_sync.py")
+        raise

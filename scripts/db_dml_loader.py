@@ -109,11 +109,15 @@ except ImportError:                       # self-contained fallback (identical b
         return raw_path
 
 
+import reject_log
+
 # Global variables — populated by main() (via `global`) before any migration
 # function runs; declared here (without a None default) so their static type
 # is the real type, not Optional[...].
 user_id = None
 debug = False
+target_profile: str | None = None   # for reject_log.log_reject() calls -- see main()
+run_id: str | None = None           # ditto -- groups this run's rejects together
 logger: logging.Logger
 engine: Engine
 session: sessionmaker
@@ -1104,10 +1108,17 @@ def migrate_catalog(df):
                 for col in valid_columns 
                 if col in row and col not in ['id', 'created_date']  # Exclude auto-generated columns
             }          
-            catalog_data[image_no] = record    
+            catalog_data[image_no] = record
         except Exception as e:
             logger.error(f"{tgt_table}: Error processing catalog entry {row.get('image_no', 'unknown')}: {str(e)}")
             logger.exception(f"{tgt_table}: Exception details:")
+            # "ambiguous", not "reject" -- a caught exception with the real Python message,
+            # but not a domain-level classified cause the way e.g. InvalidKeyError is.
+            reject_log.log_reject(
+                config, target_profile, source_script="db_dml_loader.py", stage="load",
+                severity="ambiguous", image_no=row.get('image_no'), table_name=tgt_table,
+                reason=f"Error processing catalog entry: {e}", source_data=dict(row), run_id=run_id,
+            )
     
     try:
         catalog_data_lst = list(catalog_data.values())
@@ -1127,6 +1138,13 @@ def migrate_catalog_metadata(df):
 
     metadata_data = []
     skipped = 0
+    # Opened lazily, only if a skip actually happens, and reused for every
+    # skip in this run rather than one connection per row -- this loop runs
+    # over the entire catalog every time, so a per-row connection would be
+    # wasteful even though skips themselves are rare. False (not None) once
+    # opening it has failed once, so we don't keep retrying for every
+    # remaining row in the same run.
+    reject_conn = None
     for _, row in tqdm(df.iterrows(), total=len(df), desc="Processing metadata"):
         catalog_id = lookup_caches['catalog'].get(stripy(row['image_no']))
         if catalog_id is None:
@@ -1137,6 +1155,19 @@ def migrate_catalog_metadata(df):
             # is UNIQUE-constrained (SQL NULL != NULL means every re-run would
             # insert yet another orphan row). Skip rather than accumulate them.
             skipped += 1
+            if reject_conn is None:
+                try:
+                    reject_conn = reject_log.open_connection(config, target_profile)
+                except Exception:
+                    reject_conn = False
+            if reject_conn:
+                reject_log.log_reject(
+                    config, target_profile, source_script="db_dml_loader.py", stage="load",
+                    severity="ambiguous", image_no=row.get('image_no'), table_name=tgt_table,
+                    reason="catalog_metadata: unresolved catalog_id -- this row's own catalog entry "
+                           "wasn't loaded (likely a NULL/duplicate image_no, or an earlier reject).",
+                    source_data=dict(row), run_id=run_id, conn=reject_conn,
+                )
             continue
         metadata_data.append({
             'catalog_id': catalog_id,
@@ -1146,6 +1177,11 @@ def migrate_catalog_metadata(df):
             'collection_id': lookup_caches['collection'].get(stripy(row['collection'])),
             'photographer_id': lookup_caches['photographer'].get(stripy(row['photographer']))
         })
+    if reject_conn:
+        try:
+            reject_conn.close()
+        except Exception:
+            pass
     #uniq_columns=['catalog_id', 'collection_id', 'photographer_id' ,'organisation_id', 'location_id', 'route_id']
     batch_upsert(f'{tgt_schema}.catalog_metadata', metadata_data, uniq_columns=['catalog_id'])
     if skipped:
@@ -1321,6 +1357,11 @@ def migrate_catalog_builder(df):
     batch_data[tgt_table] = {'table_obj' : Catalog_Builder, 'error_records' : error_records,  'error_counts' : error_counts, 'columns_info' : columns_info} 
     
     logger.info(f"{tgt_table}: Gathering Data")
+    # Same lazy, reused-connection pattern as migrate_catalog_metadata()'s own
+    # skip logging -- this loop (x3 per row, for the 3 possible builder slots)
+    # runs over the entire catalog every time, so open at most one connection
+    # for this whole function rather than one per skip.
+    reject_conn = None
     for _, row in catalog_builders.iterrows():
         image_no = stripy(row.get('image_no'))
         try:
@@ -1346,6 +1387,20 @@ def migrate_catalog_builder(df):
                     # rejected -- same reasoning as catalog_metadata: unlinkable,
                     # and catalog_id is part of the natural key, so a NULL here
                     # would duplicate on every re-run (SQL NULL != NULL).
+                    if reject_conn is None:
+                        try:
+                            reject_conn = reject_log.open_connection(config, target_profile)
+                        except Exception:
+                            reject_conn = False
+                    if reject_conn:
+                        reject_log.log_reject(
+                            config, target_profile, source_script="db_dml_loader.py", stage="load",
+                            severity="ambiguous", image_no=image_no, table_name=tgt_table,
+                            reason=f"catalog_builder: unresolved catalog_id for builder slot {i} -- "
+                                   "this row's own catalog entry wasn't loaded (likely a NULL/"
+                                   "duplicate image_no, or an earlier reject).",
+                            source_data=dict(row), run_id=run_id, conn=reject_conn,
+                        )
                     continue
                 builder_id = lookup_caches['builder'].get(stripy(builder_code))
 
@@ -1386,8 +1441,26 @@ def migrate_catalog_builder(df):
         except Exception as e:
             logger.error(f"{tgt_table}: Error compiling data for image {image_no}: {str(e)}")
             logger.exception(f"{tgt_table}: Exception details:")
+            if reject_conn is None:
+                try:
+                    reject_conn = reject_log.open_connection(config, target_profile)
+                except Exception:
+                    reject_conn = False
+            if reject_conn:
+                reject_log.log_reject(
+                    config, target_profile, source_script="db_dml_loader.py", stage="load",
+                    severity="ambiguous", image_no=image_no, table_name=tgt_table,
+                    reason=f"Error compiling catalog_builder data: {e}",
+                    source_data=dict(row), run_id=run_id, conn=reject_conn,
+                )
             continue  # Continue to next record on error
-    
+
+    if reject_conn:
+        try:
+            reject_conn.close()
+        except Exception:
+            pass
+
     logger.info(f"{tgt_table}: Applying Data")
     cb_data = []
     batch_cnt = 0
@@ -1466,18 +1539,20 @@ def main():
     """Main function to orchestrate the migration process."""
     
     global user_id, debug, engine, session, logger, batch_size, mig_schema, tgt_schema, config, supabase
-    global null_data_lst
-    
+    global null_data_lst, target_profile, run_id
+
     # Load config file
     config = load_config()
-    
+
     # Load config from command line
     args = get_args()
-       
+
     user_id = args.user_id
     batch_size = args.batch_size
     mig_schema = config['database']['target']['schema'][0]
     tgt_schema = config['database']['target']['schema'][1]
+    target_profile = args.target_profile
+    run_id = reject_log.new_run_id()
     debug = args.debug
     null_data_lst = ['', None, 'NULL', 'None']
     
@@ -1557,4 +1632,11 @@ def main():
     logger.info("Migration process completed")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        # target_profile/run_id are module globals main() sets near the top --
+        # already correct here if the crash happened after that point, still
+        # None (log_crash()'s own default) if it happened before.
+        reject_log.log_crash("db_dml_loader.py", target_profile=target_profile, run_id=run_id)
+        raise

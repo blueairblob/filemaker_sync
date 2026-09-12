@@ -119,6 +119,7 @@ except ImportError:                    # self-contained fallback (identical beha
 # helpers (resolve_active_profile/target_conf), not its FileMaker-facing code, so
 # this script stays importable/runnable from WSL with no ODBC dependency.
 import db_sync_manifest as dsm
+import reject_log
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LIST_PAGE_SIZE = 1500  # oci's Storage list endpoint's real per-request cap -- see
@@ -308,7 +309,15 @@ class InvalidKeyError(Exception):
     an expected, unactionable rejection as a fresh problem."""
 
 
-def write_invalid_key_report(invalid_key_names: list, cfg: dict, target_profile: str | None) -> str | None:
+INVALID_KEY_REASON = (
+    "Supabase Storage rejected this image_no as an object key (a backtick or "
+    "similar character) -- open this record in FileMaker Pro (search by Image no.) "
+    "and retype the field without that character."
+)
+
+
+def write_invalid_key_report(invalid_key_names: list, cfg: dict, target_profile: str | None,
+                              run_id: str | None = None) -> str | None:
     """A browsable .xlsx of every image_no InvalidKeyError rejected this
     run -- printing them to the log (as this script already did) isn't
     enough on its own for a RAT volunteer to act on; they need something
@@ -320,7 +329,11 @@ def write_invalid_key_report(invalid_key_names: list, cfg: dict, target_profile:
 
     `id` here is rat.catalog's own UUID -- unlike a loader-rejected row,
     these DID land in rat.catalog (their only failure is the Storage
-    upload), so a real id is available with one extra query.
+    upload), so a real id is available with one extra query. Also feeds
+    each row into rat_migration.reject_log (severity="reject" -- this
+    failure mode is fully understood, see InvalidKeyError's own docstring),
+    reusing this same id lookup rather than querying rat.catalog twice --
+    see reject_log.py's module docstring for why this exists at all.
 
     Best-effort: missing openpyxl, the DB lookup failing, or the write
     itself failing all log a warning and don't fail the run -- these rows
@@ -348,16 +361,20 @@ def write_invalid_key_report(invalid_key_names: list, cfg: dict, target_profile:
     except Exception as e:
         print(f"(rejects report: couldn't look up rat.catalog ids: {e})", file=sys.stderr)
 
+    for img in invalid_key_names:
+        reject_log.log_reject(
+            cfg, target_profile, source_script="upload_images_oci.py", stage="storage_upload",
+            severity="reject", image_no=img, catalog_id=str(ids[img]) if img in ids else None,
+            reason=INVALID_KEY_REASON, run_id=run_id,
+        )
+
     try:
         wb = Workbook()
         ws = wb.active
         ws.title = "Rejected records"
         ws.append(["image_no", "id", "reason"])
         for img in sorted(invalid_key_names):
-            ws.append([img, str(ids[img]) if img in ids else None,
-                       "Supabase Storage rejected this image_no as an object key (a backtick or "
-                       "similar character) -- open this record in FileMaker Pro (search by Image no.) "
-                       "and retype the field without that character."])
+            ws.append([img, str(ids[img]) if img in ids else None, INVALID_KEY_REASON])
 
         export_path = cfg.get("export", {}).get("path", "export")
         out_dir = Path(export_path)
@@ -463,6 +480,7 @@ def main() -> int:
     storage = config["storage"]
     base_url = storage["public_url"]
     bucket = storage["bucket"]
+    run_id = reject_log.new_run_id()
 
     registration_key = resolve_secret("RAT_AGENT_REGISTRATION_KEY", cli_val=args.registration_key)
     relay_base = args.relay_url
@@ -570,7 +588,8 @@ def main() -> int:
             print(f"  {n}")
         if len(invalid_key_names) > 20:
             print(f"  ... and {len(invalid_key_names) - 20} more")
-        invalid_key_report_path = write_invalid_key_report(invalid_key_names, config, args.target_profile)
+        invalid_key_report_path = write_invalid_key_report(invalid_key_names, config, args.target_profile,
+                                                            run_id=run_id)
         if invalid_key_report_path:
             print(f"Report (for FileMaker-side correction): {invalid_key_report_path}")
     if failed_names:
@@ -579,8 +598,18 @@ def main() -> int:
             print(f"  {n}: {err}")
         if len(failed_names) > 20:
             print(f"  ... and {len(failed_names) - 20} more")
+        # "ambiguous", not "reject" -- an unclassified upload failure, unlike InvalidKeyError's
+        # fully-understood case above (see reject_log.py's SEVERITY docs).
+        for n, err in failed_names:
+            reject_log.log_reject(config, args.target_profile, source_script="upload_images_oci.py",
+                                   stage="storage_upload", severity="ambiguous", image_no=n,
+                                   reason=str(err), run_id=run_id)
     return 1 if failed else 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception:
+        reject_log.log_crash("upload_images_oci.py")
+        raise

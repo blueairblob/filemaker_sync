@@ -2335,11 +2335,7 @@ Images` correctly going from disabled to enabled, and `Test Supabase Connection`
 
 ### Open Threads
 
-- **Storage `service_role` relay not built** — the agent still resolves the Storage key the old,
-  baked-secret way; the bigger risk than the DB password, and the reason this whole activation-gate
-  idea started. A second server-side function (agent sends its registration key + image bytes,
-  the function does the actual Storage upload, `service_role` never reaches the client at all) is
-  real, separate, not-yet-started work.
+- ~~Storage `service_role` relay not built~~ — **done later the same day, see Session 20.**
 - `picaloco_agent` not yet repackaged since any of this session's changes (GUI redesign, activation
   gate, image-sync UX) — `dist/PicalocoAgent/` reflects an old version; no Inno Setup `.iss` written
   yet.
@@ -2353,5 +2349,173 @@ Images` correctly going from disabled to enabled, and `Test Supabase Connection`
 - *(Carried, unchanged)*: GUI target-profile picker; Migration Overview's full `rat.*`-comparison
   redesign; the 16 flagged source records; `--mode dml_files` parser rewrite;
   `PicaLocoBackend`/`picaloco` rebrand (still gated on stability); restore procedure not rehearsed.
+
+---
+
+## Session 20 — 2026-09-12 — Storage `service_role` relay completed; new `rat.agent_licenses`
+## GitHub remote; `reject_log.py` designed and built
+
+**Focus:** two threads. First, finishing what Session 19 left open — the Storage half of
+`picaloco_agent`'s activation gate, and publishing `picaloco_agent` to its own GitHub remote
+(it had never had one). Second, and the bulk of this session: the user flagged a real gap for the
+future — "the RAT database requires resyncing... volunteers no doubt need lots of help with errant
+inputs" — every reject in this pipeline only ever exists as a one-off local file or a log line,
+invisible on a remote install unless someone finds and forwards it. Designed and built a persisted,
+DB-backed reject history to fix that.
+**Status:** Storage relay — `done, committed, not yet live-tested`. `picaloco_agent` GitHub remote —
+`done, pushed, confirmed clean of secrets`. `reject_log.py` — `built, vendored, not yet applied to
+live oci` (the one-time `--init` DDL needs a human to run it — see below).
+
+---
+
+### Outcome — Storage `service_role` relay (the deferred half of the activation gate)
+
+Session 19 built the DB-password half of `picaloco_agent`'s activation gate but explicitly deferred
+the Storage half — the materially bigger risk, since `service_role` bypasses RLS across the *entire*
+database and Storage, not just images. Completed it the same day, same registration-key pattern:
+
+- `picaloco_web` gained `lib/agentAuth.ts` (factored `createAdminClient()`/`isValidAgentKey()` out
+  of `api/agent-auth.ts` so both halves share one implementation) and two new relay endpoints,
+  `api/agent-storage-upload.ts` (relays one image upload, classifies Storage's `InvalidKey`
+  rejection as `{ok:false, storage_invalid_key:true}` — a 200, not an error, since the caller
+  already knows how to treat this as expected) and `api/agent-storage-list.ts` (relays one Storage
+  bucket-listing page). Both reuse the *same* `SUPABASE_SERVICE_ROLE_KEY` env var already set for
+  the DB-password half — no new Vercel config needed. `npx tsc -b`, `oxlint`, `npm run build` all
+  clean.
+- `upload_images_oci.py` gained an opt-in `--registration-key` mode (env var
+  `RAT_AGENT_REGISTRATION_KEY`): `_list_page_relay()`/`_upload_one_relay()` route through the two
+  endpoints above instead of talking to Storage directly. The existing direct-`service_role` path
+  (and `--init`, the one-time bucket bootstrap) is completely unchanged and stays the default —
+  `filemaker_sync`'s own trusted, admin-run use has no reason to pay relay overhead for something
+  already running with legitimate direct access.
+- `picaloco_agent`'s `sync_runner.py` passes the registration key through via
+  `RAT_AGENT_REGISTRATION_KEY`. `target_config.has_storage_access()` replaces the old
+  `has_service_key()` gate on the Upload Images button — and this was a **real gap being closed**,
+  not just tidying: the old gate checked only for a *baked* service key, so on any real distributed
+  install (no `_secret.py`, by design) Upload Images stayed disabled regardless of whether a
+  registration key was configured. `has_service_key()` itself was then dead code (nothing in this
+  repo ever calls `upload_images_oci.py --init`) — deleted rather than left around.
+- Docs updated: `picaloco_web/DEVOPS.md` §11, `picaloco_agent/README.md`.
+- **Not yet live-tested** — unlike the DB-password half (which got a real GUI click-through before
+  being called done), nobody's actually run a registration key through these two endpoints yet. Next
+  concrete step whenever picked back up.
+
+### Outcome — `picaloco_agent` gets its own GitHub remote
+
+`picaloco_agent` had been a local-only git repo (26 commits, `master` branch, never pushed anywhere)
+since it was created. Published to `github.com/blueairblob/picaloco_agent` — public, matching the
+other two sibling repos' visibility and default-branch convention (`master` renamed to `main`
+first). Checked history was clean of secrets *before* publishing, not after: `.gitignore` already
+covered `.env`/`src/_secret.py`/`vendor/config.toml`; full-history search (`git log --all -p --
+src/_secret.py .env`) confirmed neither was ever force-committed. Only `env_secrets.py` (the
+resolution *mechanism*, no actual secret values) appears anywhere in history, exactly as expected.
+
+---
+
+### Outcome — `reject_log.py` designed and built (the bulk of this session)
+
+**The gap, in the user's own words:** "I suspect the RAT database requires resyncing... volunteers
+no doubt have lots of help with errant inputs... The 'rejects...' excel spreadsheet is useful but we
+need some actual data to try and fix harder issues." Surveyed what actually happens today across the
+three reject producers before designing anything:
+
+- `db_dml_loader.py`'s real production path (`--mode migration_schema`) only ever *logs* per-row
+  failures — `migrate_catalog()`'s per-row exception handler and `migrate_catalog_metadata()`/
+  `migrate_catalog_builder()`'s "unresolved catalog_id, skip" branches never captured anything
+  structured, only an aggregate count plus a `logger.error`/`logger.warning` line. (Its OTHER,
+  legacy `--mode dml_files` reject mechanism — `write_rejected_data()`/`.sql.reject` files — is
+  already documented as effectively dead: that mode can't parse a realistic FileMaker export at
+  all. Left untouched.)
+- `run_incremental_sync.py`'s `write_quarantine_report()` and `upload_images_oci.py`'s
+  `write_invalid_key_report()` both already write a structured, browsable `rejects_*.xlsx` —
+  but only as a one-off local file per run, with no cross-run history and no way to review it
+  without physically having that file.
+
+**Design decisions, and why** (full design conversation preserved this session — summarized here):
+
+1. **Data ref: three separate nullable columns, not one.** `image_no` is this pipeline's natural
+   key everywhere else, so it's the primary ref — but it can't be the *only* one: this codebase
+   already has real, documented cases where `image_no` itself is exactly what's broken or absent
+   (3 NULL rows, 13 duplicates — see "Verified facts" in CLAUDE.md). `fm_rowid` (FileMaker's own
+   ROWID) is the one thing always available even when `image_no` is the problem. `catalog_id`
+   (`rat.catalog`'s UUID) is set only when the row actually landed there (e.g. a Storage-stage
+   `InvalidKeyError` — the catalog row is fine, only the upload failed) — lets an admin jump
+   straight to the live record.
+2. **`severity`: `"reject"` / `"ambiguous"` / `"crash"`, not a plain pass/fail.** `"reject"` is a
+   fully classified, known cause (`InvalidKeyError`'s backtick case). `"ambiguous"` is caught but
+   not root-caused — `run_incremental_sync.py`'s existing "didn't verify in rat.catalog" reason is
+   exactly this: it doesn't say *why* the loader rejected the row, only that it did.
+   `"crash"` is the process dying instead of rejecting cleanly — every calling script's `__main__`
+   block now wraps `main()` in a top-level `try/except Exception` that calls `log_crash()` (records
+   a traceback) before re-raising, so the run still fails loudly but the diagnostic isn't lost.
+3. **Table lives in `rat_migration`, not `rat`.** Pipeline-internal diagnostic data, read only via
+   direct Postgres connections (this module's own CLI, or `picaloco_agent` running the same
+   vendored module) — never through PostgREST. Same reasoning that already governs
+   `rat_migration.sync_manifest`.
+4. **Additive, not a replacement** for the existing `rejects_*.xlsx` reports — a volunteer without
+   DB access still needs something they can just open.
+
+**Built:** new `scripts/reject_log.py` (~340 lines) — `REJECT_LOG_DDL` (idempotent, same
+`CREATE TABLE IF NOT EXISTS`/guarded-`ALTER`/`COMMENT ON TABLE` shape as `db_sync_manifest.py`'s own
+`SYNC_MANIFEST_DDL`), `log_reject()` (the writer — best-effort, **never raises**, confirmed by
+pointing it at a deliberately unreachable host and checking it degrades to a printed warning
+instead of an exception), `log_crash()`, and an admin CLI (`--init`, `--print-ddl`,
+`--list`/`--export`/`--unresolved-only`/`--since`/`--image-no`, `--resolve`). Two correctness
+details worth remembering if this ever gets touched again:
+- **`_json_safe()`** — Postgres's `jsonb` strictly follows RFC 7159 (no `NaN`/`Infinity` literals),
+  but Python's `json` module happily *emits* them for a float `NaN` — and this pipeline's own rows
+  (read via pandas from a hand-entered source) are full of exactly that for a blank cell. Without
+  this, logging a reject whose `source_data` contained one blank cell would itself fail the INSERT.
+  Recursively sanitizes before `json.dumps()`; unit-tested against a dict with `NaN`/`Infinity` at
+  multiple nesting levels.
+- **`_str_or_none()`** — coerces `image_no`/`fm_rowid`/`catalog_id`/`table_name` to a plain `str` or
+  `None` before binding, for the same reason: callers hand this raw pandas/numpy scalars routinely.
+
+**Wired into all three producers:**
+- `upload_images_oci.py`: `write_invalid_key_report()` now also calls `log_reject()` per row
+  (`severity="reject"`, reusing the `rat.catalog` id lookup it already does rather than querying
+  twice); the `failed_names` unexpected-failure path logs `severity="ambiguous"`.
+- `run_incremental_sync.py`: `write_quarantine_report()` now also calls `log_reject()` per rejected
+  row (`severity="ambiguous"`), reusing the run's already-open `pg.cnxn` rather than opening a
+  second connection (confirmed safe: every statement against that connection up to this point in
+  the flow is a read, nothing pending a stray `commit()` could prematurely finalize).
+- `db_dml_loader.py`: `migrate_catalog()`'s per-row exception handler, `migrate_catalog_metadata()`'s
+  and `migrate_catalog_builder()`'s "unresolved catalog_id" skip branches, and
+  `migrate_catalog_builder()`'s own per-row exception handler. These three loops run over the
+  *entire* catalog every time (not just a delta), so each function opens at most **one** connection
+  for its whole run, lazily (only if a reject actually happens), rather than one per row — a real
+  connection-storm risk avoided before it happened, not after.
+
+All four files (`reject_log.py` new, the three above modified) syntax-checked, import/`--help`
+smoke-tested, and re-vendored into `picaloco_agent/vendor/scripts/` — confirmed byte-identical to
+the `filemaker_sync` originals (`diff -rq`, ignoring `__pycache__`). `build_exe.py` needs no change
+— it already `shutil.copytree()`s the whole `vendor/scripts/` directory, so the new file is picked
+up automatically on the next build.
+
+**Not yet done:**
+- **The `--init` DDL has not been run against live `oci`** — DDL/grants on the live DB are
+  auto-blocked for Claude to run directly (established this session as a general pattern, not new).
+  The exact command (`python scripts/reject_log.py --init --target-profile oci`, or
+  `--print-ddl` first to inspect) needs a human to run it before any of this is live.
+- No end-to-end live test yet (needs the table to exist first) — once `--init` is run, the natural
+  next step is a real Sync/Upload Images run and confirming rows actually land, then `--list`/
+  `--export` against them.
+- No GUI surface anywhere (`picaloco_agent`, `picaloco_web`) for reviewing rejects — CLI only, by
+  deliberate scope choice for this first build.
+- `migrate_organisation`/`migrate_location`/`migrate_route`/`migrate_builder`'s own per-row error
+  paths were not instrumented this session (only `catalog`/`catalog_metadata`/`catalog_builder`,
+  the three most directly tied to `image_no`) — a natural follow-up if those turn out to need it too.
+
+---
+
+### Open Threads
+
+- `rat_migration.reject_log`'s `--init` not yet run against live `oci` — the immediate next step.
+- Storage relay (this session's other half) not yet live-tested end-to-end.
+- *(Carried, unchanged)*: `picaloco_agent` not yet repackaged/distributed; thumbnail size gap;
+  whether other already-migrated fields have latent backtick corruption (wider data audit); GUI
+  target-profile picker; Migration Overview's full `rat.*`-comparison redesign; the 16 flagged
+  source records; `--mode dml_files` parser rewrite; `PicaLocoBackend`/`picaloco` rebrand (still
+  gated on stability); restore procedure not rehearsed.
 
 ---

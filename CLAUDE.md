@@ -411,6 +411,7 @@ python.exe scripts/fm_metadata_probe.py --selftest
 | Stage-1 extract (target-connection path fixed Session 5; see Gotchas re: `--mode dml_files`) | `scripts/filemaker_extract.py` |
 | Incremental sync engine (scan/diff/manifest) | `scripts/db_sync_manifest.py` |
 | Incremental sync orchestrator (the actual periodic sync) | `scripts/run_incremental_sync.py` |
+| Persisted reject history (writer + admin CLI reader) — see "Current focus" Session 20 | `scripts/reject_log.py` |
 | FileMaker metadata probe | `scripts/fm_metadata_probe.py` |
 | Shared secret resolution | `scripts/env_secrets.py` |
 | Ground-truth schema (reference only, not re-appliable) | `rat_schema_original.sql` |
@@ -473,9 +474,41 @@ previously go unreported forever. Separately, `picaloco_agent`'s activation-gate
 Session 18) was built for the DB-password half: a revocable **registration key**, checked against a
 new Vercel serverless function in `picaloco_web` (`api/agent-auth.ts` + `rat.agent_licenses`), means
 the agent no longer needs a baked-in DB password at all — full design/build/debugging detail in
-`devlog/worksheet.md` Session 19 and `picaloco_web/DEVOPS.md` §11. The Storage `service_role` key
-side of that same idea is **not yet built** — still the old baked-secret mechanism, bigger risk, real
-separate work.
+`devlog/worksheet.md` Session 19 and `picaloco_web/DEVOPS.md` §11.
+
+**Update (later, same day as Session 19 — Storage relay completed):** the Storage `service_role`
+half of the activation gate, called "not yet built" at the time, is now done too — same
+registration-key pattern, via a new opt-in `--registration-key` mode on `upload_images_oci.py`
+(routes through `picaloco_web`'s `api/agent-storage-upload.ts`/`agent-storage-list.ts` relay
+instead of talking to Storage directly). Default direct-service_role path (and `--init`) is
+completely unchanged. `picaloco_agent`'s `target_config.has_storage_access()` replaces the old
+`has_service_key()` gate on Upload Images — that gate previously blocked Upload Images entirely on
+any real distributed install regardless of registration key, the actual gap this closed. Full
+detail: `picaloco_web/DEVOPS.md` §11, `picaloco_agent/README.md`. `picaloco_agent` also picked up
+its own public GitHub remote this session (`github.com/blueairblob/picaloco_agent`, previously
+local-only) — history checked clean of secrets first (`.env`/`src/_secret.py` were always
+gitignored, confirmed via full-history search before publishing).
+
+**Update (Session 20): every reject in this pipeline used to only ever exist as a one-off local
+file or a log line — invisible on a remote picaloco_agent install unless someone found and
+forwarded it.** New `scripts/reject_log.py` persists loader/upload rejects into
+`rat_migration.reject_log` (writer: `log_reject()`/`log_crash()`; admin reader:
+`--list`/`--export`/`--resolve` CLI) — additive, not a replacement for the existing
+`rejects_*.xlsx` reports. Wired into all three producers: `upload_images_oci.py`'s
+`InvalidKeyError` path (severity `"reject"` — fully classified) and its unexpected-failure path
+(`"ambiguous"`); `run_incremental_sync.py`'s `write_quarantine_report()` (`"ambiguous"` — its
+existing "didn't verify in rat.catalog" reason is a catch-all, not db_dml_loader.py's actual
+per-row cause); `db_dml_loader.py`'s `migrate_catalog()`/`migrate_catalog_metadata()`/
+`migrate_catalog_builder()` per-row exception/skip branches. Every calling script's `__main__`
+block also gained a top-level crash handler (`log_crash()`) so an unhandled exception still gets
+one diagnostic row before the process exits non-zero. Data ref is deliberately three separate
+nullable columns (`image_no`/`fm_rowid`/`catalog_id`), not one — this codebase already has real
+cases where `image_no` itself is the broken thing (NULL/duplicate rows, see "Verified facts"
+above). Table lives in `rat_migration`, not `rat` — same reasoning as `sync_manifest`, direct
+Postgres access only, never PostgREST. **Not yet applied to live `oci`** — DDL is auto-blocked for
+Claude to run directly, so the exact `--init` command needs to be run by a human first; see
+`devlog/worksheet.md` Session 20 for that command and the full design discussion. Vendored into
+`picaloco_agent` already, but not yet live-tested end-to-end (needs the table to exist first).
 
 Smaller open threads: no GUI target-profile picker; Migration Overview's full `rat.*`-comparison redesign
 (parked, no clean table mapping); `picture_metadata` untested against real images (no local files); the 16
@@ -484,5 +517,6 @@ flagged source records (FileMaker-side); `--mode dml_files` parser rewrite (low 
 `PicaLocoBackend`/`picaloco` rebrand (explicitly gated until stable — arguably close now, still not done);
 `supabase-edge-functions` crash-loop fix handed to user, not yet confirmed run; whether other
 already-migrated fields (not just `image_no`) have latent corruption from the backtick bug's entire
-prior history (a wider data audit, not yet done); `picaloco_agent` not yet repackaged/distributed.
+prior history (a wider data audit, not yet done); `picaloco_agent` not yet repackaged/distributed;
+`rat_migration.reject_log`'s `--init` not yet run against live `oci` (see Session 20 update above).
 Full detail in `devlog/worksheet.md`.
