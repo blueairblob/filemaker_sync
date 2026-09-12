@@ -2655,11 +2655,44 @@ own comment had guessed; corrected the comment in the same commit. Output:
 work, not that the installed app launches and functions on a real machine — that's still the next
 concrete step, not a formality.
 
+### Update, same session — the first real install run exposed a real packaging bug
+
+The user actually ran `PicalocoAgent-Setup-0.2.0.exe` on the dev machine — first real install
+attempt, not just a compile. The wizard completed normally (finish screen, Norton "had a moan"
+but didn't visibly block anything) and the app appeared to launch. But afterward the user couldn't
+find it to run it again — checked directly rather than guessed: `%LOCALAPPDATA%\Programs\
+PicalocoAgent` didn't exist on disk at all, and `reg.exe query "HKCU\...\Uninstall" /f "Picaloco"`
+(interop now working — see above) came back with zero matches. So this wasn't "hard to find," it
+was **entirely gone**, registry trace included, despite Inno Setup itself reporting success.
+
+Most likely explanation: Norton auto-quarantined the whole freshly-installed, unsigned exe
+*after* the wizard reported completion — a known aggressive-remediation behavior for unsigned
+PyInstaller binaries, not an Inno Setup bug. `--onefile` self-extracts to `%TEMP%` and executes
+from there on every launch, which is exactly the "dropper" shape AV heuristics flag hardest.
+
+**Fix applied (not yet re-verified by another real install):** switched `build_exe.py`/
+`installer.iss` from `--onefile` to `--onedir` — `PicalocoAgent.exe` now sits directly next to a
+sibling `_internal/` support folder instead of self-extracting each run (`PicalocoAgent.exe`
+dropped from ~40MB to ~2.1MB; `_internal/` carries the ~32MB PyInstaller normally hides inside the
+onefile blob). Rebuilt (`python.exe build_exe.py`) and recompiled (`ISCC.exe installer.iss`)
+clean. Also fixed a smaller, independent finding from the same test: the installer's desktop-icon
+task defaulted to *unchecked*, so a user who didn't notice that checkbox had no icon anywhere
+obvious — switched it to checked by default, unrelated to the AV question but same root symptom
+(a real user losing track of the installed app).
+
+**Not a guaranteed fix** — if Norton's detection turns out to be a generic "unsigned executable"
+heuristic rather than the self-extraction behavior specifically, `--onedir` alone won't clear it,
+and code signing (a real cost, not yet budgeted) becomes the actual next lever. Next time this
+installer runs, check Norton's own History/Quarantine for the actual detection name rather than
+assuming either outcome.
+
 ### Open Threads (revised)
 
-- **Next concrete step: run `PicalocoAgent-Setup-0.2.0.exe`, go through the install wizard, and
-  confirm the installed app actually launches** (Config tab connects, Action tab's Check Sync
-  works) — nothing here has been installed even once yet.
+- **Next concrete step: re-run `PicalocoAgent-Setup-0.2.0.exe` (the `--onedir` rebuild) and confirm
+  the installed app survives this time** — check `%LOCALAPPDATA%\Programs\PicalocoAgent` and the
+  uninstall registry key exist *after* the wizard finishes, not just that the wizard finished.
+  If it still vanishes, pull the detection name from Norton's own History/Quarantine before
+  deciding whether `--onedir` wasn't enough or something else is going on.
 - *(Carried, unchanged)*: thumbnail size gap; wider backtick-corruption data audit; GUI
   target-profile picker; Migration Overview's full `rat.*`-comparison redesign; the 16 flagged
   source records; `--mode dml_files` parser rewrite; `PicaLocoBackend`/`picaloco` rebrand (still
