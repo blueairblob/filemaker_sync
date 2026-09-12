@@ -2540,3 +2540,45 @@ a clear note explaining what they were.
   gated on stability); restore procedure not rehearsed.
 
 ---
+
+## Session 21 (2026-09-12, WSL bounced/rebooted mid-project — picked up via devlog + git log,
+no work lost, working tree was clean)
+
+**Closed the one open thread carried from Session 20: the Storage relay's own live end-to-end
+test.** Reused the real registration key already issued and confirmed live for the Postgres half
+(Session 19) — found at `%LOCALAPPDATA%\PicalocoAgent\config.json` on the real Windows test
+machine (`e956d4fd-...`, reachable read-only from WSL via `/mnt/c/Users/...`) — no new key needed;
+same `rat.agent_licenses` row gates both halves of the gate. Ran `scripts/upload_images_oci.py
+--registration-key ... --target-profile oci` from WSL directly against the repo's own `venv`
+(confirmed it has `requests`/`psycopg2`/`tqdm`/`openpyxl` — no Windows detour needed, this is the
+Postgres+HTTP side, not FileMaker/ODBC).
+
+All three relay paths confirmed live against real `oci`/Vercel, not synthetic:
+1. **List relay** (`api/agent-storage-list.ts`): `--list-missing` paginated the *entire* real
+   bucket (141,327 objects, 95 pages of 1,500 at `LIST_PAGE_SIZE`) through the Vercel relay
+   instead of Storage directly, landing on the same 48 missing image_nos the direct path already
+   knows about (mostly the known backtick/accented-character set) — confirms `_list_page_relay()`
+   pagination and `isValidAgentKey()` both work correctly at real scale, not just for one page.
+2. **Upload relay, success path**: `msmsa0265` — one of the 48 missing, but *not* one of the known
+   backtick cases (a genuine, previously-unexplained gap) — uploaded via the relay and
+   independently verified present in Storage afterward with a direct `object/info` GET (200,
+   correct size/etag). Real fix, not just a test: this image is no longer missing.
+3. **Upload relay, InvalidKeyError path**: `mssacpe3042\`` (a fresh backtick case, not one of the
+   two already exercised directly in Session 20) — relay correctly returned
+   `storage_invalid_key: true`, `upload_one()`'s relay branch raised `InvalidKeyError` exactly as
+   it does on the direct path, and `write_invalid_key_report()`'s `log_reject()` call landed it in
+   `rat_migration.reject_log` with the right `severity="reject"`/reason — confirmed by `--list
+   --image-no`.
+
+**Not addressed this session** (still open): `msmsa0265` turning up missing at all, with no
+backtick/accent explanation, is itself a small loose end -- likely just a prior run that predates
+this image_no existing in the export, not investigated further. Left unresolved in reject_log:
+none new (the InvalidKey row is a real, standing, permanent issue, same as always).
+
+### Open Threads
+
+- All carried items unchanged from Session 20's list (see above) except the Storage relay live
+  test, now done. Next natural candidates: `picaloco_agent` repackaging/distribution, or the wider
+  backtick-corruption data audit.
+
+---
