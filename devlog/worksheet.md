@@ -2623,4 +2623,46 @@ this app's own GUI specifically, vs. `filemaker_sync`'s CLI).
   source records; `--mode dml_files` parser rewrite; `PicaLocoBackend`/`picaloco` rebrand (still
   gated on stability); restore procedure not rehearsed.
 
+### Update, same session — the WSL blocker turned out to be fixable without a restart
+
+The "this sandbox can't run Windows binaries" problem above wasn't actually a dead end. Root
+cause, found by diagnosing rather than assuming a restart was the only fix: `wsl.conf` has
+`systemd=true` on this machine, and `systemd-binfmt.service` runs at every boot and repopulates
+`/proc/sys/fs/binfmt_misc` from `/etc/binfmt.d/`/`/usr/lib/binfmt.d/` — but no WSL-provided config
+file feeds it a `WSLInterop` entry, so that registration silently never came back (confirmed: the
+binfmt_misc directory had exactly two *other* entries, both timestamped to that boot's
+`systemd-binfmt.service` run, and no `WSLInterop`). The underlying interop plumbing itself
+(`/run/WSL/<pid>_interop`, `$WSL_INTEROP`) was alive the whole time — this was never a dead WSL
+session, just one missing binfmt registration. Fix (user ran it, since `sudo` needs an interactive
+password this tool can't supply):
+```
+echo ':WSLInterop:M::MZ::/init:PF' | sudo tee /etc/binfmt.d/WSLInterop.conf
+sudo systemctl restart systemd-binfmt.service
+```
+Persistent (survives future reboots too, via the new conf file) and scoped to one systemd unit —
+no `wsl --shutdown`, no effect on the other concurrently-running Claude session the user was
+protecting. Confirmed working immediately after (`python.exe --version` succeeded from this
+session too).
+
+**With that fixed, both outstanding `picaloco_agent` packaging steps actually ran this session:**
+`python.exe build_exe.py` rebuilt `dist/PicalocoAgent/` clean, picking up everything vendored
+since the last package (GUI redesign, Upload Images, `reject_log.py`, the Storage relay). Then
+`installer.iss` compiled clean via `ISCC.exe` — found at a per-user path on this machine
+(`C:\Users\si_wh\AppData\Local\Programs\Inno Setup 6\`), not `Program Files (x86)` as the script's
+own comment had guessed; corrected the comment in the same commit. Output:
+`dist/installer/PicalocoAgent-Setup-0.2.0.exe` (~58MB, not tracked — `dist/` is gitignored).
+**Not yet done: actually running that installer.** Compiling clean confirms the packaging steps
+work, not that the installed app launches and functions on a real machine — that's still the next
+concrete step, not a formality.
+
+### Open Threads (revised)
+
+- **Next concrete step: run `PicalocoAgent-Setup-0.2.0.exe`, go through the install wizard, and
+  confirm the installed app actually launches** (Config tab connects, Action tab's Check Sync
+  works) — nothing here has been installed even once yet.
+- *(Carried, unchanged)*: thumbnail size gap; wider backtick-corruption data audit; GUI
+  target-profile picker; Migration Overview's full `rat.*`-comparison redesign; the 16 flagged
+  source records; `--mode dml_files` parser rewrite; `PicaLocoBackend`/`picaloco` rebrand (still
+  gated on stability); restore procedure not rehearsed.
+
 ---
