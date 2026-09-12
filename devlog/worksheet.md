@@ -2582,3 +2582,45 @@ none new (the InvalidKey row is a real, standing, permanent issue, same as alway
   backtick-corruption data audit.
 
 ---
+
+## Session 22 (2026-09-12, same day — `picaloco_agent` packaging, first step)
+
+**Picked `picaloco_agent` repackaging/distribution off Session 21's open-threads list.** Wrote
+`picaloco_agent/installer.iss` (new) — the Inno Setup script that packages `build_exe.py`'s
+`dist/PicalocoAgent/` output into a single installer `.exe`, which didn't exist before this
+session (README previously said "no `.iss` script has been written yet"). Per-user, no-admin
+install (`PrivilegesRequired=lowest`, default dir `%LOCALAPPDATA%\Programs\PicalocoAgent`) —
+checked first that nothing the app does needs elevation: its ODBC DSN is a User DSN under `HKCU`
+(`src/odbc_setup.py`), and `vendor/config.toml`/`vendor/logs/` are written next to the exe on every
+run, with the subprocess `cwd` set to `vendor/` (`sync_runner.py`'s `VENDOR_DIR`) — got this
+slightly wrong on the first pass (assumed `{app}/logs`), caught by actually grepping
+`sync_runner.py`'s `cwd=` before finalizing the `[UninstallDelete]` cleanup paths.
+
+**This session's environment genuinely cannot run Windows binaries** — unlike the WSL sessions
+this worksheet otherwise documents, `python.exe`/`cmd.exe` failed with `Exec format error` and
+`/proc/sys/fs/binfmt_misc/WSLInterop` doesn't exist here (a sandboxed variant, not the same
+interop-enabled WSL prior sessions used). So this session could only write and reason about the
+`.iss` script, not compile or run it. **Two steps still need a real Windows machine, handed off,
+not done:**
+1. `python.exe build_exe.py` (repo root) — `dist/PicalocoAgent/` is stale (predates the GUI
+   redesign, `reject_log.py` vendoring, and the Storage relay).
+2. `"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss` — produces
+   `dist\installer\PicalocoAgent-Setup-0.2.0.exe`. Never run even once; the installer itself is
+   unverified until someone runs it on a real machine.
+
+Also refreshed `picaloco_agent/README.md`'s "Status" section: item 6 (Storage relay) was still
+marked "not yet live-tested" even though Session 21 (above) already did exactly that against the
+identical vendored code — updated to reflect it, noting the one real gap left (a click-through of
+this app's own GUI specifically, vs. `filemaker_sync`'s CLI).
+
+### Open Threads
+
+- `picaloco_agent` rebuild (`build_exe.py`) + installer compile (`installer.iss`) — both need a
+  real Windows session, not yet run.
+- Installer itself unverified — no clean-machine install has been attempted.
+- *(Carried, unchanged)*: thumbnail size gap; wider backtick-corruption data audit; GUI
+  target-profile picker; Migration Overview's full `rat.*`-comparison redesign; the 16 flagged
+  source records; `--mode dml_files` parser rewrite; `PicaLocoBackend`/`picaloco` rebrand (still
+  gated on stability); restore procedure not rehearsed.
+
+---
