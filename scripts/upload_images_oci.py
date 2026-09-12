@@ -45,6 +45,18 @@ Requires RAT_OCI_SERVICE_KEY (see scripts/env_secrets.py) -- the oci instance's
 service_role key, needed for Storage writes. Get it from whoever administers
 the oci Docker Compose stack; it is not derivable from anything already in
 this repo.
+
+REGISTRATION-KEY RELAY (2026-09-12, opt-in, default path UNCHANGED): pass
+--registration-key (or set RAT_AGENT_REGISTRATION_KEY) instead of a service
+key to route every Storage call through picaloco_web's server-side relay
+(api/agent-storage-upload.ts / agent-storage-list.ts) rather than talking to
+Storage directly. This exists for picaloco_agent -- an untrusted, remotely-
+distributed install -- which never holds a service_role key at all, only a
+revocable registration key. filemaker_sync's own trusted, admin-run use
+(disaster recovery, a full archive migration) has no reason to pay per-
+request relay overhead for something already running with legitimate direct
+access, so this stays opt-in; --init (bucket bootstrap) still requires a
+direct service key regardless, since the relay has no bucket-create endpoint.
 """
 from __future__ import annotations
 import argparse
@@ -112,6 +124,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LIST_PAGE_SIZE = 1500  # oci's Storage list endpoint's real per-request cap -- see
                        # migrate_storage_images_from_cloud.py's module docstring for how this
                        # was confirmed; using a higher value just gets silently clamped back down.
+AGENT_RELAY_BASE = "https://picaloco-web.vercel.app"  # see module docstring's REGISTRATION-KEY RELAY section
 
 _session = requests.Session()
 _retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
@@ -155,7 +168,23 @@ def _list_page_curl(base_url: str, bucket: str, prefix: str, headers: dict, offs
     return json.loads(result.stdout)
 
 
-def list_dest_objects(base_url: str, bucket: str, headers: dict, debug: bool = False) -> set[str]:
+def _list_page_relay(relay_base: str, registration_key: str, offset: int) -> list[dict]:
+    """One page of a Storage object/list call via picaloco_web's
+    /api/agent-storage-list relay, for a caller with a registration key but
+    no service_role key of its own (picaloco_agent). Mirrors
+    _list_page_curl()'s shape/behaviour, just over the relay instead of
+    Storage directly -- see api/agent-storage-list.ts's own docstring."""
+    r = _session.post(
+        f"{relay_base}/api/agent-storage-list",
+        json={"key": registration_key, "prefix": "images/", "limit": LIST_PAGE_SIZE, "offset": offset},
+        timeout=45,
+    )
+    r.raise_for_status()
+    return r.json()["items"]
+
+
+def list_dest_objects(base_url: str, bucket: str, headers: dict, debug: bool = False,
+                       registration_key: str | None = None, relay_base: str | None = None) -> set[str]:
     """Every object already on oci's bucket under images/, as bucket-relative
     paths -- diffed against the local file list up front instead of a
     HEAD-per-file existence check (which would itself be 141k+ requests).
@@ -165,7 +194,11 @@ def list_dest_objects(base_url: str, bucket: str, headers: dict, debug: bool = F
     hung for a while, but it flooded a captured/streamed log the same way
     export_images()'s tqdm bar did (see filemaker_extract.py), so it's now
     gated behind --debug too. A retry failure is a genuine anomaly, not
-    routine progress, so it always prints regardless."""
+    routine progress, so it always prints regardless.
+
+    registration_key (opt-in, default None): route each page through the
+    relay instead of Storage directly -- see module docstring's
+    REGISTRATION-KEY RELAY section."""
     names: list[str] = []
     offset = 0
     pages = 0
@@ -174,7 +207,10 @@ def list_dest_objects(base_url: str, bucket: str, headers: dict, debug: bool = F
         last_err = None
         for attempt in range(4):
             try:
-                page = _list_page_curl(base_url, bucket, "images/", headers, offset)
+                if registration_key:
+                    page = _list_page_relay(relay_base, registration_key, offset)
+                else:
+                    page = _list_page_curl(base_url, bucket, "images/", headers, offset)
                 break
             except Exception as e:
                 last_err = e
@@ -210,7 +246,8 @@ def _connect_target(cfg: dict, target_profile: str | None):
 
 
 def compute_missing_image_nos(base_url: str, bucket: str, headers: dict, cfg: dict,
-                               target_profile: str | None, debug: bool = False) -> list[str]:
+                               target_profile: str | None, debug: bool = False,
+                               registration_key: str | None = None, relay_base: str | None = None) -> list[str]:
     """Every image_no in rat.catalog that doesn't already have an object in
     oci's Storage -- the actual gap a caller needs to fill, computed WITHOUT
     touching FileMaker at all. On a healthy system this is just the
@@ -233,7 +270,8 @@ def compute_missing_image_nos(base_url: str, bucket: str, headers: dict, cfg: di
     if debug:
         print(f"  {len(catalog_image_nos)} image_no(s) in {schema}.catalog")
 
-    existing = list_dest_objects(base_url, bucket, headers, debug=debug)
+    existing = list_dest_objects(base_url, bucket, headers, debug=debug,
+                                  registration_key=registration_key, relay_base=relay_base)
     existing_stems = {e[len("images/"):-len(".webp")] for e in existing}
     return sorted(catalog_image_nos - existing_stems)
 
@@ -332,7 +370,34 @@ def write_invalid_key_report(invalid_key_names: list, cfg: dict, target_profile:
         return None
 
 
-def upload_one(base_url: str, bucket: str, image_no: str, local_path: Path, headers: dict) -> None:
+def _upload_one_relay(relay_base: str, registration_key: str, image_no: str, local_path: Path) -> None:
+    """Uploads via picaloco_web's /api/agent-storage-upload relay instead of
+    Storage directly -- see upload_one()'s registration_key branch and the
+    module docstring's REGISTRATION-KEY RELAY section. Base64-encodes the
+    whole file into the JSON body, fine at this scale (webp files are
+    single-digit KB, see module docstring's SCALE note)."""
+    import base64
+    with open(local_path, "rb") as f:
+        data = f.read()
+    r = _session.post(
+        f"{relay_base}/api/agent-storage-upload",
+        json={"key": registration_key, "image_no": image_no,
+              "data": base64.b64encode(data).decode("ascii")},
+        timeout=30,
+    )
+    r.raise_for_status()
+    body = r.json()
+    if body.get("storage_invalid_key"):
+        raise InvalidKeyError(image_no)
+    if not body.get("ok"):
+        raise RuntimeError(f"relay upload reported failure: {body}")
+
+
+def upload_one(base_url: str, bucket: str, image_no: str, local_path: Path, headers: dict,
+                registration_key: str | None = None, relay_base: str | None = None) -> None:
+    if registration_key:
+        _upload_one_relay(relay_base, registration_key, image_no, local_path)
+        return
     upload_headers = dict(headers)
     upload_headers["Content-Type"] = "image/webp"
     upload_headers["x-upsert"] = "true"
@@ -385,6 +450,12 @@ def main() -> int:
                      "(a Postgres query + a bucket listing, no local files or FileMaker involved) and "
                      "write that list to OUTFILE, one per line. Lets a caller extract+upload only the "
                      "actual gap instead of walking the whole archive every run.")
+    ap.add_argument("--registration-key", help="Exchange this key for Storage access via picaloco_web's "
+                     "server-side relay (api/agent-storage-*.ts) instead of holding/using a service_role "
+                     "key directly -- see module docstring's REGISTRATION-KEY RELAY section. When set, "
+                     "--service-key/RAT_OCI_SERVICE_KEY is not needed and --init is unavailable.")
+    ap.add_argument("--relay-url", default=AGENT_RELAY_BASE, help="Base URL for the --registration-key "
+                     "relay (default: %(default)s).")
     args = ap.parse_args()
 
     os.chdir(REPO_ROOT)
@@ -393,13 +464,27 @@ def main() -> int:
     base_url = storage["public_url"]
     bucket = storage["bucket"]
 
-    service_key = resolve_secret("RAT_OCI_SERVICE_KEY", cli_val=args.service_key)
-    if not service_key:
-        raise SystemExit(
-            "RAT_OCI_SERVICE_KEY not set (env/.env or --service-key). This is the oci "
-            "instance's service_role key -- get it from whoever administers the oci host."
-        )
-    headers = {"apikey": service_key, "Authorization": f"Bearer {service_key}"}
+    registration_key = resolve_secret("RAT_AGENT_REGISTRATION_KEY", cli_val=args.registration_key)
+    relay_base = args.relay_url
+
+    if registration_key:
+        if args.init:
+            raise SystemExit(
+                "--init needs direct service_role access (--service-key/RAT_OCI_SERVICE_KEY) -- it's a "
+                "one-time admin bootstrap step, not something a --registration-key caller ever needs; "
+                "the relay has no bucket-create endpoint."
+            )
+        headers = {}  # unused on the relay path
+    else:
+        service_key = resolve_secret("RAT_OCI_SERVICE_KEY", cli_val=args.service_key)
+        if not service_key:
+            raise SystemExit(
+                "RAT_OCI_SERVICE_KEY not set (env/.env or --service-key), and no --registration-key/"
+                "RAT_AGENT_REGISTRATION_KEY given either. The former is the oci instance's service_role "
+                "key (get it from whoever administers the oci host); the latter routes through "
+                "picaloco_web's relay instead -- see module docstring."
+            )
+        headers = {"apikey": service_key, "Authorization": f"Bearer {service_key}"}
 
     if args.init:
         ensure_bucket(base_url, bucket, headers, storage)
@@ -407,7 +492,8 @@ def main() -> int:
 
     if args.list_missing:
         missing = compute_missing_image_nos(base_url, bucket, headers, config,
-                                             args.target_profile, debug=args.debug)
+                                             args.target_profile, debug=args.debug,
+                                             registration_key=registration_key, relay_base=relay_base)
         Path(args.list_missing).write_text("\n".join(missing), encoding="utf-8")
         print(f"{len(missing)} image_no(s) missing from oci Storage -- written to {args.list_missing}")
         return 0
@@ -430,7 +516,8 @@ def main() -> int:
         print(f"--force: skipping destination listing, uploading all {len(to_upload)} selected file(s)")
     else:
         print("Listing destination (oci)...")
-        existing = list_dest_objects(base_url, bucket, headers, debug=args.debug)
+        existing = list_dest_objects(base_url, bucket, headers, debug=args.debug,
+                                      registration_key=registration_key, relay_base=relay_base)
         to_upload = [f for f in files if f"images/{f.stem}.webp" not in existing]
         skipped = len(files) - len(to_upload)
         print(f"{skipped} already on oci, {len(to_upload)} to upload")
@@ -451,7 +538,8 @@ def main() -> int:
 
     def _worker(f: Path) -> tuple[str, Exception | None]:
         try:
-            upload_one(base_url, bucket, f.stem, f, headers)
+            upload_one(base_url, bucket, f.stem, f, headers,
+                       registration_key=registration_key, relay_base=relay_base)
             return f.stem, None
         except Exception as e:
             return f.stem, e

@@ -16,6 +16,10 @@ Environment variables:
                           (image upload scripts only -- never used for the anon-scoped
                           read path; resolve via plain resolve_secret(), not
                           resolve_target_pwd(), since only one instance has Storage today)
+    RAT_AGENT_REGISTRATION_KEY  picaloco_agent's revocable registration key -- when set,
+                          upload_images_oci.py routes Storage calls through picaloco_web's
+                          server-side relay instead of using RAT_OCI_SERVICE_KEY directly
+                          (see that script's own REGISTRATION-KEY RELAY docstring section)
     RAT_OLD_CLOUD_ANON_KEY  anon key for the old Supabase.com cloud project being migrated
                           away from (migrate_storage_images_from_cloud.py's read side only
                           -- a one-off migration tool, not part of the ongoing pipeline)
