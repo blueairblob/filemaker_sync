@@ -224,6 +224,33 @@ Session 8 for full detail — both worth knowing about elsewhere in this codebas
 Cron/Task Scheduler wiring is deliberately out of scope — this makes the sync correct and runnable on
 demand, not automatic.
 
+**Sync is now target-aware, not just source-aware (Session 19).** Every Check Sync/Sync also checks
+(a) `repaired` — is anything the manifest believes is loaded actually missing from `rat.catalog` right
+now (target-side data loss, independent of whether FileMaker's `ROWMODID` moved) — and (b)
+`missing_images` — the same Postgres-vs-Storage gap check `upload_images_oci.py --list-missing` uses,
+run unconditionally so a record whose catalog row is stable but whose photo never uploaded doesn't
+silently stop being reported the moment it falls out of that week's delta. Both run every time, not
+gated on there being a source-side delta at all. See `devlog/worksheet.md` Session 19.
+
+**Two real, previously-unknown data-corruption bugs found and fixed (Session 19) — both "our own
+pipeline silently diverging from the source value," not bad source data:**
+1. `adjust_sql_syntax()` did a blind, whole-SQL-string backtick→doublequote replace meant to convert
+   MySQL-style column-identifier quoting, but `df_to_sql_bulk_insert()` already emits correct
+   Postgres identifiers by the time this ran — so it only ever found *data*, and silently mangled any
+   literal backtick in any text field of any table, for this pipeline's entire history. Removed from
+   both DML call sites (kept for DDL, where it may still be legitimate).
+2. `export_images()` stripped spaces from the local filename before writing it, so any
+   space-containing `image_no` (a real, common pattern — `"Class 1400 (11)"`, `"Porto Tram"`, etc.)
+   extracted its photo correctly every run but under a filename that could never match any
+   `--image-nos` list built from the real value — permanently invisible, no error anywhere. Fixed by
+   dropping just the space-strip (`\n`/`\r` kept). **Recovered ~130 previously-invisible real photos
+   in one re-run** once fixed.
+
+Both confirmed with direct byte-level (hex dump) or FileMaker-screenshot evidence before touching
+anything — see Session 19 for the full trace. Worth knowing if a "corrupted" or "missing" record ever
+turns up again: check whether it's genuinely bad source data, or this pipeline's own code silently
+changing a value in transit, before assuming either.
+
 ## Golden rules (invariants - do not violate without explicit sign-off)
 
 1. **Quarantine over silent coercion.** Bad/ambiguous rows go to a `.reject` file with a reason. Never
@@ -435,10 +462,27 @@ applied to `oci`) and the GUI has a Tools-menu link-out to `picaloco-web`'s (not
 page. Full agent/relay/websocket build not started — this is scoping/foot-in-the-door only. See
 `devlog/worksheet.md` Session 18 for the full discussion and open threads.
 
+**Update (Session 19): the biggest chunk of this session was live-testing `picaloco_agent` for the
+first time and finding two real, previously-unknown data-corruption bugs in code that's been running
+since this pipeline's earliest days** (backtick→doublequote mangling in DML text; space-stripped
+local image filenames silently orphaning ~130 real photos) — both now fixed, see "Loader status"
+above and `devlog/worksheet.md` Session 19 for the full trace. Sync itself also became target-aware,
+not just source-aware (the `repaired`/`missing_images` checks, also in "Loader status" above) — a
+real gap this session's testing exposed: a record whose target row/photo silently went missing could
+previously go unreported forever. Separately, `picaloco_agent`'s activation-gate work (floated in
+Session 18) was built for the DB-password half: a revocable **registration key**, checked against a
+new Vercel serverless function in `picaloco_web` (`api/agent-auth.ts` + `rat.agent_licenses`), means
+the agent no longer needs a baked-in DB password at all — full design/build/debugging detail in
+`devlog/worksheet.md` Session 19 and `picaloco_web/DEVOPS.md` §11. The Storage `service_role` key
+side of that same idea is **not yet built** — still the old baked-secret mechanism, bigger risk, real
+separate work.
+
 Smaller open threads: no GUI target-profile picker; Migration Overview's full `rat.*`-comparison redesign
 (parked, no clean table mapping); `picture_metadata` untested against real images (no local files); the 16
 flagged source records (FileMaker-side); `--mode dml_files` parser rewrite (low priority,
 `migration_schema` mode works); `requirements.txt`'s `pandas==2.1.4` pin (no Python 3.13 wheel);
 `PicaLocoBackend`/`picaloco` rebrand (explicitly gated until stable — arguably close now, still not done);
-`supabase-edge-functions` crash-loop fix handed to user, not yet confirmed run.
+`supabase-edge-functions` crash-loop fix handed to user, not yet confirmed run; whether other
+already-migrated fields (not just `image_no`) have latent corruption from the backtick bug's entire
+prior history (a wider data audit, not yet done); `picaloco_agent` not yet repackaged/distributed.
 Full detail in `devlog/worksheet.md`.

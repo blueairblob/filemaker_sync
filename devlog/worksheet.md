@@ -2116,3 +2116,242 @@ Tkinter window (everything so far called the underlying modules directly), a gen
 real delta (needs an actual FileMaker edit — nothing to fabricate here), packaging, and committing.
 
 ---
+
+## Session 19 — 2026-09-09 to 2026-09-12 — Two real data-corruption bugs found via live `picaloco_agent`
+## testing; sync becomes target-aware; `picaloco_agent`'s activation gate built end-to-end
+
+**Focus:** started as routine live click-through testing of `picaloco_agent` (the first real session
+of it, following Session 18's module-level-only verification). Testing immediately surfaced real
+gaps — noisy logs, a full-catalog image scan, images silently never uploading for no visible reason
+— and pulling on those threads led to two genuine, previously-unknown data-corruption bugs in code
+that's been running since this pipeline's earliest days, plus a complete second-order design (Sync
+now checks *target* completeness, not just source freshness). Also built, from scratch, the first
+piece of `picaloco_agent`'s activation-gate work floated in Session 18: a revocable registration-key
+system so the installer no longer needs a baked-in DB password at all.
+**Status:** `picaloco_agent` image-sync UX — `done, live-tested`. The two corruption bugs — `found,
+fixed, vendored, confirmed live`. Target-completeness self-heal — `done, live-tested`. Activation gate
+(DB password only, not yet Storage) — `done, live end-to-end, including a real debugging saga`.
+`picaloco_web` search — one real bug found and fixed along the way.
+
+---
+
+### Outcome — `picaloco_agent` image-sync UX (early in the session)
+
+Live-tested `picaloco_agent`'s Upload Images/Sync image handling for the first time and found it
+noisy and needlessly expensive:
+
+- Per-record image sync folded directly into `Sync` itself (`run_incremental_sync.py` now
+  extracts+uploads images for its own verified delta as a last step) — a routine sync no longer
+  needs a separate Upload Images click for new/changed records.
+- `Upload Images` itself changed from a full 141k-row catalog walk to gap-scoped
+  (`upload_images_oci.py --list-missing`: a Postgres-vs-Storage diff, no FileMaker touched at all,
+  then extract+upload only the real gap).
+- `filemaker_extract.py`'s per-image `tqdm` progress bar and `upload_images_oci.py`'s per-page
+  Storage-listing progress were flooding the log by default — both now suppressed unless a new
+  **Debug** checkbox is on.
+- `InvalidKeyError` classification added to `upload_images_oci.py`: Supabase Storage rejects certain
+  characters in an object key (see Session 16's original finding) — these are now reported as
+  `known_invalid_key`, separate from `failed`, so a permanently-unfixable-here rejection doesn't read
+  as "something's wrong" every single run.
+- A browsable `.xlsx` "rejects" report added (first as two differently-shaped reports for the two
+  failure paths, later unified into one `rejects_<timestamp>.xlsx` shape: `image_no`/`id`/`reason`
+  lead-in columns, `id` meaning FileMaker's `ROWID` or `rat.catalog`'s UUID depending on which stage
+  caught the problem) — gives whoever has FileMaker access something to actually act on instead of a
+  bare name in a log.
+- Dropped the unused local `.jpg` image export (nothing downstream ever read it) and added a "Clear
+  Local Image Cache" Tools-menu action, since the local export folder is a permanent cache, not
+  temporary staging, and was never cleaned up on its own.
+
+---
+
+### Outcome — two real data-corruption bugs, found live, not assumed
+
+**#1: `adjust_sql_syntax()` was corrupting any literal backtick in extracted data, silently, for the
+pipeline's entire history.** Surfaced by deliberately deleting a `rat.catalog` row (`arc00001`) to
+test the new target-completeness check below, which worked — but then testing the *known* 45
+"backtick" `InvalidKey` records (Session 16) turned up something new: a byte-level hex dump of what
+actually landed in `rat_migration.ratcatalogue` showed a **double quote** (`0x22`), not a backtick
+(`0x60`) — and the user then produced a real FileMaker screenshot proving the source genuinely has a
+backtick (`mssacpe3057\``). Root cause: `adjust_sql_syntax()` did a blind, whole-SQL-string
+`sql.replace('`', '"')`, meant to convert MySQL-style backtick-quoted column identifiers to
+Postgres-style double-quoted ones — but `df_to_sql_bulk_insert()` already emits correctly-quoted
+Postgres identifiers whenever the target isn't MySQL, so by the time this ran on DML/INSERT text
+there was no legitimate identifier-quoting left to "fix," only real data, and any literal backtick in
+*any* text field of *any* table got silently mangled into a double quote on the way into Postgres.
+Fixed by removing the call from both DML call sites in `export_data()` (left in place for DDL, where
+FileMaker's own schema description may genuinely use backtick-quoted identifiers). Confirmed live: a
+real Sync of the affected 45 rows after the fix landed `verified: 45, rejected: 0` (previously
+`rejected: 45` every time) — all 45 now hold their real, backtick-containing `image_no`.
+
+Cleanup needed after the fix: the 45 rows had *also* already landed in `rat.catalog` under their old,
+corrupted (double-quote) key during earlier testing, before the fix existed — the corrected re-insert
+created a genuine duplicate (same photo, two rows, two different `image_no` spellings) rather than
+replacing the old one, since Postgres treats `"..."` and `` `...` `` as different unique keys. Cleaned
+up live: `DELETE FROM rat.catalog WHERE image_no LIKE '%"%'` (plus cascading
+`catalog_metadata`/`catalog_builder`/`usage`/`picture_metadata` deletes first, FK order) — confirmed
+via `picaloco_web` search afterward showing exactly one, correct result.
+
+**#2: `export_images()` was stripping spaces from the local filename, silently orphaning every
+space-containing `image_no`'s photo.** Found chasing why a Storage-gap check reported ~178 missing
+images when only 45 were the known `InvalidKey` group — extraction logs showed rows being
+"processed" but far fewer local files actually landing on disk. The user found the smoking gun
+directly in FileMaker: `"Class 1400 (11)"` genuinely has a photo attached. Root cause:
+`image_name.replace(' ', '')` before building the local `.webp` path — the photo extracted correctly
+every run, just under a filename (`Class1400(11).webp`) that could never match any `--image-nos`
+filter built from the real, space-containing `image_no`, so nothing ever selected it for upload. No
+error anywhere — permanent invisibility. Fixed by dropping just the space-strip (`\n`/`\r` stripping
+kept, since those genuinely can't be part of a filename). Also added explicit percent-encoding
+(`urllib.parse.quote`) to `upload_images_oci.py`'s Storage upload URL, since a space-containing
+`image_no` had never actually reached that code path before (previously always stripped first) and
+its correctness there hadn't been exercised. **Confirmed live: a full re-run uploaded 130 previously
+invisible real photos in one go** — the vast majority of what had looked like a 178-record gap turned
+out to be this bug, not "no photo attached" as first suspected (that category turned out to be just 1
+record, once a new debug log — `export_images()` was totally silent about this specific skip
+before — confirmed the real number instead of leaving it inferred).
+
+Both bugs share a shape worth remembering: **this pipeline's own code silently diverging from the
+source value**, not source data corruption — in both cases the "corrupted" record was traced back to
+provably-correct source data and a specific line of *our* code mangling it in transit, confirmed with
+direct byte-level/screenshot evidence before touching anything, never assumed.
+
+---
+
+### Outcome — Sync becomes target-aware, not just source-aware
+
+Two related, permanent additions to `run_incremental_sync.py`, both running on *every* Check
+Sync/Sync, not gated on there being a source-side delta:
+
+1. **`repaired`** — `fetch_catalog_image_nos()` diffs the manifest's "loaded" set against what's
+   actually in `rat.catalog` right now; anything the manifest believes is loaded but that's actually
+   missing (confirmed live by deliberately deleting `arc00001`) gets re-synced, bypassing the
+   `ROWMODID` check entirely, since direct proof of absence is stronger evidence than "hasn't changed
+   since last load." Without this, a manifest that already believes a row is loaded never re-checks
+   `rat.catalog` itself, so target-side data loss (an accidental delete, or the corruption-bug cleanup
+   above) would otherwise go unnoticed and unrepaired forever.
+2. **`missing_images`** — the same gap-scoped Postgres-vs-Storage check `upload_images_oci.py
+   --list-missing` already does, now run unconditionally by `run_incremental_sync.py` itself and
+   folded into the same image-sync step. Without this, a record whose catalog row is stable (not
+   new/changed/repaired) but whose photo has never successfully uploaded — exactly the 45 known
+   `InvalidKey` rows — silently stopped being reported anywhere the moment it fell out of that
+   week's delta; Check Sync/Sync just said "Nothing to do" forever despite a real, permanent gap.
+   Filtered against a **live FileMaker skinny scan** (`db_sync_manifest.py`'s new
+   `--list-image-nos` mode) before being reported/acted on — confirmed live that the raw
+   Postgres-vs-Storage diff alone included stale `rat.catalog` rows with no matching FileMaker record
+   at all (garbage-looking values like `"Class 1400 (102)"`, `"Porto Tram"` — turned out to mostly be
+   *real*, space-containing `image_no`s per bug #2 above, but the filter is correct and necessary
+   regardless: nothing this pipeline can fix for a row that's gone from the source).
+
+---
+
+### Outcome — `picaloco_web`: one real search bug found and fixed
+
+Confirmed live: searching `"Class 1400 (11)"` in `picaloco_web` (to verify bug #2's fix end-to-end)
+returned zero results despite the record genuinely existing (confirmed via direct SQL). Root cause:
+`catalogService.ts`'s free-text search built a raw PostgREST `or=(...)` filter string by
+concatenating the user's query directly into five `ilike` conditions — PostgREST treats `,` and `()`
+as filter-syntax (condition separators/grouping), so a literal `(`/`)` in the search term corrupted
+the filter expression before it ever reached a real comparison; not a loud error, just silently zero
+rows. Fixed by quoting the value per PostgREST's own escaping syntax (`column.ilike."value"`, with
+`"`/`\` inside it escaped) instead of stripping characters out of the query — keeps the actual search
+text and matching exactly what the user typed. Verified the escaping function directly (embedded
+quote/backslash/parens all round-trip correctly) and confirmed `tsc`/`oxlint`/`vite build` all pass.
+
+---
+
+### Outcome — `picaloco_agent`'s activation gate, built and proven live end-to-end
+
+Session 18 floated an activation-key pattern (like MakeMKV's beta keys) for letting the installer be
+distributed via a plain weblink instead of a gated download, given it bakes in a real Supabase
+`service_role` key. Picked up and built for real this session, for the DB-password half only (Storage
+`service_role` relay explicitly deferred — see Open Threads).
+
+**Design, decided after weighing options:** not a literal MakeMKV-style shared/rotating key (doesn't
+map onto Supabase, which has one project-wide `service_role` secret, not individually-revocable
+copies of it) and not a Supabase Edge Function (`oci`'s `supabase-edge-functions` container has never
+had a function deployed to it — confirmed crash-looping since Session 18, and a prior session already
+recommended just stopping it; reviving it means live SSH work on `oci` this session can't do). Instead:
+a small Vercel serverless function in `picaloco_web` (`api/agent-auth.ts`), since that repo already
+has a proven Vercel deploy path. The agent ships with **no** DB password baked in at all, prompts for
+a **registration key**, and exchanges it for the real password via this function — revoking a key
+(one `UPDATE`) cuts off an install immediately, no new agent release needed.
+
+**Built:**
+- `rat.agent_licenses` (`id`/`key`/`label`/`revoked`/`created_at`/`last_used_at`, no `anon` grant at
+  all) — see the live-debugging saga below for why it ended up in `rat`, not the conceptually-tidier
+  `rat_migration`.
+- `api/agent-auth.ts` — POST `{key}`, checks it via a `service_role` client, returns the real
+  `picaloco_agent` DB password if valid and not revoked.
+- `picaloco_agent`: `local_config.py` gained a `registration_key` field (own save function, so it
+  can't clobber the FileMaker fields or vice versa); `target_config.py`'s `TARGET['pwd']` is no longer
+  resolved at import time — `ensure_password()` does it now, POSTing the key and caching the result
+  in memory for the run, falling back to the old baked-`_secret.py`/env mechanism ONLY when no key is
+  configured at all (kept for local dev convenience — a real distributed `.exe` won't have
+  `_secret.py`, so that path is naturally inert there); a configured-but-rejected key is a hard
+  failure, never a silent fallback.
+- GUI: a **Help → Registration...** dialog (moved out of the Config tab after user feedback that an
+  always-visible Activation section was too dominant for a one-time value) with live "Checking key...
+  / accepted / rejected" feedback; `Sync`/`Upload Images` disabled with an explanatory tooltip when
+  unregistered (`Check Sync` stays clickable — read-only, fails informatively instead). Found and
+  fixed a real bug in the process: `_set_busy(False)` unconditionally re-enabled every action button,
+  which would have silently undone this gate the moment any operation finished.
+- The connection-details popup gained a **Copy to Clipboard** button — found needed mid-debugging,
+  when relaying a raw `psycopg2` error by hand was the only option `messagebox.showinfo`'s
+  non-selectable text allowed.
+
+**The live-debugging saga** (each step confirmed with a direct `curl` against the deployed endpoint,
+not assumed):
+1. First real key tried: rejected exactly like a bogus one. Root cause: the table was created in
+   `rat_migration`, but this `oci` instance's PostgREST only exposes schemas explicitly configured for
+   the REST API — `rat` is the only one that's ever needed that (`mobile_catalog_view`);
+   `rat_migration` has only ever been reached via *direct* Postgres connections elsewhere in this
+   project, never through `supabase-js`/PostgREST. A real, valid key failed identically to a wrong
+   one, with no error distinguishing them. Fixed by moving the table to `rat` (table grants are
+   per-table, not schema-wide, so this doesn't expose it to `anon` — it has no grant either way).
+2. Still failed after the move, now with a genuinely different (and, thanks to a temporarily
+   surfaced error detail, visible) error: Postgres `42501 permission denied for schema rat`.
+   `service_role` had never actually been granted `USAGE` on `rat` / `SELECT, UPDATE` on this table —
+   its usual broad access is Supabase's own bootstrap default for schemas *it* creates
+   (`public`/`auth`/`storage`), not automatic for a project's own custom schema; this was the first
+   table this project has ever queried as `service_role` rather than `anon`. Fixed with two explicit
+   `GRANT`s; temporary error-detail exposure reverted immediately after.
+3. Endpoint now returned `200` — but with the literal placeholder `CHANGE_ME_BEFORE_RUNNING`, since
+   the real `picaloco_agent` role password had never actually been loaded into `AGENT_DB_PASSWORD`.
+   Rotated; two more empty-commit redeploys needed before Vercel actually picked up the new value
+   (env var changes only apply to deployments created after they're set, not retroactively).
+4. GUI then showed a real `Test Supabase Connection` failure: `password authentication failed for
+   user "picaloco_agent"`. The rotated value had been updated in Vercel/`_secret.py` but never
+   actually applied to the live Postgres role itself — two further rounds of `ALTER ROLE ... WITH
+   PASSWORD` (the first attempt used a different literal than what Vercel actually returned, confirmed
+   by curling the live endpoint directly rather than assuming) got both sides in sync.
+5. One last transient failure: Supavisor's own `ECIRCUITBREAKER` protection, temporarily blocking new
+   connections after the repeated auth failures above — resolved itself after a short wait, unrelated
+   to whether the credentials were now correct.
+
+**Confirmed working end-to-end**, live: a real registration key issued via `INSERT INTO
+rat.agent_licenses`, accepted in the actual GUI (not just module-level testing), `Sync`/`Upload
+Images` correctly going from disabled to enabled, and `Test Supabase Connection` going green.
+
+---
+
+### Open Threads
+
+- **Storage `service_role` relay not built** — the agent still resolves the Storage key the old,
+  baked-secret way; the bigger risk than the DB password, and the reason this whole activation-gate
+  idea started. A second server-side function (agent sends its registration key + image bytes,
+  the function does the actual Storage upload, `service_role` never reaches the client at all) is
+  real, separate, not-yet-started work.
+- `picaloco_agent` not yet repackaged since any of this session's changes (GUI redesign, activation
+  gate, image-sync UX) — `dist/PicalocoAgent/` reflects an old version; no Inno Setup `.iss` written
+  yet.
+- `picaloco_agent` download distribution (the original prompt for this whole activation-gate thread)
+  — deliberately parked in favour of a plain weblink once built/packaged; not yet actually linked from
+  `picaloco_web` anywhere.
+- Whether other already-migrated fields (not just `image_no`) have latent backtick→doublequote
+  corruption from bug #1's entire prior history — a wider data audit, not chased this session.
+- Thumbnail size gap (new image uploads are full-size `webp`, not the historical thumbnail `webp
+  _mobile`) — unchanged, still open from earlier sessions.
+- *(Carried, unchanged)*: GUI target-profile picker; Migration Overview's full `rat.*`-comparison
+  redesign; the 16 flagged source records; `--mode dml_files` parser rewrite;
+  `PicaLocoBackend`/`picaloco` rebrand (still gated on stability); restore procedure not rehearsed.
+
+---
