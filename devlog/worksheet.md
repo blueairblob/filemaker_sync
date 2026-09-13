@@ -2744,3 +2744,60 @@ volunteer. Revisit when actual distribution (not just dev-machine testing) is im
   gated on stability); restore procedure not rehearsed.
 
 ---
+
+## Session 23 — 2026-09-13 — GUI target-profile picker
+
+**Focus:** Picked "GUI target-profile picker" off Session 22's carried open-threads list — a
+documented known limitation (`CLAUDE.md`'s "Known, accepted limitations") since every GUI
+operation always ran against `config.toml`'s `active_profile`, with no way to pick `supabase`
+over `oci` (or vice versa) without editing the file.
+**Status:** `completed`, live-tested
+
+**What changed:** `gui/filemaker_gui.py` gained a header combobox
+(`_discover_target_profiles()`/`_resolve_default_profile()`) built dynamically from whatever
+`[database.target.<profile>]` sub-tables exist in `config.toml` (not a hardcoded
+`supabase`/`oci` list — an added or renamed profile just works), defaulting to the file's own
+`active_profile` (or legacy `db` key) so nothing changes on first launch unless a user explicitly
+picks something else. `gui/gui_operations.py`'s `OperationManager` gained a `target_profile`
+attribute; `run_python_command()` — the single choke point every subprocess call already funnels
+through (connection tests, status refreshes, and every real operation alike) — now appends
+`--target-profile <profile>` there, so wiring this up needed exactly one change, not one per call
+site. Session-only: doesn't write back to `config.toml`, so a restart still defaults to whatever
+the file says, same as any CLI invocation without `--target-profile`.
+
+**A small, related staleness fixed in passing:** the "Supabase Target" connection-status card
+label was hardcoded regardless of the actual active profile — stale since Session 13 silently
+switched the default to `oci`, meaning the card had been mislabeled for many sessions without
+anyone noticing (the label is decorative; connectivity itself was never affected). Now reflects
+whichever profile is selected, via a new `StatusCard.set_title()`.
+
+**Live-tested, not just code-reviewed:** launched the real GUI (`python.exe gui/filemaker_gui.py`
+from WSL, interop confirmed working per the fix earlier this session) and let its own
+startup auto-connection-test run. The log output showed `Args: --info-only --json
+--target-profile oci` reaching the real subprocess call, which then genuinely connected to both
+FileMaker (102 base table fields found) and `oci` (PostgreSQL 17.6, live version string) — proof
+the picker's default-profile resolution, the `OperationManager` wiring, and the actual downstream
+script all agree, not just that the code imports cleanly. **Not confirmed:** how the combobox
+actually looks/behaves on screen — this session has no way to see the Windows desktop, so the
+widget's rendering, dropdown behavior, and the connection-status card's label swap on selection
+are unverified beyond "the code that builds them ran without raising."
+
+**Noticed but out of scope, not touched:** `filemaker_extract_refactored.py`'s own `--json`
+diagnostic output labels the target as `"Self-hosted Supabase (OCI/Tailscale) (supabase)"` —
+a literal `"(supabase)"` suffix hardcoded regardless of which profile is actually active. Pre-existing,
+unrelated to this session's change (that script is the legacy diagnostic layer, already flagged
+elsewhere as its own thing) — a candidate follow-up if it's ever actively worked on again, not a
+side effect of the picker.
+
+### Open Threads
+
+- **Next: someone needs to actually open the GUI on the Windows box and visually confirm the
+  picker** — combobox renders/populates correctly, switching profiles updates both status card
+  labels, and connections re-test against the newly selected target.
+- *(Carried, unchanged)*: thumbnail size gap; wider backtick-corruption data audit; Migration
+  Overview's full `rat.*`-comparison redesign; the 16 flagged source records; `--mode dml_files`
+  parser rewrite; `PicaLocoBackend`/`picaloco` rebrand (still gated on stability); restore
+  procedure not rehearsed; `picaloco_agent` distribution blocked on the deferred AV/code-signing
+  decision (Session 22).
+
+---

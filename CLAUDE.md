@@ -130,9 +130,19 @@ in `devlog/worksheet.md` Sessions 9–13; this is the current-state summary.
   `LiveStatusPanel` gained a level filter (`All`/`Info+`/`Warning+`/`Errors only`, default `Info+`) that
   filters the *view* only, `LogManager`'s own history is untouched.
 
+**GUI target-profile picker added (Session 23)** — a header combobox (`FileMakerSyncGUI`'s
+`_discover_target_profiles()`/`_resolve_default_profile()`) now lets the GUI pick any
+`[database.target.<profile>]` from `config.toml` (`supabase`/`oci`) instead of always running
+against the file's `active_profile`. Session-only, doesn't write back to `config.toml` — a restart
+still defaults to whatever the file says, same as any CLI run without `--target-profile`.
+`OperationManager.target_profile` is the single hook: `run_python_command()` appends
+`--target-profile <profile>` to every subprocess call from there, so connection tests, status
+refreshes, and every real operation all picked it up without touching each call site. Live-tested:
+launched the real GUI and confirmed the startup connection-test's own log line showed
+`--target-profile oci` reaching the real subprocess and connecting for real — widget rendering
+itself not visually confirmed (no way to see the Windows desktop from that session).
+
 **Known, accepted limitations** (deliberate choices, not bugs):
-- No GUI target-profile picker — every operation runs against `config.toml`'s `active_profile` (now `oci`,
-  see below); no way to pick `supabase` from the GUI without editing the file.
 - Stop Action only cancels Full/Incremental/Delta Sync, Load to Target, and Export operations — Test
   Connections/Update Dashboard use a separate code path it doesn't touch.
 - Migration Overview's numbers reflect `rat_migration` staging, not the final `rat.*` schema — no clean
@@ -511,13 +521,16 @@ against two genuine backtick image_nos (not a synthetic call) and landed correct
 `rat_migration.reject_log` with the right `catalog_id`/`run_id`/reason; `log_crash()` was also
 confirmed against a real exception. See `devlog/worksheet.md` Session 20 for the full trace.
 
-Smaller open threads: no GUI target-profile picker; Migration Overview's full `rat.*`-comparison redesign
+Smaller open threads: Migration Overview's full `rat.*`-comparison redesign
 (parked, no clean table mapping); `picture_metadata` untested against real images (no local files); the 16
 flagged source records (FileMaker-side); `--mode dml_files` parser rewrite (low priority,
 `migration_schema` mode works); `requirements.txt`'s `pandas==2.1.4` pin (no Python 3.13 wheel);
 `PicaLocoBackend`/`picaloco` rebrand (explicitly gated until stable — arguably close now, still not done);
 `supabase-edge-functions` crash-loop fix handed to user, not yet confirmed run; whether other
 already-migrated fields (not just `image_no`) have latent corruption from the backtick bug's entire
-prior history (a wider data audit, not yet done); `picaloco_agent` not yet repackaged/distributed;
-`rat_migration.reject_log`'s `--init` not yet run against live `oci` (see Session 20 update above).
+prior history (a wider data audit, not yet done); `picaloco_agent` builds, installs, and runs
+(Session 22) but real distribution to a RAT volunteer is blocked on an unsigned-exe AV
+false-positive (Norton quarantines every build regardless of `--onefile`/`--onedir`) — code signing
+is the only mitigation that would actually generalize, deliberately deferred as a cost decision
+while `picaloco_agent` is still pre-distribution dev work, not a live blocker.
 Full detail in `devlog/worksheet.md`.
