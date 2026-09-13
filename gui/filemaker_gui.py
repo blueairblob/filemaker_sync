@@ -20,7 +20,7 @@ import webbrowser
 # Import our modules
 from gui_logging import LogManager, LogLevel, PerformanceLogger
 from gui_widgets import StatusCard, MigrationOverview, QuickActions, StatusBar, LiveStatusPanel
-from gui_operations import OperationManager, ConnectionTester, StatusManager
+from gui_operations import OperationManager, ConnectionTester, StatusManager, REPO_ROOT
 from gui_logviewer import LogViewerWindow, LogStatsWindow
 
 class FileMakerSyncGUI:
@@ -981,6 +981,17 @@ Enhanced with comprehensive thread safety and user controls.
 
 def main():
     """Main entry point"""
+    # Chdir to the repo root before anything else runs -- confirmed live that
+    # launching this from gui/ (`cd gui && python.exe filemaker_gui.py`)
+    # instead of the repo root made every operation fail with an opaque
+    # connection error (run_python_command() couldn't find scripts/) and
+    # would have silently misplaced LogManager's own './logs' too (gui/logs/
+    # existing alongside the real logs/ is a leftover from exactly this).
+    # One chdir here covers every relative-path reader in this GUI and its
+    # subprocesses, present and future, instead of chasing each one
+    # individually -- see gui_operations.py's REPO_ROOT for the fuller story.
+    os.chdir(REPO_ROOT)
+
     # Create root window
     root = tk.Tk()
     

@@ -17,6 +17,17 @@ import logging
 
 from gui_logging import LogManager, LogLevel, PerformanceLogger
 
+# The repo root, resolved from this file's own location -- NOT Path.cwd().
+# Every pipeline script this module shells out to expects to run with the
+# repo root as its cwd (reads config.toml/.env from there -- see CLAUDE.md's
+# "How to run"), so launching filemaker_gui.py from any other working
+# directory (e.g. `cd gui && python.exe filemaker_gui.py`) used to make
+# every subprocess call fail outright: Path.cwd() / 'scripts' / script
+# wouldn't exist, so run_python_command() returned "not found in scripts/"
+# before ever launching anything -- confirmed live, surfaced as a plain
+# "connection error" with no indication the actual cause was cwd.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
 class OperationState(Enum):
     IDLE = "idle"
     RUNNING = "running"
@@ -135,9 +146,13 @@ class OperationManager:
                 return {'success': False, 'error': 'Shutdown requested'}
             
             # Check if script exists. All pipeline scripts live under scripts/,
-            # not the repo root -- resolve there explicitly rather than as a
-            # bare filename relative to whatever the GUI's cwd happens to be.
-            script_path = Path.cwd() / 'scripts' / script
+            # not the repo root -- resolve there explicitly via REPO_ROOT
+            # (this file's own location), not Path.cwd(), which depended on
+            # launching filemaker_gui.py from the repo root specifically --
+            # confirmed live to silently fail with "not found in scripts/"
+            # (surfacing to the user as an opaque connection error) when
+            # launched from gui/ or anywhere else instead.
+            script_path = REPO_ROOT / 'scripts' / script
             if not script_path.exists():
                 error_msg = f'{script} not found in scripts/'
                 self.log_manager.log(LogLevel.ERROR, "Command", error_msg)
@@ -197,7 +212,7 @@ class OperationManager:
         """
         process = subprocess.Popen(
             full_command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1, cwd=Path.cwd(),
+            text=True, bufsize=1, cwd=REPO_ROOT,
         )
         assert process.stdout is not None  # guaranteed by stdout=PIPE above
         self._current_process = process
