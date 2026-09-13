@@ -56,6 +56,14 @@ class OperationManager:
         # itself -- it just makes launches wait their turn.
         self._subprocess_lock = threading.Lock()
         
+        # Which [database.target.<profile>] every subprocess this manager
+        # launches should hit -- set by FileMakerSyncGUI from its target-profile
+        # picker (defaults to config.toml's own active_profile at startup).
+        # None means "don't pass --target-profile at all", letting each script
+        # fall back to its own config/env resolution, same as every CLI
+        # invocation that omits the flag.
+        self.target_profile: Optional[str] = None
+
         # Result queue for communication
         self._result_queue = queue.Queue(maxsize=10)
         
@@ -110,7 +118,14 @@ class OperationManager:
         """
         if timeout is None:
             timeout = self.connection_timeout if 'info-only' in cmd_args else self.command_timeout
-        
+
+        # Route at the currently-selected target profile (see self.target_profile's
+        # docstring) -- every pipeline script this manager can launch accepts
+        # --target-profile, so this one hook covers connection tests, status
+        # refreshes, and every real operation without touching each call site.
+        if self.target_profile and '--target-profile' not in cmd_args:
+            cmd_args = [*cmd_args, '--target-profile', self.target_profile]
+
         self.log_manager.log(LogLevel.INFO, "Command", f"Starting: {description} (timeout: {timeout}s)")
         self.log_manager.log(LogLevel.DEBUG, "Command", f"Args: {' '.join(cmd_args)}")
         

@@ -21,6 +21,12 @@ class StatusCard(ttk.Frame):
         self.title = title
         self.full_message = "Not tested"  # Store full message for details
         self.create_widgets()
+
+    def set_title(self, title: str):
+        """Update the title shown in the Details dialog -- lets a caller rename
+        this card (e.g. FileMakerSyncGUI's target-profile picker changing which
+        DB the "target" card refers to) without recreating the widget."""
+        self.title = title
     
     def create_widgets(self):
         # Header frame

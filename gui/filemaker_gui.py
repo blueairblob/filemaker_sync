@@ -45,6 +45,16 @@ class FileMakerSyncGUI:
         self.operation_manager = OperationManager(self.log_manager)
         self.connection_tester = ConnectionTester(self.operation_manager)
         self.status_manager = StatusManager(self.operation_manager)
+
+        # Which [database.target.<profile>] every operation runs against.
+        # Previously there was no GUI way to pick 'supabase' over config.toml's
+        # active_profile without editing the file (a documented known
+        # limitation) -- this is a session-only choice, not persisted back to
+        # config.toml: a restart still defaults to the file's own
+        # active_profile, same as any CLI invocation without --target-profile.
+        self._target_profiles = self._discover_target_profiles()
+        self._active_profile_key = self._resolve_default_profile()
+        self.operation_manager.target_profile = self._active_profile_key
         
         # Child window management
         self._child_windows_lock = threading.Lock()
@@ -110,7 +120,33 @@ class FileMakerSyncGUI:
         except Exception as e:
             print(f"Error loading config: {e}, using defaults")
             return default_config
-    
+
+    def _discover_target_profiles(self) -> dict:
+        """{profile_key: display_name} for every [database.target.<profile>]
+        sub-table in config.toml -- identified by having its own 'host' key,
+        same shape config_manager.py's _parse_config() already relies on.
+        Built dynamically (not a hardcoded 'supabase'/'oci' list) so an added
+        or renamed profile in the file just works here too."""
+        target_cfg = self.config.get('database', {}).get('target', {})
+        profiles = {}
+        for key, value in target_cfg.items():
+            if isinstance(value, dict) and 'host' in value:
+                name = value.get('name')
+                display = name[1] if isinstance(name, list) and len(name) > 1 else key
+                profiles[key] = display
+        return profiles or {'supabase': 'supabase'}
+
+    def _resolve_default_profile(self) -> str:
+        """Startup default: config.toml's own active_profile (or legacy 'db'
+        key), same precedence config_manager.py's resolve_active_profile()
+        uses minus the CLI/env override layers -- this is what every script
+        already falls back to when the GUI doesn't pass --target-profile, so
+        matching it here means picking a profile is a strict opt-in change,
+        never a surprise on first launch."""
+        target_cfg = self.config.get('database', {}).get('target', {})
+        default = target_cfg.get('active_profile') or target_cfg.get('db') or 'supabase'
+        return default if default in self._target_profiles else next(iter(self._target_profiles))
+
     def start_gui_update_processor(self):
         """Start the GUI update processor"""
         def process_gui_updates():
@@ -191,8 +227,24 @@ class FileMakerSyncGUI:
         
         subtitle_label = ttk.Label(header_frame, text=subtitle_text, font=('Arial', 9))
         subtitle_label.pack(side='left', padx=(20, 0))
-        
+
         # REMOVED: Activity log button - user can access via Quick Actions "View Logs"
+
+        # Target profile picker -- which [database.target.<profile>] every
+        # operation/test runs against (see _discover_target_profiles()/
+        # _resolve_default_profile() and OperationManager.target_profile).
+        # Session-only: doesn't edit config.toml, so this never silently
+        # changes what a plain CLI run of these scripts would do.
+        profile_frame = ttk.Frame(header_frame)
+        profile_frame.pack(side='right')
+        ttk.Label(profile_frame, text="Target:", font=('Arial', 9, 'bold')).pack(side='left', padx=(0, 5))
+        self.target_profile_var = tk.StringVar(value=self._target_profiles[self._active_profile_key])
+        self.target_profile_combo = ttk.Combobox(
+            profile_frame, textvariable=self.target_profile_var,
+            values=list(self._target_profiles.values()), state='readonly', width=28,
+        )
+        self.target_profile_combo.pack(side='left')
+        self.target_profile_combo.bind('<<ComboboxSelected>>', self.on_target_profile_changed)
     
     def create_connection_status(self, parent):
         """Create connection status section"""
@@ -211,14 +263,42 @@ class FileMakerSyncGUI:
         self.fm_status_card = StatusCard(fm_card_frame, "FileMaker Pro")
         self.fm_status_card.pack(fill='x')
         
-        # Target status card
-        target_card_frame = ttk.LabelFrame(conn_frame, text="Supabase Target", 
+        # Target status card -- label reflects whichever profile is currently
+        # selected (see the header's target-profile picker), not a hardcoded
+        # "Supabase Target" that goes stale the moment active_profile != supabase
+        # (it already had, silently, since Session 13 switched the default to oci).
+        target_display = self._target_profiles[self._active_profile_key]
+        target_card_frame = ttk.LabelFrame(conn_frame, text=f"{target_display} Target",
                                           style='Large.TLabelframe', padding=8)
         target_card_frame.pack(side='right', fill='x', expand=True, padx=(8, 0))
-        
-        self.target_status_card = StatusCard(target_card_frame, "Supabase Target")
+        self.target_card_frame = target_card_frame
+
+        self.target_status_card = StatusCard(target_card_frame, f"{target_display} Target")
         self.target_status_card.pack(fill='x')
-    
+
+    def on_target_profile_changed(self, event=None):
+        """Header combobox handler -- switches which [database.target.<profile>]
+        every subsequent subprocess call targets. Doesn't touch config.toml;
+        see the picker's own comment in create_header() for why."""
+        display = self.target_profile_var.get()
+        profile_key = next((k for k, v in self._target_profiles.items() if v == display), display)
+        self._active_profile_key = profile_key
+        self.operation_manager.target_profile = profile_key
+
+        self.target_card_frame.configure(text=f"{display} Target")
+        self.target_status_card.set_title(f"{display} Target")
+
+        self.log_manager.log(LogLevel.INFO, "Config",
+                              f"Target profile switched to '{profile_key}' ({display})")
+
+        # Whatever's currently shown (connection status, Migration Overview) is
+        # about the OLD profile -- stale the instant the switch happens, not
+        # just eventually. Re-test/re-refresh immediately rather than leaving
+        # it looking valid for the new target until the next manual click or
+        # the 30s auto-refresh.
+        self.safe_test_all_connections()
+        self.safe_refresh_migration_status()
+
     def create_main_content(self, parent):
         """Create main content area: an Actions tab (Quick Actions buttons) and a
         Status tab (Migration Overview + a live-scrolling log panel). Starting any
