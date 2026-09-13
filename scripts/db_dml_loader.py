@@ -51,7 +51,7 @@ import tomli
 import pandas as pd
 from PIL import Image
 #from supabase import create_client, Client
-from sqlalchemy import create_engine, MetaData, Table, select, insert, inspect, text
+from sqlalchemy import create_engine, MetaData, Table, select, insert, inspect, text, or_
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -450,6 +450,47 @@ def clean_record_data(record):
     """Clean all string values in a record dictionary."""
     return {k: clean_string_data(v) for k, v in record.items()}
           
+def _apply_upsert_conflict(stmt, tgt_table_obj, uniq_columns, record):
+    """Attach the ON CONFLICT clause for a natural-key upsert -- DO UPDATE
+    when there's real payload to refresh, DO NOTHING when there isn't.
+
+    Added 2026-09-13, replacing a previous on_conflict_do_nothing() everywhere
+    -- see CLAUDE.md's "Loader status" for the full story. That meant once a
+    row existed for a given natural key, ITS DATA COULD NEVER BE CORRECTED BY
+    ANY FUTURE SYNC, full stop -- confirmed live trying to fix 4 known-corrupt
+    rat.catalog rows via a normal Stage 2 re-run, which silently did nothing.
+
+    Which columns update: every column actually being inserted for this
+    record, except the conflict target itself (unchanged by definition --
+    it's what matched) and the CREATION audit columns (created_by/
+    created_date: preserve when the row was first created; modified_by/
+    modified_date, deliberately not excluded, should move to reflect this
+    sync having touched the row). Falls back to DO NOTHING when nothing's
+    left after excluding the above -- e.g. country's only real column IS its
+    own natural key, so there's genuinely nothing to refresh.
+
+    WHERE guard: only fires the UPDATE when at least one real payload column
+    (i.e. excluding modified_by/modified_date themselves, which trivially
+    "differ" every run) is actually IS DISTINCT FROM the existing row.
+    Without this, every row in a 141k-row table gets a fresh modified_date on
+    every single Full Sync regardless of whether anything about it actually
+    changed -- unnecessary MVCC bloat/write amplification at this table's
+    scale, and it would make modified_date meaningless as "last real edit"."""
+    excluded = set(uniq_columns) | {"id", "created_by", "created_date"}
+    update_cols = {col for col in record if col not in excluded and col in tgt_table_obj.c}
+    if not update_cols:
+        return stmt.on_conflict_do_nothing(index_elements=uniq_columns)
+
+    guard_cols = update_cols - {"modified_by", "modified_date"}
+    stmt = stmt.on_conflict_do_update(
+        index_elements=uniq_columns,
+        set_={col: stmt.excluded[col] for col in update_cols},
+        where=or_(*(tgt_table_obj.c[col].is_distinct_from(stmt.excluded[col])
+                    for col in guard_cols)) if guard_cols else None,
+    )
+    return stmt
+
+
 def batch_upsert(table_name, data, uniq_columns=['id'], return_after_batch=False, quiet=True, batch_data={}):
     """
     Perform batch upsert operations with bulk insert optimization while maintaining compatibility
@@ -498,12 +539,31 @@ def batch_upsert(table_name, data, uniq_columns=['id'], return_after_batch=False
             batches = [data[y:y + batch_size] for y in range(0, data_len, batch_size)]
         
         # Per batch
-        for batch in tqdm(batches, desc=f"Upserting {data_len} to {table_name}", disable=quiet): 
+        for batch in tqdm(batches, desc=f"Upserting {data_len} to {table_name}", disable=quiet):
             # Clean data in the batch
             cleaned_batch = [clean_record_data(record) for record in batch]
-            
+
+            # Postgres refuses ON CONFLICT DO UPDATE if the batch's own VALUES
+            # list uses the same conflict key twice ("ON CONFLICT DO UPDATE
+            # command cannot affect row a second time") -- a real risk, not
+            # hypothetical: 13 known duplicate image_no rows in the FileMaker
+            # source (see CLAUDE.md's "Verified facts") resolve to the same
+            # catalog_id, so catalog_metadata/usage/picture_metadata can
+            # legitimately build a batch with the same key twice.
+            # on_conflict_do_nothing() tolerated this silently; do_update()
+            # does not. Dedupe last-value-wins within EACH batch (not the
+            # whole `data` list -- Postgres has no problem with the same key
+            # across two SEPARATE statements, only within one VALUES list),
+            # matching migrate_catalog()'s own OrderedDict pattern for
+            # exactly this reason.
+            if uniq_columns != ['id']:
+                deduped = OrderedDict()
+                for record in cleaned_batch:
+                    deduped[tuple(record.get(c) for c in uniq_columns)] = record
+                cleaned_batch = list(deduped.values())
+
             # Check data length
-            len_err = False     
+            len_err = False
             for record in cleaned_batch:                        
                 # Check data lengths before insert
                 for col, max_length in columns_info.items():
@@ -531,23 +591,23 @@ def batch_upsert(table_name, data, uniq_columns=['id'], return_after_batch=False
                 # Try bulk insert first
                 stmt = pg_insert(tgt_table_obj).values(cleaned_batch)
                 if uniq_columns != ['id']:
-                    stmt = stmt.on_conflict_do_nothing(index_elements=uniq_columns)
-                
+                    stmt = _apply_upsert_conflict(stmt, tgt_table_obj, uniq_columns, cleaned_batch[0])
+
                 result = supabase.execute(stmt)
                 supabase.commit()
                 success_cnt += len(cleaned_batch)
-                
+
             except (IntegrityError, DataError) as e:
                 supabase.rollback()
                 logger.debug(f"{table_name}: Bulk insert failed, falling back to individual inserts")
-                
+
                 # Fall back to individual inserts
                 for record in cleaned_batch:
                     try:
                         stmt = pg_insert(tgt_table_obj).values(record)
                         if uniq_columns != ['id']:
-                            stmt = stmt.on_conflict_do_nothing(index_elements=uniq_columns)
-                        
+                            stmt = _apply_upsert_conflict(stmt, tgt_table_obj, uniq_columns, record)
+
                         result = supabase.execute(stmt)
                         supabase.commit()
                         success_cnt += 1
