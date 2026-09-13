@@ -123,6 +123,18 @@ CREATE TABLE IF NOT EXISTS rat_migration.reject_log (
     notes         text
 );
 
+-- Added 2026-09-13: resolved=true only ever meant "someone looked at this",
+-- not WHAT happened -- no way to tell "we fixed our own data" apart from
+-- "false positive, dismissed" apart from "flagged for the client to fix in
+-- FileMaker, nothing to do on our side" without reading the free-text notes
+-- column by eye. Free text, not an enum (this table has no CHECK
+-- constraints anywhere else either) -- suggested values: 'fixed' (our own
+-- copy corrected), 'flagged_for_source_fix' (source-side issue, needs a RAT
+-- volunteer in FileMaker, our copy is already correct), 'dismissed' (not a
+-- real issue). ADD COLUMN IF NOT EXISTS, same idempotent-on-existing-table
+-- pattern as db_sync_manifest.py's own row_hash column.
+ALTER TABLE rat_migration.reject_log ADD COLUMN IF NOT EXISTS resolution text;
+
 CREATE INDEX IF NOT EXISTS reject_log_image_no_idx   ON rat_migration.reject_log (image_no);
 CREATE INDEX IF NOT EXISTS reject_log_run_at_idx     ON rat_migration.reject_log (run_at);
 CREATE INDEX IF NOT EXISTS reject_log_unresolved_idx ON rat_migration.reject_log (resolved) WHERE NOT resolved;
@@ -289,7 +301,8 @@ def log_crash(source_script: str, config_path: str = "config.toml",
 # Admin CLI -- the reader/triage half.
 # =============================================================================
 def _query(cfg: dict, target_profile: str | None, *, unresolved_only: bool,
-           since: str | None, image_no: str | None, limit: int) -> list[dict]:
+           since: str | None, image_no: str | None, source_script: str | None,
+           limit: int) -> list[dict]:
     conn = _connect(cfg, target_profile)
     try:
         schema = _mig_schema(cfg)
@@ -302,11 +315,15 @@ def _query(cfg: dict, target_profile: str | None, *, unresolved_only: bool,
         if image_no:
             where.append("image_no = %s")
             params.append(image_no)
+        if source_script:
+            where.append("source_script = %s")
+            params.append(source_script)
         clause = f"WHERE {' AND '.join(where)}" if where else ""
         with conn.cursor() as c:
             c.execute(
                 f"""SELECT id, run_at, run_id, source_script, stage, severity, image_no,
-                           fm_rowid, catalog_id, table_name, reason, resolved, resolved_at, notes
+                           fm_rowid, catalog_id, table_name, reason, resolved, resolved_at,
+                           resolution, notes
                     FROM {schema}.reject_log {clause}
                     ORDER BY run_at DESC LIMIT %s""",
                 (*params, limit),
@@ -317,15 +334,16 @@ def _query(cfg: dict, target_profile: str | None, *, unresolved_only: bool,
         conn.close()
 
 
-def _resolve(cfg: dict, target_profile: str | None, reject_id: int, note: str | None) -> int:
+def _resolve(cfg: dict, target_profile: str | None, reject_id: int, note: str | None,
+             resolution: str | None = None) -> int:
     conn = _connect(cfg, target_profile)
     try:
         schema = _mig_schema(cfg)
         with conn.cursor() as c:
             c.execute(
                 f"UPDATE {schema}.reject_log SET resolved = true, resolved_at = now(), "
-                f"notes = COALESCE(%s, notes) WHERE id = %s",
-                (note, reject_id),
+                f"notes = COALESCE(%s, notes), resolution = COALESCE(%s, resolution) WHERE id = %s",
+                (note, resolution, reject_id),
             )
             updated = c.rowcount
         conn.commit()
@@ -339,9 +357,11 @@ def _print_table(rows: list[dict]) -> None:
         print("No matching rejects.")
         return
     for r in rows:
+        resolved_str = f"yes ({r['resolution']})" if r['resolved'] and r['resolution'] else \
+                       ("yes" if r['resolved'] else "no")
         print(f"[{r['id']}] {r['run_at']}  {r['severity']:<9} {r['source_script']}/{r['stage']}  "
               f"image_no={r['image_no'] or '-'}  fm_rowid={r['fm_rowid'] or '-'}  "
-              f"resolved={'yes' if r['resolved'] else 'no'}")
+              f"resolved={resolved_str}")
         print(f"      {r['reason']}")
 
 
@@ -351,7 +371,8 @@ def _export_xlsx(rows: list[dict], out_path: Path) -> None:
     ws = wb.active
     ws.title = "Rejects"
     cols = ["id", "run_at", "run_id", "source_script", "stage", "severity", "image_no",
-            "fm_rowid", "catalog_id", "table_name", "reason", "resolved", "resolved_at", "notes"]
+            "fm_rowid", "catalog_id", "table_name", "reason", "resolved", "resolved_at",
+            "resolution", "notes"]
     ws.append(cols)
     for r in rows:
         ws.append([str(r.get(c)) if r.get(c) is not None else None for c in cols])
@@ -374,9 +395,15 @@ def main() -> int:
     ap.add_argument("--unresolved-only", action="store_true")
     ap.add_argument("--since", help="Only rejects at/after this ISO date/time, e.g. 2026-09-01")
     ap.add_argument("--image-no")
+    ap.add_argument("--source-script", help="Filter to one producer, e.g. "
+                     "'audit_backtick_corruption.py' or 'db_dml_loader.py'.")
     ap.add_argument("--limit", type=int, default=200)
     ap.add_argument("--resolve", type=int, metavar="ID", help="Mark one reject_log row resolved.")
     ap.add_argument("--note", help="Note to attach when resolving (with --resolve).")
+    ap.add_argument("--resolution", help="What kind of resolution this was (with --resolve) -- "
+                     "free text, suggested values: 'fixed' (our own data corrected), "
+                     "'flagged_for_source_fix' (source-side issue, needs a RAT volunteer in "
+                     "FileMaker), 'dismissed' (not a real issue).")
     args = ap.parse_args()
 
     if args.print_ddl:
@@ -392,7 +419,7 @@ def main() -> int:
         return 0
 
     if args.resolve is not None:
-        updated = _resolve(cfg, args.target_profile, args.resolve, args.note)
+        updated = _resolve(cfg, args.target_profile, args.resolve, args.note, args.resolution)
         if updated:
             print(f"Resolved reject_log id={args.resolve}.")
             return 0
@@ -401,7 +428,8 @@ def main() -> int:
 
     if args.export or args.list:
         rows = _query(cfg, args.target_profile, unresolved_only=args.unresolved_only,
-                      since=args.since, image_no=args.image_no, limit=args.limit)
+                      since=args.since, image_no=args.image_no,
+                      source_script=args.source_script, limit=args.limit)
         if args.export:
             _export_xlsx(rows, Path(args.export))
             print(f"{len(rows)} reject(s) written to {args.export}")
