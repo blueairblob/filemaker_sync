@@ -2864,4 +2864,72 @@ both connections green, no errors, launched from the exact directory that broke 
   procedure not rehearsed; `picaloco_agent` distribution blocked on the deferred AV/code-signing
   decision (Session 22).
 
+### Update, same session — the backtick data audit: real answer, small blast radius
+
+**User's own framing for picking this up:** the client has admitted there's a lot of junk in the
+FileMaker database and wants it corrected, which the user connected to two things — a chance to
+quantify the historical backtick bug's real damage, and a step toward "some sort of validation as
+we export" the user sees as already implied in the existing extract/quarantine code. Scoped down
+first (via a clarifying question) to just the retrospective backtick scan — a broader ongoing
+export-time validation pass is a distinct, larger follow-up, not done this session.
+
+**Method, and why it's precise rather than a guess:** the backtick→doublequote bug is fixed now
+(Session 19), so a *fresh* FileMaker extract into `rat_migration.ratcatalogue` correctly preserves
+every backtick. New `scripts/audit_backtick_corruption.py` diffs each `rat.catalog` text column
+against that fresh value, but only counts a row as CONFIRMED corrupted when
+`fresh_value.replace('`', '"') == stored_value` — the bug's own exact mechanism, not just "these
+two values differ" (a genuine edit since the row was last loaded would also differ, and is
+definitely not this bug). Ran a fresh `filemaker_extract.py --db-exp --ddl --dml --del-data
+--target-profile oci` first (several minutes, touches only disposable `rat_migration.*` staging,
+never `rat.*`) to get a clean, current baseline to diff against.
+
+**Result: 4 confirmed hits, all in `catalog.description`** (`at0550`, `cjwsam119`, `rat00819`,
+`trz00696`) — a real but small blast radius, nowhere near the scale the "lots of junk" framing
+might have suggested. Logged into `rat_migration.reject_log` (`severity='reject'`,
+`source_script='audit_backtick_corruption.py'`), verified readable via `reject_log.py --list`
+alongside every other known issue.
+
+**A real scare that turned out to be a bug in the audit script itself, not the data — caught
+before reporting it:** the first raw-diff pass claimed **112,475** "other differences" across
+141,244 rows (~80%) — alarmingly high, worth real scrutiny before trusting it rather than reporting
+it as fact. Sampled a handful directly: almost all of it was `db_dml_loader.py`'s own
+`stripy()`/`clean_record_data()` whitespace-trimming on load (`' '` → `''`, trailing spaces
+trimmed) that this script's own comparison hadn't replicated — not corruption, not real edit-drift,
+just this script not accounting for a transformation the loader already legitimately does. Fixed by
+comparing `.strip()`'d values for that secondary count (the backtick-signature test itself was
+never affected — whitespace noise can't produce that exact substitution pattern). Once fixed: real
+non-corruption drift is just **9 rows** — `rat.catalog` is, in fact, well-synced with FileMaker
+right now.
+
+**Also found and fixed along the way:** `rat.catalog.works_number`/`year_built`/`plant_code`/
+`bw_image_no` are **entirely NULL, 0/141,244 rows** — confirmed live via a direct query while
+scoping which columns to compare. `migrate_catalog()` in `db_dml_loader.py` copies staging
+columns into `rat.catalog` only where the NAMES match exactly, and these four are `"Works
+number"`/`"Year built"`/`"Plant code"`/`"BW_image_no"` in FileMaker's raw naming — never renamed
+anywhere in the pipeline, so they've silently never been copied. A separate, pre-existing gap,
+unrelated to the backtick bug — noted here rather than fixed (out of scope for this audit), a
+candidate for its own follow-up.
+
+**Remediation deliberately not performed.** The audit script only finds and reports — the fresh,
+correct value is already sitting in `rat_migration.ratcatalogue` from this session's extract, so
+re-running Stage 2 (`db_dml_loader.py --mode migration_schema`) would upsert it into `rat.catalog`
+for every row, fixing all 4 confirmed hits (and the 9 legitimate-drift rows) as a side effect —
+but that's a write to live `rat.*`, a separate, explicit decision, not something to do silently as
+part of a read-only audit.
+
+### Open Threads (revised again)
+
+- **Decision needed: apply the fix?** Re-running Stage 2 against the now-fresh staging would
+  correct all 4 confirmed rows (and the 9 drifted ones) in one pass — not yet done, needs an
+  explicit go-ahead since it writes to live `rat.*`.
+- `rat.catalog.works_number`/`year_built`/`plant_code`/`bw_image_no` are dead columns (never
+  populated, column-name mismatch in `migrate_catalog()`) — newly discovered, not yet fixed.
+- Broader export-time validation pass (general field-quality checks on every future sync, not just
+  this one historical bug) — explicitly deferred to a follow-up, not this session.
+- *(Carried, unchanged)*: thumbnail size gap; Migration Overview's full `rat.*`-comparison
+  redesign; the 16 flagged source records; `--mode dml_files` parser rewrite; `PicaLocoBackend`/
+  `picaloco` rebrand (still gated on stability); restore procedure not rehearsed; `picaloco_agent`
+  distribution blocked on the deferred AV/code-signing decision (Session 22); `gui/logs/` stray
+  leftover cleanup.
+
 ---

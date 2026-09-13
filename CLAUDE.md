@@ -248,7 +248,12 @@ pipeline silently diverging from the source value," not bad source data:**
    MySQL-style column-identifier quoting, but `df_to_sql_bulk_insert()` already emits correct
    Postgres identifiers by the time this ran — so it only ever found *data*, and silently mangled any
    literal backtick in any text field of any table, for this pipeline's entire history. Removed from
-   both DML call sites (kept for DDL, where it may still be legitimate).
+   both DML call sites (kept for DDL, where it may still be legitimate). **Blast radius quantified
+   (Session 23):** `scripts/audit_backtick_corruption.py` retrospectively confirmed exactly **4**
+   already-loaded `rat.catalog` rows still carry the mangled value (all in `description`) — small,
+   not the wider damage the "lots of junk in FileMaker" framing that prompted the audit might have
+   suggested. Findings live in `rat_migration.reject_log`; not yet remediated (fix is a normal
+   Stage 2 re-run against fresh staging, not yet applied — separate, explicit decision).
 2. `export_images()` stripped spaces from the local filename before writing it, so any
    space-containing `image_no` (a real, common pattern — `"Class 1400 (11)"`, `"Porto Tram"`, etc.)
    extracted its photo correctly every run but under a filename that could never match any
@@ -526,9 +531,13 @@ Smaller open threads: Migration Overview's full `rat.*`-comparison redesign
 flagged source records (FileMaker-side); `--mode dml_files` parser rewrite (low priority,
 `migration_schema` mode works); `requirements.txt`'s `pandas==2.1.4` pin (no Python 3.13 wheel);
 `PicaLocoBackend`/`picaloco` rebrand (explicitly gated until stable — arguably close now, still not done);
-`supabase-edge-functions` crash-loop fix handed to user, not yet confirmed run; whether other
-already-migrated fields (not just `image_no`) have latent corruption from the backtick bug's entire
-prior history (a wider data audit, not yet done); `picaloco_agent` builds, installs, and runs
+`supabase-edge-functions` crash-loop fix handed to user, not yet confirmed run; `rat.catalog`'s
+`works_number`/`year_built`/`plant_code`/`bw_image_no` columns are dead (0/141,244 populated —
+`migrate_catalog()` only copies staging columns whose names match `rat.catalog`'s exactly, and
+these four never got renamed from FileMaker's raw naming; found via Session 23's backtick audit,
+not yet fixed); a broader ongoing export-time data-quality validation pass (general field checks
+on every future sync, not just the one historical bug) — the user's wider ask, deliberately scoped
+down to the retrospective scan first; `picaloco_agent` builds, installs, and runs
 (Session 22) but real distribution to a RAT volunteer is blocked on an unsigned-exe AV
 false-positive (Norton quarantines every build regardless of `--onefile`/`--onedir`) — code signing
 is the only mitigation that would actually generalize, deliberately deferred as a cost decision
