@@ -2789,11 +2789,33 @@ unrelated to this session's change (that script is the legacy diagnostic layer, 
 elsewhere as its own thing) — a candidate follow-up if it's ever actively worked on again, not a
 side effect of the picker.
 
+### Update, same session — actually seen on screen, not just launched
+
+Realized mid-session there's no "plugin" needed to see the Windows GUI at all: with `python.exe`
+interop already working, a plain `PIL.ImageGrab.grab()` call run via `python.exe` and saved to
+`%TEMP%` is readable straight off `/mnt/c/...` — no VNC, no remote-desktop tooling, just a
+screenshot file and an image-capable Read. Used this to actually launch the real GUI in the
+background, screenshot it, and look:
+
+**First screenshot found a real bug the code review missed:** the header combobox's `width=28`
+truncated the longer profile name mid-string ("Self-hosted Supabase (OCI/Tails..."), even though
+the target status card's own label (built from the same string) displayed it in full right below.
+Fixed by sizing the combobox width to the longest configured display name rather than a fixed
+guess. Relaunched, re-screenshotted, confirmed the full name now renders cleanly. Both connection
+cards showed green (real FileMaker + real `oci` connections, not mocked), and the target card's
+label correctly read "Self-hosted Supabase (OCI/Tailscale) Target" rather than the old stale
+"Supabase Target". Killed the background GUI process and deleted both temp screenshots afterward
+rather than leaving either lying around.
+
+**Not exercised even now:** actually clicking the combobox and selecting a different profile
+(`supabase`) to watch the labels swap and connections re-test live — the screenshot method proves
+the window renders correctly, not that a click-driven interaction works, since there's no mouse
+control from this session, only screenshot capture.
+
 ### Open Threads
 
-- **Next: someone needs to actually open the GUI on the Windows box and visually confirm the
-  picker** — combobox renders/populates correctly, switching profiles updates both status card
-  labels, and connections re-test against the newly selected target.
+- Combobox selection → live label swap + re-test (`on_target_profile_changed`) still only
+  code-reviewed, not click-tested — no mouse control available from this session.
 - *(Carried, unchanged)*: thumbnail size gap; wider backtick-corruption data audit; Migration
   Overview's full `rat.*`-comparison redesign; the 16 flagged source records; `--mode dml_files`
   parser rewrite; `PicaLocoBackend`/`picaloco` rebrand (still gated on stability); restore
