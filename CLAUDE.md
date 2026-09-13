@@ -165,26 +165,41 @@ see below), the full **sanitise/quarantine/reject** pipeline, and correct natura
 has `env_secrets` wired into `get_db_engine`.
 (It replaced an earlier stale 781-line reconstruction — if you see references to that, they're historical.)
 
-> **⚠ Major, previously-undocumented limitation, found Session 23 — read before assuming a resync
-> "fixes" any already-loaded row.** `batch_upsert()` — the single function every `migrate_*` call
-> in this pipeline goes through, for every table — always does `ON CONFLICT (...) DO NOTHING`,
-> never `DO UPDATE`. "Correct natural-key conflict targets" above means the conflict *target*
-> (which column(s) count as a duplicate) is right; the conflict *action* silently skips instead of
-> updating. **Once a row exists for a given natural key, its stored field values can never be
-> corrected by any future sync — Full Sync, Delta Sync, or a manual Stage 2 re-run all funnel
-> through this same insert-or-skip logic.** Confirmed live: re-ran Stage 2 against freshly-corrected
-> staging data specifically to fix 4 known-corrupted rows, and it made zero difference — had to fix
-> those 4 with a direct, targeted `UPDATE` instead. Compounds with `run_incremental_sync.py`'s Delta
-> Sync "verify" step (`fetch_verified()`), which only checks image_no *presence* in `rat.catalog`,
-> not content — so for an already-existing "changed" row, verification trivially passes even though
-> the real update was silently dropped, and the sync manifest then advances as if that row is
-> correctly synced, permanently masking the failure from all future syncs too. This means the
-> "Delta Sync catches late edits" framing elsewhere in this document is **only true for genuinely
-> new records** — an edit to an existing record's field value does not reliably land. Not yet fixed
-> (deliberately deferred, Session 23) — needs its own scoped design (per-table `ON CONFLICT DO
-> UPDATE`, which columns should/shouldn't be overwritten, audit-column handling) and testing against
-> `test/` fixtures before touching live `oci` again. See `devlog/worksheet.md` Session 23 for the
-> full discovery trace.
+> **⚠ Major limitation found AND FIXED, Session 23 — `batch_upsert()` now genuinely upserts.**
+> `batch_upsert()` — the single function every `migrate_*` call in this pipeline goes through, for
+> every table — used to always do `ON CONFLICT (...) DO NOTHING`, never `DO UPDATE`. "Correct
+> natural-key conflict targets" above means the conflict *target* was always right; the conflict
+> *action* silently skipped instead of updating. **Once a row existed for a given natural key, its
+> stored field values could never be corrected by any future sync** — Full Sync, Delta Sync, or a
+> manual Stage 2 re-run all funneled through this same insert-or-skip logic. Confirmed live: re-ran
+> Stage 2 against freshly-corrected staging specifically to fix 4 known-corrupted rows, and it made
+> zero difference — had to fix those 4 with a direct, targeted `UPDATE` instead, which is how this
+> was discovered. Compounded with `run_incremental_sync.py`'s Delta Sync "verify" step
+> (`fetch_verified()`), which only checks image_no *presence* in `rat.catalog`, not content — so an
+> already-existing "changed" row verified successfully even when its real update was silently
+> dropped, and the sync manifest then advanced as if it were correctly synced, permanently masking
+> the failure. This meant "Delta Sync catches late edits" was **only true for genuinely new
+> records**, not edits to existing ones.
+>
+> **Fixed, same session:** `_apply_upsert_conflict()` now does a real `ON CONFLICT DO UPDATE`,
+> refreshing every inserted column except the conflict target and the *creation* audit columns
+> (`created_by`/`created_date` are preserved; `modified_by`/`modified_date` correctly move). Two
+> real risks handled, not just the naive fix: (1) Postgres refuses `DO UPDATE` if one batch's own
+> `VALUES` list repeats a conflict key (`"ON CONFLICT DO UPDATE command cannot affect row a second
+> time"`) — a real, not hypothetical, risk given the 13 known duplicate `image_no` rows (see
+> "Verified facts" below) resolving to the same `catalog_id` for `catalog_metadata`/`usage`/
+> `picture_metadata` — fixed with a same-batch dedup guard (last-value-wins, matching
+> `migrate_catalog()`'s own `OrderedDict` pattern). (2) A `WHERE ... IS DISTINCT FROM ...` guard so
+> re-syncing unchanged data doesn't rewrite `modified_date` on all 141k catalog rows every Full Sync
+> (real MVCC bloat/write amplification at this scale, and it would make `modified_date` meaningless
+> as "last real edit"). Validated first against real Postgres via throwaway scratch tables (never
+> touching `rat.*`), covering all of the above plus audit-column correctness, **then validated live
+> against real `oci`**: a full Stage 2 run left every table's row count exactly unchanged, 20
+> randomly sampled untouched rows kept their exact original `modified_date` (the no-op guard holding
+> at real scale, not just synthetic), and — the actual point — the 9 rows the backtick audit had
+> found genuinely drifted (see below) are now **correctly corrected**, re-confirmed via a second
+> audit run showing **0 confirmed hits and 0 remaining drift**. See `devlog/worksheet.md` Session 23
+> for the full discovery-and-fix trace.
 
 **Every lookup goes through `lookup_caches` now (Session 6, ~30–1,000× faster).** `migrate_route`/
 `migrate_builder`/`migrate_organisation`/`migrate_location` used to call `get_location_id()`/
@@ -568,9 +583,12 @@ fix — re-running Stage 2 against the now-fresh staging — silently did nothin
 Fixed the 4 rows directly instead (targeted `UPDATE`, verified 0 hits remain). Extended
 `reject_log.py` with a structured `resolution` field (`'fixed'` vs `'flagged_for_source_fix'` vs
 `'dismissed'`, not just a bare boolean) and a `--source-script` filter, per the user's explicit ask
-to track fixes in the reject table itself as a proper audit tool. See `devlog/worksheet.md`
-Session 23 for the full trace, including why this wasn't chased further (the upsert-logic fix
-itself is real, separate, higher-stakes work — deliberately deferred, not fixed this session).
+to track fixes in the reject table itself as a proper audit tool. **Then fixed the upsert bug
+itself, same session**, once the user picked it back up as the next task — see the blockquote atop
+"Loader status" for the full fix-and-validation trace (isolated scratch-table tests, then a live
+Stage 2 run against real `oci`: row counts unchanged, the no-op guard holding at scale, and the 9
+previously-drifted rows now genuinely corrected). See `devlog/worksheet.md` Session 23 for the
+complete discovery-to-fix narrative.
 
 Smaller open threads: Migration Overview's full `rat.*`-comparison redesign
 (parked, no clean table mapping); `picture_metadata` untested against real images (no local files); the 16
