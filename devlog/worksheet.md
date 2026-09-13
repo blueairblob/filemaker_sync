@@ -2726,11 +2726,18 @@ on literally every fresh build, forever, under the current approach.
 real improvement on its own technical merits), but it does not by itself solve distribution to a
 real RAT volunteer's machine.
 
+### Decision — code signing explicitly deferred, not chosen
+
+User's call: skip deciding among the four AV options for now — "this is dev work in progress,
+worth noting for now only." Not a rejection of code signing, just not a live decision while
+`picaloco_agent` is still pre-distribution dev/test work, not yet being handed to an actual RAT
+volunteer. Revisit when actual distribution (not just dev-machine testing) is imminent.
+
 ### Open Threads (revised)
 
-- **Decision needed, not yet made: how to handle the Norton/AV false-positive for real
-  distribution** — see the four options above. Nothing further to build until this is decided;
-  building more packaging polish on top of an unsigned exe doesn't address the actual blocker.
+- `picaloco_agent` packaging is otherwise done for now: builds, installs, and runs (Norton
+  friction aside, parked per the decision above). No further packaging work planned until the AV
+  question is revisited.
 - *(Carried, unchanged)*: thumbnail size gap; wider backtick-corruption data audit; GUI
   target-profile picker; Migration Overview's full `rat.*`-comparison redesign; the 16 flagged
   source records; `--mode dml_files` parser rewrite; `PicaLocoBackend`/`picaloco` rebrand (still
