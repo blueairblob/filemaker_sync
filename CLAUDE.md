@@ -165,6 +165,27 @@ see below), the full **sanitise/quarantine/reject** pipeline, and correct natura
 has `env_secrets` wired into `get_db_engine`.
 (It replaced an earlier stale 781-line reconstruction — if you see references to that, they're historical.)
 
+> **⚠ Major, previously-undocumented limitation, found Session 23 — read before assuming a resync
+> "fixes" any already-loaded row.** `batch_upsert()` — the single function every `migrate_*` call
+> in this pipeline goes through, for every table — always does `ON CONFLICT (...) DO NOTHING`,
+> never `DO UPDATE`. "Correct natural-key conflict targets" above means the conflict *target*
+> (which column(s) count as a duplicate) is right; the conflict *action* silently skips instead of
+> updating. **Once a row exists for a given natural key, its stored field values can never be
+> corrected by any future sync — Full Sync, Delta Sync, or a manual Stage 2 re-run all funnel
+> through this same insert-or-skip logic.** Confirmed live: re-ran Stage 2 against freshly-corrected
+> staging data specifically to fix 4 known-corrupted rows, and it made zero difference — had to fix
+> those 4 with a direct, targeted `UPDATE` instead. Compounds with `run_incremental_sync.py`'s Delta
+> Sync "verify" step (`fetch_verified()`), which only checks image_no *presence* in `rat.catalog`,
+> not content — so for an already-existing "changed" row, verification trivially passes even though
+> the real update was silently dropped, and the sync manifest then advances as if that row is
+> correctly synced, permanently masking the failure from all future syncs too. This means the
+> "Delta Sync catches late edits" framing elsewhere in this document is **only true for genuinely
+> new records** — an edit to an existing record's field value does not reliably land. Not yet fixed
+> (deliberately deferred, Session 23) — needs its own scoped design (per-table `ON CONFLICT DO
+> UPDATE`, which columns should/shouldn't be overwritten, audit-column handling) and testing against
+> `test/` fixtures before touching live `oci` again. See `devlog/worksheet.md` Session 23 for the
+> full discovery trace.
+
 **Every lookup goes through `lookup_caches` now (Session 6, ~30–1,000× faster).** `migrate_route`/
 `migrate_builder`/`migrate_organisation`/`migrate_location` used to call `get_location_id()`/
 `get_country_id()` — always a live, unindexed `SELECT` per row — because the shared cache was only built
@@ -249,11 +270,17 @@ pipeline silently diverging from the source value," not bad source data:**
    Postgres identifiers by the time this ran — so it only ever found *data*, and silently mangled any
    literal backtick in any text field of any table, for this pipeline's entire history. Removed from
    both DML call sites (kept for DDL, where it may still be legitimate). **Blast radius quantified
-   (Session 23):** `scripts/audit_backtick_corruption.py` retrospectively confirmed exactly **4**
-   already-loaded `rat.catalog` rows still carry the mangled value (all in `description`) — small,
-   not the wider damage the "lots of junk in FileMaker" framing that prompted the audit might have
-   suggested. Findings live in `rat_migration.reject_log`; not yet remediated (fix is a normal
-   Stage 2 re-run against fresh staging, not yet applied — separate, explicit decision).
+   AND fixed (Session 23):** `scripts/audit_backtick_corruption.py` retrospectively confirmed
+   exactly **4** already-loaded `rat.catalog` rows still carried the mangled value (all in
+   `description`) — small, not the wider damage the "lots of junk in FileMaker" framing that
+   prompted the audit might have suggested. **Attempting to fix via a normal Stage 2 re-run against
+   fresh staging did NOT work** — see the loader's own `ON CONFLICT DO NOTHING` limitation flagged
+   above, discovered as a direct result of this fix attempt failing. Fixed instead with a targeted,
+   direct `UPDATE` per row; verified 0 confirmed hits remain. `rat_migration.reject_log` entries
+   marked `resolved=true, resolution='fixed'`, with the literal backtick itself flagged in each
+   note for a RAT volunteer to review/correct in FileMaker (a genuine source-side typo, not
+   something to auto-fix) — exported to `rejects_backtick_audit_20260913.xlsx` as the handoff
+   artifact (gitignored, not committed).
 2. `export_images()` stripped spaces from the local filename before writing it, so any
    space-containing `image_no` (a real, common pattern — `"Class 1400 (11)"`, `"Porto Tram"`, etc.)
    extracted its photo correctly every run but under a filename that could never match any
@@ -525,6 +552,25 @@ end-to-end (2026-09-12)**: the real `upload_images_oci.py` InvalidKeyError path 
 against two genuine backtick image_nos (not a synthetic call) and landed correctly in
 `rat_migration.reject_log` with the right `catalog_id`/`run_id`/reason; `log_crash()` was also
 confirmed against a real exception. See `devlog/worksheet.md` Session 20 for the full trace.
+
+**Update (Session 23): the backtick data audit found its own answer, then found something much
+bigger while trying to apply the fix.** The client had admitted a lot of junk exists in the
+FileMaker source and wants it corrected; the user connected this to quantifying the historical
+backtick bug's real damage plus a step toward ongoing export-time validation. Scoped down (via a
+clarifying question) to just the retrospective scan first. New `scripts/audit_backtick_corruption.py`
+diffed `rat.catalog` against a fresh FileMaker extract using the bug's own exact signature
+(`` fresh_value.replace('`', '"') == stored_value ``, not just "these differ") — found **4** confirmed
+hits, all in `catalog.description`. (A first raw-diff pass claimed 112,475 differences; investigated
+before trusting it — almost entirely the loader's own whitespace-stripping the script hadn't
+replicated, not real corruption. Real drift once fixed: 9 rows.) **Trying to apply the obvious
+fix — re-running Stage 2 against the now-fresh staging — silently did nothing**, which is how the
+`ON CONFLICT DO NOTHING` limitation flagged at the top of "Loader status" was actually discovered.
+Fixed the 4 rows directly instead (targeted `UPDATE`, verified 0 hits remain). Extended
+`reject_log.py` with a structured `resolution` field (`'fixed'` vs `'flagged_for_source_fix'` vs
+`'dismissed'`, not just a bare boolean) and a `--source-script` filter, per the user's explicit ask
+to track fixes in the reject table itself as a proper audit tool. See `devlog/worksheet.md`
+Session 23 for the full trace, including why this wasn't chased further (the upsert-logic fix
+itself is real, separate, higher-stakes work — deliberately deferred, not fixed this session).
 
 Smaller open threads: Migration Overview's full `rat.*`-comparison redesign
 (parked, no clean table mapping); `picture_metadata` untested against real images (no local files); the 16

@@ -2877,7 +2877,7 @@ export-time validation pass is a distinct, larger follow-up, not done this sessi
 (Session 19), so a *fresh* FileMaker extract into `rat_migration.ratcatalogue` correctly preserves
 every backtick. New `scripts/audit_backtick_corruption.py` diffs each `rat.catalog` text column
 against that fresh value, but only counts a row as CONFIRMED corrupted when
-`fresh_value.replace('`', '"') == stored_value` — the bug's own exact mechanism, not just "these
+`` fresh_value.replace('`', '"') == stored_value `` — the bug's own exact mechanism, not just "these
 two values differ" (a genuine edit since the row was last loaded would also differ, and is
 definitely not this bug). Ran a fresh `filemaker_extract.py --db-exp --ddl --dml --del-data
 --target-profile oci` first (several minutes, touches only disposable `rat_migration.*` staging,
@@ -2917,11 +2917,78 @@ for every row, fixing all 4 confirmed hits (and the 9 legitimate-drift rows) as 
 but that's a write to live `rat.*`, a separate, explicit decision, not something to do silently as
 part of a read-only audit.
 
+### Update, same session — the user said "go ahead", and that's when the real discovery happened
+
+User's go-ahead: "any fix to original data can go ahead we just have to log it so the source can
+be updated by the RAT volunteers." Ran Stage 2 (`db_dml_loader.py --mode migration_schema
+--target-profile oci`, ~4.5 minutes, full catalog + every other table) against the now-fresh
+staging, expecting it to upsert the 4 corrected values into `rat.catalog` as a side effect.
+**It didn't.** Re-ran the audit script immediately after — all 4 rows came back exactly as
+corrupted as before Stage 2 ran.
+
+**Root cause, and it's much bigger than these 4 rows: `batch_upsert()` in `db_dml_loader.py` — the
+single function EVERY `migrate_*` call in this entire pipeline goes through, for every table —
+always does `ON CONFLICT (...) DO NOTHING`, never `DO UPDATE`.** Confirmed by reading the code
+(`scripts/db_dml_loader.py:534`/`549`), not just inferred from the failed fix. This means: once a
+row exists for a given natural key, its stored field values can **never be corrected by any future
+sync of any kind** — Full Sync, Delta Sync, or a manual Stage 2 re-run all funnel through this same
+insert-or-skip logic. Only a genuinely new natural key (never seen before) actually lands.
+
+**It compounds: `run_incremental_sync.py`'s Delta Sync "verify" step doesn't actually verify
+content, only presence.** `fetch_verified()` is `SELECT image_no FROM rat.catalog WHERE image_no =
+ANY(...)` — for an already-existing row (which "changed" rows always are, by definition), this
+trivially passes even when `ON CONFLICT DO NOTHING` silently dropped the actual update. Worse: the
+sync manifest then gets advanced (`mark_loaded`) as if that row is now correctly synced at its
+latest FileMaker `ROWMODID`/hash — so the stale, wrong data becomes **permanently stuck**, with no
+future Delta Sync ever re-attempting it either, since the manifest now believes it's already
+current. This directly contradicts what this very document has claimed since Session 8: "Delta
+Sync's value... is catching late edits during a multi-day engagement." As built, it only reliably
+catches genuinely *new* records — an edit to an *existing* record's field value silently never
+lands, and the failure is invisible (no error, no log line, "verified" reports success).
+
+**This wasn't chased further this session** (the user explicitly chose "fix the 4 rows now, flag
+the bigger bug for later" over investigating full impact or fixing the upsert logic itself — a
+real, separate, higher-stakes piece of work: it touches every `migrate_*` function across every
+table, and a real fix needs care around which columns should/shouldn't be overwritten on conflict,
+audit-column handling, and testing against `test/` fixtures before touching live `oci` again).
+
+**The 4 rows themselves were fixed directly** — a targeted, scoped `UPDATE rat.catalog SET
+description = <fresh value> WHERE image_no = <image_no>` for exactly the 4 confirmed rows, using
+the same `modified_by`/`modified_date` convention `batch_upsert()` itself uses (looked up the
+`backtick-audit-fix` user id created by the earlier Stage 2 run). Verified via the audit script
+immediately after: **0 confirmed hits remain.**
+
+**Extended `reject_log.py` per the user's explicit ask** ("add any fixes to the reject table as
+'fixed'... as an audit tool"): a new `resolution` text column (guarded `ALTER TABLE ADD COLUMN IF
+NOT EXISTS`, same pattern as `db_sync_manifest.py`'s `row_hash`) distinguishes *what kind* of
+resolution happened — `'fixed'` (our own copy corrected), suggested `'flagged_for_source_fix'`
+(source-side issue, needs a RAT volunteer), `'dismissed'` (not real) — instead of just a bare
+`resolved` boolean plus free-text notes nobody could query. Also added `--source-script` filtering
+to `--list`/`--export` (needed immediately: exporting today's backtick findings via `--since` alone
+pulled in 3 unrelated `db_dml_loader.py` rejects from the same Stage 2 run — the 3 already-known
+orphaned-metadata rows, not backtick-related). The 4 reject_log rows are now `resolved=true`,
+`resolution='fixed'`, with a note explicitly separating "our database copy is fixed" from "the
+literal backtick is still sitting in the FileMaker source and reads as a genuine mid-word typo —
+flagged for a RAT volunteer to review and correct in FileMaker, not something to auto-fix."
+Exported to `rejects_backtick_audit_20260913.xlsx` (gitignored, sitting in the repo root as the
+actual handoff artifact — not committed, matching this project's own convention that generated
+reports aren't source-controlled).
+
+Also, while editing `.gitignore` to add `rejects_*.xlsx`: found and fixed unrelated pre-existing
+corruption in its final line — a UTF-16-with-embedded-null-bytes mess that had silently merged
+`Thumbs.db` into two broken `MySQL/*.fmpur`/`MySQL/*.csv` patterns, meaning none of the three
+actually worked as an ignore rule. Fixed in passing, not the point of this session's work.
+
 ### Open Threads (revised again)
 
-- **Decision needed: apply the fix?** Re-running Stage 2 against the now-fresh staging would
-  correct all 4 confirmed rows (and the 9 drifted ones) in one pass — not yet done, needs an
-  explicit go-ahead since it writes to live `rat.*`.
+- **`batch_upsert()`'s `ON_CONFLICT_DO_NOTHING` is a major, previously-undocumented pipeline
+  limitation** — no existing row's data can ever be corrected by a normal sync, and Delta Sync's
+  "verify" step can't detect this failure (presence-only check). Explicitly deferred this session,
+  not fixed. This is now the single most consequential open item in this document — bigger than
+  anything else on this list. Needs: full impact assessment (how many genuinely-edited rows across
+  which tables are actually stuck stale, not just theoretical), a design for what `ON CONFLICT DO
+  UPDATE` should look like per table (which columns should/shouldn't be overwritten, audit-column
+  handling), and testing against `test/` fixtures before touching live `oci` again.
 - `rat.catalog.works_number`/`year_built`/`plant_code`/`bw_image_no` are dead columns (never
   populated, column-name mismatch in `migrate_catalog()`) — newly discovered, not yet fixed.
 - Broader export-time validation pass (general field-quality checks on every future sync, not just
