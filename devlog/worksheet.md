@@ -2822,4 +2822,46 @@ control from this session, only screenshot capture.
   procedure not rehearsed; `picaloco_agent` distribution blocked on the deferred AV/code-signing
   decision (Session 22).
 
+### Update, same session — a real, user-found bug: the GUI only worked from the repo root
+
+**User's own click-test of the profile picker went well** (screenshot confirmed: switched to
+`oci`, Migration Overview refreshed, connections stayed green) **but surfaced a separate, real
+bug while doing it:** launching from inside `gui/` (`cd gui && python.exe filemaker_gui.py`,
+instead of the documented `python.exe gui/filemaker_gui.py` from the repo root) produced
+"connection errors" with no obvious cause. User's question, worth repeating verbatim: "This GUI
+should work regardless of where it is launched?" — correct, and it should have.
+
+**Root cause:** `gui_operations.py`'s `run_python_command()` resolved `scripts/` as
+`Path.cwd() / 'scripts'`, and its subprocess `Popen` used `cwd=Path.cwd()` too — both silently
+assumed the GUI was launched from the repo root specifically. Launched from `gui/` instead,
+`Path.cwd() / 'scripts' / script` doesn't exist, so `run_python_command()` returned
+`"{script} not found in scripts/"` before ever launching a subprocess — surfacing to the user as
+an opaque connection failure with no hint the real cause was cwd. **A second, quieter instance of
+the same bug had already happened before, silently:** `gui/logs/` exists alongside the real
+`logs/` at the repo root — a leftover from `LogManager`'s own relative `./logs` default being
+written somewhere unintended at least once in this GUI's history, never noticed because it fails
+silently (just writes logs to the wrong place) rather than loudly (like the scripts/ case did).
+
+**Fixed at the root, not per-path:** `gui_operations.py` now computes `REPO_ROOT =
+Path(__file__).resolve().parent.parent` (from the file's own location, immune to cwd) and uses it
+for both the `scripts/` lookup and the subprocess `cwd`; `filemaker_gui.py`'s `main()` now
+`os.chdir(REPO_ROOT)`s before creating the window at all — one chdir covers every other
+relative-path reader (config.toml, `LogManager`'s `logs/`) in one place, present and future,
+rather than auditing and patching each one individually.
+
+**Live-tested by reproducing the exact failure first:** launched from `gui/` pre-fix (confirmed
+broken, matching the user's report), applied the fix, relaunched the same way, screenshotted —
+both connections green, no errors, launched from the exact directory that broke it before.
+
+### Open Threads (revised)
+
+- Combobox selection → live label swap + re-test: now actually click-tested by the user via
+  screenshot (this session) — confirmed working, not just code-reviewed. Closed.
+- `gui/logs/`'s stray leftover files not cleaned up (harmless, just misplaced) — low priority.
+- *(Carried, unchanged)*: thumbnail size gap; wider backtick-corruption data audit; Migration
+  Overview's full `rat.*`-comparison redesign; the 16 flagged source records; `--mode dml_files`
+  parser rewrite; `PicaLocoBackend`/`picaloco` rebrand (still gated on stability); restore
+  procedure not rehearsed; `picaloco_agent` distribution blocked on the deferred AV/code-signing
+  decision (Session 22).
+
 ---
