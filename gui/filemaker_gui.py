@@ -239,9 +239,13 @@ class FileMakerSyncGUI:
         profile_frame.pack(side='right')
         ttk.Label(profile_frame, text="Target:", font=('Arial', 9, 'bold')).pack(side='left', padx=(0, 5))
         self.target_profile_var = tk.StringVar(value=self._target_profiles[self._active_profile_key])
+        # Width sized to the longest configured display name (screenshot-verified
+        # 2026-09-13 -- width=28 truncated "Self-hosted Supabase (OCI/Tailscale)"),
+        # not a fixed guess, so an even longer future profile name doesn't repeat this.
+        combo_width = max(20, max(len(v) for v in self._target_profiles.values()) + 2)
         self.target_profile_combo = ttk.Combobox(
             profile_frame, textvariable=self.target_profile_var,
-            values=list(self._target_profiles.values()), state='readonly', width=28,
+            values=list(self._target_profiles.values()), state='readonly', width=combo_width,
         )
         self.target_profile_combo.pack(side='left')
         self.target_profile_combo.bind('<<ComboboxSelected>>', self.on_target_profile_changed)
