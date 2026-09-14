@@ -1148,6 +1148,33 @@ def migrate_route(df):
     batch_upsert(f"{tgt_schema}.{tgt_table}", route_data_lst, uniq_columns=['name'])
     logger.info(f"{tgt_table}: Completed migration. Migrated {len(routes)} routes")
 
+# FileMaker's raw staging column name -> rat.catalog's snake_case name, for
+# the handful of columns whose staging name doesn't already match the target
+# schema 1:1 the way every other column here does. Without this,
+# migrate_catalog()'s straight `col in row` lookup below silently found
+# nothing for these four and they went permanently NULL -- confirmed live
+# 2026-09-13 (0/141,244 populated), found while scoping the backtick audit's
+# column comparison, unrelated to that bug. See devlog/worksheet.md Session 23.
+CATALOG_COLUMN_RENAME = {
+    'works_number': 'Works number',
+    'year_built': 'Year built',
+    'plant_code': 'Plant code',
+    'bw_image_no': 'BW_image_no',
+}
+
+# Sanity ceiling for the four CATALOG_COLUMN_RENAME columns specifically --
+# rat.catalog's varchar columns for all four are UNBOUNDED (confirmed live,
+# 2026-09-13: no character_maximum_length at all), so the length check
+# batch_upsert() already does for length-constrained columns can't catch
+# anything here. Found exactly one genuine case backfilling these for the
+# first time: image_no cmuk0089's "Year built" holds a 31,008-character
+# runaway paste (the same short phrase repeated ~350 times) -- a real
+# FileMaker data-entry error, not this pipeline's doing. Every other value
+# across all four columns tops out under 220 chars; 500 is a generous
+# margin above that, so this only catches genuine garbage, not real longer
+# annotations (127 rows legitimately run 21-100 chars in Year built alone).
+CATALOG_RENAMED_COLUMN_MAX_LEN = 500
+
 def migrate_catalog(df):
     """Migrate catalog data to Supabase."""
     tgt_table = 'catalog'
@@ -1155,19 +1182,38 @@ def migrate_catalog(df):
     # Get the target table structure
     Catalog = get_table('catalog', tgt_schema)
     # Get list of valid column names from the SQLAlchemy Table object
-    valid_columns = [c.name for c in Catalog.columns] 
+    valid_columns = [c.name for c in Catalog.columns]
     #logger.debug(f"{tgt_table}: Valid columns in target schema: {valid_columns}")
     catalog_data = OrderedDict()
-    
+
     for _, row in df.iterrows():
         try:
-            image_no = stripy(row['image_no']) 
-            # Create data dictionary with only valid columns
+            image_no = stripy(row['image_no'])
+            # Create data dictionary with only valid columns. CATALOG_COLUMN_RENAME
+            # maps a target column to its differently-named staging source column
+            # where the two don't already match verbatim (see its own docstring).
             record = {
-                col: row[col] 
-                for col in valid_columns 
-                if col in row and col not in ['id', 'created_date']  # Exclude auto-generated columns
-            }          
+                col: row[CATALOG_COLUMN_RENAME.get(col, col)]
+                for col in valid_columns
+                if CATALOG_COLUMN_RENAME.get(col, col) in row and col not in ['id', 'created_date']  # Exclude auto-generated columns
+            }
+            # Quarantine (not silently truncate or load) any of the four
+            # renamed, unbounded-length columns that's implausibly long for
+            # what it is -- see CATALOG_RENAMED_COLUMN_MAX_LEN's own docstring.
+            for col in CATALOG_COLUMN_RENAME:
+                val = record.get(col)
+                if isinstance(val, str) and len(val) > CATALOG_RENAMED_COLUMN_MAX_LEN:
+                    reject_log.log_reject(
+                        config, target_profile, source_script="db_dml_loader.py", stage="load",
+                        severity="reject", image_no=image_no, table_name=tgt_table,
+                        reason=(f"catalog.{col} is {len(val)} chars, implausible for this field "
+                                f"(max sane length elsewhere in this column: "
+                                f"{CATALOG_RENAMED_COLUMN_MAX_LEN}) -- likely a FileMaker "
+                                f"data-entry error (e.g. a runaway paste), not loaded. "
+                                f"First 200 chars: {val[:200]!r}"),
+                        source_data={col: val}, run_id=run_id,
+                    )
+                    record[col] = None
             catalog_data[image_no] = record
         except Exception as e:
             logger.error(f"{tgt_table}: Error processing catalog entry {row.get('image_no', 'unknown')}: {str(e)}")
