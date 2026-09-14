@@ -3133,13 +3133,40 @@ overwriting, confirmed no information lost (same layout, properties panel open i
 - The two scope gaps (`rat.collection`/`rat.route` missing columns) — documented, not implemented.
   Real next step if picked up: resolve the PII/public-exposure question first, then add columns +
   migration logic.
-- General validation pass currently only covers `rat.catalog` (via `migrate_catalog()`) — other
-  `migrate_*` functions (organisation, location, route, builder, etc.) don't have it yet. Natural
-  follow-up if further junk data turns up in those tables.
+
+### Update, same day — the same staging-vs-target check run against organisation/location/builder
+
+User asked to repeat the collection/route comparison for these three. Two came back clean:
+**`organisation`** (`type`/`country_id`, 1522/1522 populated) and **`location`** (`country_id`,
+14178/14178 populated) — both fully populated already, and their FileMaker lookup screens
+(`rat_lookup__org_area.png`/`rat_lookup__location.png`, already in the reference folder) confirm
+they're plain name-pick value lists on the FileMaker side — nothing richer being entered that
+isn't already captured.
+
+**`builder` was the exact same dead-column bug as this morning's `migrate_catalog()` fix.**
+`rat.builder.plant_code`/`builder_plant`/`remarks` are real target columns, and
+`rat_migration.ratbuilders` already carries the matching staging data (`Plant code`/
+`Builder plant`/`Remarks`) — but `migrate_builder()` never read or wrote any of the three:
+**0/518 populated**, confirmed live before touching anything. Unlike the collection/route gaps,
+no PII concern here (plant codes and manufacturer remarks about locomotive builders, not people),
+so this one was fixed immediately rather than just documented — same treatment as the catalog
+columns: added the three fields to `migrate_builder()`'s read/write, applied the same general
+data-entry-error guard (reusing `GENERAL_TEXT_MAX_LEN`/`_looks_like_runaway_repetition()` as-is,
+no new logic needed), dry-run validated against all 352 real non-empty staging values first (0
+flags, clean — no outliers this time, unlike `cmuk0089`), then backfilled live: 29/290/32 rows
+populated respectively, `builder` count unchanged at 518, same 0-error/1-known-NULL-row outcome
+as every other Stage 2 run this session.
+
+### Open Threads
+
+- General validation pass now covers `migrate_catalog()` and `migrate_builder()` — other
+  `migrate_*` functions (organisation, location, route, collection, etc.) still don't have it.
+  Lower priority now that a second real staging-vs-target sweep (collection/route/organisation/
+  location/builder) only turned up the one further case.
 - *(Carried, unchanged)*: thumbnail size gap; Migration Overview's full `rat.*`-comparison
   redesign; the 16 flagged source records; `--mode dml_files` parser rewrite; `PicaLocoBackend`/
   `picaloco` rebrand (still gated on stability); restore procedure not rehearsed; `picaloco_agent`
   distribution blocked on the deferred AV/code-signing decision (Session 22); `gui/logs/` stray
-  leftover cleanup.
+  leftover cleanup; the collection/route scope gaps (documented only, PII question unresolved).
 
 ---

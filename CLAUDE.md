@@ -401,6 +401,16 @@ changing a value in transit, before assuming either.
     `rat_orig_app_details.txt` (the main
     "Data entry" layout's documented tab order). See `devlog/worksheet.md` Session 23 for the
     conversation that produced these.
+  - **Same staging-vs-target check run against `organisation`/`location`/`builder` — one real hit.**
+    `organisation` (`type`/`country_id`, 1522/1522 populated) and `location` (`country_id`,
+    14178/14178 populated) have no gap — both fully populated, and their FileMaker lookup screens
+    (`rat_lookup__org_area.png`/`rat_lookup__location.png`) confirm they're plain name-pick value
+    lists, nothing richer to capture. **`builder` had the exact same dead-column bug as
+    `migrate_catalog()`'s columns above:** `rat.builder.plant_code`/`builder_plant`/`remarks` were
+    0/518 populated despite `rat_migration.ratbuilders` already carrying the matching data — fixed
+    the same session, dry-run validated (0 flags across 352 real values) then backfilled live:
+    29/290/32 rows populated. No PII concern here (plant codes and manufacturer remarks), so unlike
+    the collection/route gaps above, this one was fixed immediately rather than just documented.
 
 ---
 
