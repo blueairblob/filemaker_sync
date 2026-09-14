@@ -3063,9 +3063,40 @@ placeholder values (`clean_record_data()`'s existing stripping correctly treats 
 verified via a direct query before trusting the smaller numbers, not assumed. Same 0-error,
 1-known-NULL-image_no-row outcome as every prior Stage 2 run this session.
 
+### Update, same day — the general validation pass, built and dry-run-validated before going live
+
+Generalized the `cmuk0089`-specific length check into something covering every text column
+`migrate_catalog()` writes — the actual "broader export-time validation" the client asked for, not
+just the one narrow case. Two signals, not one fixed length (a single ceiling can't span a 4-digit
+year and a 2,294-character description): a generous 5,000-char backstop, plus
+`_looks_like_runaway_repetition()` — compresses the value and checks the ratio, catching "a short
+phrase pasted hundreds of times" (the actually-confirmed real failure mode) independent of what
+"normal length" means for any given column.
+
+**Did not trust this on the first pass, and that mattered.** Wrote a read-only dry-run script
+first — pulled all ~1,096,429 non-empty text values from live staging and ran the new check against
+every one, *before* wiring anything into a real load. Result: **16 flags, 15 of which were false
+positives.** Looked at them rather than assuming the check was right: a genuine short value (e.g.
+`"5634"` in `Works number`) padded with roughly 200 characters of trailing whitespace compresses
+"well" as a raw string (mechanically true — lots of repeated spaces), but is completely fine once
+stripped — which is exactly what `clean_record_data()` does before insertion anyway. Fixed by
+checking the *stripped* value, matching what actually lands in the database, not the raw staging
+one. Re-ran the dry run: **exactly 1 flag**, the already-confirmed `cmuk0089` case, 0 false
+positives across the full dataset. Only then ran it live against real `oci` (full Stage 2): same
+single result, row count unchanged, confirming the dry run's finding held at the real write path
+too. The new reject_log row for the same `cmuk0089` case was resolved with a note cross-referencing
+the earlier one from the narrower check.
+
+This closes out the "2 then 3" pair the user asked for in one sitting: dead columns fixed and
+backfilled, then the general validation pass built, dry-run-proven against real data, and confirmed
+live — three real fixes to `rat.catalog` today (upsert logic, dead columns, general validation),
+each checked before being trusted, none of them assumed.
+
 ### Open Threads
 
-- Broader export-time validation pass — in progress, next.
+- General validation pass currently only covers `rat.catalog` (via `migrate_catalog()`) — other
+  `migrate_*` functions (organisation, location, route, builder, etc.) don't have it yet. Natural
+  follow-up if further junk data turns up in those tables.
 - *(Carried, unchanged)*: thumbnail size gap; Migration Overview's full `rat.*`-comparison
   redesign; the 16 flagged source records; `--mode dml_files` parser rewrite; `PicaLocoBackend`/
   `picaloco` rebrand (still gated on stability); restore procedure not rehearsed; `picaloco_agent`

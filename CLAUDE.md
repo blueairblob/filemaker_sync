@@ -596,17 +596,31 @@ name. Backfilling live surfaced a genuine, previously-invisible data-entry error
 times) — quarantined (left `NULL`, logged with `resolution='flagged_for_source_fix'`) rather than
 loaded verbatim, since these four columns are unbounded `varchar` and nothing else in the pipeline
 would have caught it. Backfilled 79,942/105,694/25,002/162 rows correctly (the gap from staging's
-raw non-empty counts is whitespace-only placeholders, correctly stripped). See
-`devlog/worksheet.md` Session 23 for the complete discovery-to-fix narrative.
+raw non-empty counts is whitespace-only placeholders, correctly stripped).
+
+**Then built the general export-time validation pass the client actually asked for.**
+`migrate_catalog()` now checks *every* text column it writes (not just the 4 renamed ones) for two
+independent "this looks like a FileMaker data-entry accident" signals: a generous absolute length
+backstop (5,000 chars — `description`'s own legitimate max is 2,294) and compression-ratio
+repetition detection (`_looks_like_runaway_repetition()` — catches a short phrase pasted hundreds
+of times, the actually-confirmed real failure mode, independent of what "normal length" means for
+any given column). **Validated with a dry run against all ~1M non-empty text values in live staging
+before writing anything**: the first pass found 16 flags, 15 of which were false positives (a
+genuine short value like `"5634"` padded with ~200 chars of trailing whitespace, which compresses
+well raw but is fine once stripped) — fixed by checking the stripped value, matching what actually
+gets inserted; re-ran clean at exactly 1 flag, the one already-confirmed `cmuk0089` case. Ran live
+against real `oci`: same result, row count unchanged. See `devlog/worksheet.md` Session 23 for the
+complete discovery-to-fix narrative across all three pieces of work (upsert fix, dead columns,
+general validation).
 
 Smaller open threads: Migration Overview's full `rat.*`-comparison redesign
 (parked, no clean table mapping); `picture_metadata` untested against real images (no local files); the 16
 flagged source records (FileMaker-side); `--mode dml_files` parser rewrite (low priority,
 `migration_schema` mode works); `requirements.txt`'s `pandas==2.1.4` pin (no Python 3.13 wheel);
 `PicaLocoBackend`/`picaloco` rebrand (explicitly gated until stable — arguably close now, still not done);
-`supabase-edge-functions` crash-loop fix handed to user, not yet confirmed run; a broader ongoing
-export-time data-quality validation pass (general field checks on every future sync, not just the
-backtick bug or the one runaway-paste case) — the user's wider ask, in progress; `picaloco_agent` builds, installs, and runs
+`supabase-edge-functions` crash-loop fix handed to user, not yet confirmed run; the general
+validation pass covers only `rat.catalog` so far, not the other `migrate_*` tables — a natural
+follow-up if further "junk data" turns up elsewhere; `picaloco_agent` builds, installs, and runs
 (Session 22) but real distribution to a RAT volunteer is blocked on an unsigned-exe AV
 false-positive (Norton quarantines every build regardless of `--onefile`/`--onedir`) — code signing
 is the only mitigation that would actually generalize, deliberately deferred as a cost decision
