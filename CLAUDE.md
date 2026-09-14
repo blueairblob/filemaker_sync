@@ -367,6 +367,40 @@ changing a value in transit, before assuming either.
   Session 7 fixed on `oci`; not reconciled against the cloud target. 57,187 of those rows resolve to the
   `'UNK'` sentinel builder (real data — many trains genuinely have no resolvable builder code, but do carry
   real `plant_code`/`works_number`/`year_built`); this is now stable across re-runs, not growing.
+- **The real FileMaker data-entry layouts, from the user directly (Session 23), resolve several
+  previously-unclear questions:**
+  - **The mysterious `S`-prefixed `ratcatalogue` columns** (`Scountry`, `Sorganisation`, `Simage_no`,
+    `Sgauge`, `Sactive_area`, `Sfacility`, `Scorporate_body`, `Scollection`, `Sbuilder code`,
+    `Sworks number`, `Sroute`, `Slocation`) **are FileMaker's own "Search" layout criteria-storage
+    fields, not real catalog data** — confirmed against the actual Search layout screenshot, which
+    shows fields like `Simage_no`/`active_area` mapped 1:1 to these. Already correctly excluded from
+    `rat.catalog`'s column list; nothing to fix, just previously undocumented.
+  - **`Works number`/`Year built` are entered on the "Common carrier" and "Industrial" `RATcatalogue`
+    layouts** (not the main "Data entry" one, and not the separate `RATbuilders` layout, which is
+    only the builder *master list* editor, not a per-photo entry point) — on both, `Works no.` and
+    `Year built` sit immediately adjacent on the same row. Plausible (not confirmed) explanation for
+    the `cmuk0089` runaway-paste case (Session 23, "Loader status" above): a paste meant for
+    `Description` (further down the same screen) landing in `Year built` instead. The same
+    adjacency appears on both layouts, so it's a systemic form-design pattern, not a one-off.
+  - **Two real scope gaps, found by comparing the `RATcollections`/`RATroutes` layouts against what
+    actually lands in `rat.*`:** `rat_migration.ratcollections` already carries `photographer`,
+    `print_sales`, `internet_use`, `publications_use`, `contact`, `remarks`, `accession_number` —
+    none of which `rat.collection` has a column for (today just `name`/`owner`/`donor`/
+    `storage_location`). `rat_migration.ratroutes` already carries `organisation` ("Owning
+    organisation"), `country`, `remarks` — `rat.route` has none of them (today just `name`/
+    `start_location_id`/`end_location_id`). Both are genuinely extracted by Stage 1 already, just
+    never migrated by Stage 2. **Deliberately not acted on** — user's call: document only, don't
+    add the columns/migration logic yet. Worth flagging if picked up later: `rat.collection`'s
+    `owner`/`donor`/`contact` likely hold real people's names/contact details (donors/collectors,
+    not archive subjects) — the same kind of non-public-by-default consideration already applied to
+    `catalog.valuation`/`owners_ref` in `anon`'s grants (see `picaloco_web` Session 14).
+  - Full layout screenshots referenced above live in
+    `FileMakerPro_source_details/RAT_Original_App_Images/` (`rat_form__common_carrier.png`,
+    `rat_form__industrial.png`, `rat_form__ratcollections.png`, `rat_form__ratroutes.png`,
+    `rat_form__search.png` — the last four saved to disk this session, weren't there before) plus
+    `rat_orig_app_details.txt` (the main
+    "Data entry" layout's documented tab order). See `devlog/worksheet.md` Session 23 for the
+    conversation that produced these.
 
 ---
 
