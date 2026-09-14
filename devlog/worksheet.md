@@ -3092,8 +3092,47 @@ backfilled, then the general validation pass built, dry-run-proven against real 
 live — three real fixes to `rat.catalog` today (upsert logic, dead columns, general validation),
 each checked before being trusted, none of them assumed.
 
+### Update, same day — the user shared the real FileMaker forms, several open questions resolved
+
+User shared screenshots of the actual FileMaker Pro data-entry layouts — first the main "Data
+entry" screen (already covered above), then five more: Search, RATcollections, RATroutes,
+Industrial, RATbuilders. Framed as "shows how data is grouped wrt source app" — not a specific
+task, just useful ground truth. Worth having, and it resolved three real things with evidence
+instead of guessing:
+
+1. **The `S`-prefixed `ratcatalogue` columns mystery, solved.** `Scountry`/`Sorganisation`/
+   `Simage_no`/etc. — present in the live staging column dump from earlier this session but never
+   investigated — are FileMaker's own "Search" layout criteria-storage fields, confirmed directly
+   against the Search screenshot (`Simage_no`/`active_area`/etc. map straight onto it). Not a bug,
+   not migrated, nothing to fix — just previously an unexplained oddity.
+2. **The `Works number`/`Year built` adjacency generalizes.** Checked the "Industrial" layout
+   (same underlying `RATcatalogue` table as "Common carrier", different field arrangement) — same
+   two fields sit right next to each other there too. Reinforces, doesn't newly prove, the
+   `cmuk0089` runaway-paste hypothesis from earlier.
+3. **Two real, previously-unknown scope gaps**, found by directly querying what's actually in
+   staging vs. target: `rat_migration.ratcollections` already extracts `photographer`/
+   `print_sales`/`internet_use`/`publications_use`/`contact`/`remarks`/`accession_number`, none of
+   which `rat.collection` has a column for. `rat_migration.ratroutes` already extracts
+   `organisation`/`country`/`remarks`, none of which `rat.route` has. Both are Stage-1-already,
+   Stage-2-never gaps. **Flagged the PII angle before anyone acts on this**: `owner`/`donor`/
+   `contact` on collections almost certainly name real people (donors/collectors), the same kind of
+   thing this project already treats as non-public-by-default elsewhere (`catalog.valuation`/
+   `owners_ref`).
+
+**User's call: document only, don't touch the schema or migration logic yet.** Documented in
+`CLAUDE.md`'s "Verified facts". Also saved the four newly-shared screenshots into
+`FileMakerPro_source_details/RAT_Original_App_Images/` (they'd only existed in this chat's image
+cache otherwise) — caught and fixed my own mistake along the way: first commit of the CLAUDE.md
+write-up cited the images as already being on disk when they weren't yet; found on review, fixed
+by actually saving them before the real commit. One filename collision
+(`rat_form__search.png` already existed, an older capture) — checked the old content before
+overwriting, confirmed no information lost (same layout, properties panel open in the old one).
+
 ### Open Threads
 
+- The two scope gaps (`rat.collection`/`rat.route` missing columns) — documented, not implemented.
+  Real next step if picked up: resolve the PII/public-exposure question first, then add columns +
+  migration logic.
 - General validation pass currently only covers `rat.catalog` (via `migrate_catalog()`) — other
   `migrate_*` functions (organisation, location, route, builder, etc.) don't have it yet. Natural
   follow-up if further junk data turns up in those tables.
