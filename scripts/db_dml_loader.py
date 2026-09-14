@@ -1418,7 +1418,15 @@ def migrate_builder(df):
     tgt_table = 'builder'
     logger.info(f"{tgt_table}: Starting builder migration")
     # Assuming 'builder' and 'builder_location' columns exist in the DataFrame
-    builders = df[['Builder code', 'Builder name', 'Location']].dropna(subset=['Builder code']).drop_duplicates()
+    # plant_code/builder_plant/remarks added 2026-09-14 -- rat.builder already
+    # had these columns and rat_migration.ratbuilders already carried the
+    # matching staging data ("Plant code"/"Builder plant"/"Remarks"), but this
+    # function never read or wrote any of the three: 0/518 populated despite
+    # real waiting data. Same dead-column pattern as migrate_catalog()'s
+    # works_number/year_built/plant_code/bw_image_no fix earlier this session
+    # -- see devlog/worksheet.md Session 23.
+    builders = df[['Builder code', 'Builder name', 'Location', 'Plant code',
+                    'Builder plant', 'Remarks']].dropna(subset=['Builder code']).drop_duplicates()
     builder_data = OrderedDict()
     Location = get_table('location', tgt_schema)
     # Fetch the location null value
@@ -1430,15 +1438,48 @@ def migrate_builder(df):
             location_id = get_location_id(Location, row['Location'], f"migrate_{tgt_table}: {builder_code}")
         else:
             location_id = location_nvl
-          
-        builder_data[builder_name] = {
+
+        record = {
             'code': builder_code,
             'name': builder_name,
-            'location_id': location_id
+            'location_id': location_id,
+            'plant_code': row['Plant code'],
+            'builder_plant': row['Builder plant'],
+            'remarks': row['Remarks'],
         }
-        
+        # Same general "looks like a FileMaker data-entry accident" guard as
+        # migrate_catalog() -- see GENERAL_TEXT_MAX_LEN/
+        # _looks_like_runaway_repetition()'s own docstrings. No outliers found
+        # backfilling these live (max lengths 5/41/176), but nothing stops a
+        # future entry from being one.
+        for col in ('plant_code', 'builder_plant', 'remarks'):
+            val = record.get(col)
+            if not isinstance(val, str):
+                continue
+            stripped = val.strip()
+            if not stripped:
+                record[col] = None
+                continue
+            if len(stripped) > GENERAL_TEXT_MAX_LEN:
+                reason = f"{len(stripped)} chars, exceeds the generous sanity ceiling ({GENERAL_TEXT_MAX_LEN})"
+            elif _looks_like_runaway_repetition(stripped):
+                reason = f"{len(stripped)} chars, looks like a repeated/copy-paste accident (compresses to under 10% of its size)"
+            else:
+                continue
+            reject_log.log_reject(
+                config, target_profile, source_script="db_dml_loader.py", stage="load",
+                severity="reject", table_name=tgt_table,
+                reason=(f"builder.{col} (builder_code={builder_code!r}) looks like a FileMaker "
+                        f"data-entry error: {reason}. Not loaded. First 200 chars: "
+                        f"{stripped[:200]!r}"),
+                source_data={col: val}, run_id=run_id,
+            )
+            record[col] = None
+
+        builder_data[builder_name] = record
+
     builder_data_lst = list(builder_data.values())
-    batch_upsert(f"{tgt_schema}.{tgt_table}", builder_data_lst, uniq_columns=['code']) 
+    batch_upsert(f"{tgt_schema}.{tgt_table}", builder_data_lst, uniq_columns=['code'])
     logger.info(f"Completed {tgt_table} migration. Migrated {len(builder_data)} builders")
 
 def stripy(txt):
