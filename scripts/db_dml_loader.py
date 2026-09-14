@@ -44,6 +44,7 @@ Version: 1.0
 
 import sys
 import os
+import zlib
 os.system('chcp 65001')  # Set console to UTF-8
 from pathlib import Path
 import re
@@ -1162,18 +1163,34 @@ CATALOG_COLUMN_RENAME = {
     'bw_image_no': 'BW_image_no',
 }
 
-# Sanity ceiling for the four CATALOG_COLUMN_RENAME columns specifically --
-# rat.catalog's varchar columns for all four are UNBOUNDED (confirmed live,
-# 2026-09-13: no character_maximum_length at all), so the length check
-# batch_upsert() already does for length-constrained columns can't catch
-# anything here. Found exactly one genuine case backfilling these for the
-# first time: image_no cmuk0089's "Year built" holds a 31,008-character
-# runaway paste (the same short phrase repeated ~350 times) -- a real
-# FileMaker data-entry error, not this pipeline's doing. Every other value
-# across all four columns tops out under 220 chars; 500 is a generous
-# margin above that, so this only catches genuine garbage, not real longer
-# annotations (127 rows legitimately run 21-100 chars in Year built alone).
-CATALOG_RENAMED_COLUMN_MAX_LEN = 500
+# General export-time data-quality validation (Session 23, 2026-09-14) -- the
+# client's own wider ask ("lots of junk in the FileMaker database"), which
+# the narrower CATALOG_RENAMED_COLUMN_MAX_LEN check above was the first,
+# column-specific instance of (found: image_no cmuk0089's "Year built" held
+# a 31,008-char runaway paste). Generalized to every text column
+# migrate_catalog() writes, via two independent signals rather than one
+# fixed length -- a single ceiling can't work across columns as different as
+# a 4-digit year and a 2000+-character photo description:
+#
+# 1. A generous absolute length backstop, for the "someone pasted an entire
+#    unrelated document into this field" case regardless of its content.
+# 2. Compression-ratio-based repetition detection -- catches the actually
+#    confirmed real-world failure mode (a short phrase repeated hundreds of
+#    times) independent of what "normal length" looks like for any given
+#    column, which a fixed ceiling per-column would need hand-tuning for.
+GENERAL_TEXT_MAX_LEN = 5000  # rat.catalog's own longest legitimate value today (description) is 2,294 chars
+
+def _looks_like_runaway_repetition(value: str) -> bool:
+    """True if `value` compresses far better than any real narrative text
+    would -- the signature of a short phrase pasted many times in a row,
+    not a length judgement. Threshold and minimum length chosen with
+    generous margin against the one confirmed real case (cmuk0089's Year
+    built: ~350x repetition of one ~40-char phrase, compresses to well
+    under 1% of its original size)."""
+    if len(value) < 200:
+        return False  # too short for a compression ratio to mean anything
+    compressed = zlib.compress(value.encode('utf-8', errors='ignore'), level=9)
+    return len(compressed) / len(value) < 0.10
 
 def migrate_catalog(df):
     """Migrate catalog data to Supabase."""
@@ -1197,23 +1214,40 @@ def migrate_catalog(df):
                 for col in valid_columns
                 if CATALOG_COLUMN_RENAME.get(col, col) in row and col not in ['id', 'created_date']  # Exclude auto-generated columns
             }
-            # Quarantine (not silently truncate or load) any of the four
-            # renamed, unbounded-length columns that's implausibly long for
-            # what it is -- see CATALOG_RENAMED_COLUMN_MAX_LEN's own docstring.
-            for col in CATALOG_COLUMN_RENAME:
-                val = record.get(col)
-                if isinstance(val, str) and len(val) > CATALOG_RENAMED_COLUMN_MAX_LEN:
-                    reject_log.log_reject(
-                        config, target_profile, source_script="db_dml_loader.py", stage="load",
-                        severity="reject", image_no=image_no, table_name=tgt_table,
-                        reason=(f"catalog.{col} is {len(val)} chars, implausible for this field "
-                                f"(max sane length elsewhere in this column: "
-                                f"{CATALOG_RENAMED_COLUMN_MAX_LEN}) -- likely a FileMaker "
-                                f"data-entry error (e.g. a runaway paste), not loaded. "
-                                f"First 200 chars: {val[:200]!r}"),
-                        source_data={col: val}, run_id=run_id,
-                    )
-                    record[col] = None
+            # Quarantine (not silently truncate or load) any text column whose
+            # value looks like a FileMaker data-entry accident -- see
+            # GENERAL_TEXT_MAX_LEN/_looks_like_runaway_repetition()'s own
+            # docstrings. image_no is excluded: it's the row's own natural
+            # key (nulling it would violate the NOT NULL constraint and break
+            # the row's identity), and its own corruption is already handled
+            # separately (InvalidKeyError / audit_backtick_corruption.py).
+            for col, val in list(record.items()):
+                if col == 'image_no' or not isinstance(val, str) or not val:
+                    continue
+                # Check the value clean_record_data() will actually insert
+                # (stripped), not the raw staging one -- dry-run testing
+                # against live staging found 15 false positives otherwise:
+                # a genuine short value (e.g. "5634") padded with ~200 chars
+                # of trailing whitespace compresses "well" on the raw string
+                # but is completely fine once stripped, same as it will be
+                # by the time it's actually inserted.
+                stripped = val.strip()
+                if not stripped:
+                    continue
+                if len(stripped) > GENERAL_TEXT_MAX_LEN:
+                    reason = f"{len(stripped)} chars, exceeds the generous sanity ceiling ({GENERAL_TEXT_MAX_LEN})"
+                elif _looks_like_runaway_repetition(stripped):
+                    reason = f"{len(stripped)} chars, looks like a repeated/copy-paste accident (compresses to under 10% of its size)"
+                else:
+                    continue
+                reject_log.log_reject(
+                    config, target_profile, source_script="db_dml_loader.py", stage="load",
+                    severity="reject", image_no=image_no, table_name=tgt_table,
+                    reason=(f"catalog.{col} looks like a FileMaker data-entry error: {reason}. "
+                            f"Not loaded. First 200 chars: {stripped[:200]!r}"),
+                    source_data={col: val}, run_id=run_id,
+                )
+                record[col] = None
             catalog_data[image_no] = record
         except Exception as e:
             logger.error(f"{tgt_table}: Error processing catalog entry {row.get('image_no', 'unknown')}: {str(e)}")
