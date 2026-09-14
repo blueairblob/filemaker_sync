@@ -3029,12 +3029,43 @@ real column IS its own natural key).
    `audit_backtick_corruption.py` one final time: **0 confirmed hits, 0 remaining drift.**
    `rat.catalog` is now, for the first time verifiably, in true sync with FileMaker.
 
-### Open Threads (final, this session)
+### Update, next day (2026-09-14) — dead columns fixed, a real "junk data" case found in the wild
 
-- `rat.catalog.works_number`/`year_built`/`plant_code`/`bw_image_no` are dead columns (never
-  populated, column-name mismatch in `migrate_catalog()`) — newly discovered, not yet fixed.
-- Broader export-time validation pass (general field-quality checks on every future sync, not just
-  this one historical bug) — explicitly deferred to a follow-up, not this session.
+User picked the next two items off the list together: fix the dead `rat.catalog` columns, then
+build the broader validation pass. Dead columns first.
+
+**Root cause, quick fix:** `migrate_catalog()` copies `row[col]` into the target record only where
+`col` (the target column name) also exists verbatim as a key in `row` (the staging DataFrame).
+`works_number`/`year_built`/`plant_code`/`bw_image_no` never matched their FileMaker raw names
+(`"Works number"`/`"Year built"`/`"Plant code"`/`"BW_image_no"`), so they'd been silently, entirely
+unpopulated since this codebase's earliest days. New `CATALOG_COLUMN_RENAME` dict fixes the lookup.
+
+**Checked before backfilling, not after:** queried staging for each column's actual data volume and
+max length before running anything against live `oci` — `works_number`/`plant_code`/`bw_image_no`
+all looked sane (max lengths 220/6/8), but `year_built`'s max length was **31,008 characters**, a
+wild outlier against a normal 4-digit year. Investigated rather than shipped: exactly one row,
+`image_no` `cmuk0089`, held `"1966 vgv"` followed by the same short phrase (`"Type 3 Co-Co diesel
+electric number 6860"`) repeated ~350 times — a genuine FileMaker data-entry error (a runaway
+paste), not anything this pipeline did. **This is precisely the kind of "junk in the FileMaker
+database" the client described wanting found and corrected** — a real, concrete instance, not a
+hypothetical.
+
+Since all four target columns are unbounded `varchar` (confirmed live — no
+`character_maximum_length` at all), nothing else in this pipeline would ever have caught this.
+Added a length-sanity guard (`CATALOG_RENAMED_COLUMN_MAX_LEN = 500`, comfortably above every
+legitimate value seen across all four columns) — quarantines rather than loads: sets the field to
+`NULL` and logs to `reject_log` with `resolution='flagged_for_source_fix'`, noting the real year
+(1966) is recoverable from the start of the garbage value for whoever cleans it up in FileMaker.
+
+**Backfilled live against real `oci`:** 79,942 / 105,694 / 25,002 / 162 rows populated respectively.
+The gap from staging's raw non-empty counts (109,685 / 122,306 / 26,886) is entirely whitespace-only
+placeholder values (`clean_record_data()`'s existing stripping correctly treats `"  "` as empty) —
+verified via a direct query before trusting the smaller numbers, not assumed. Same 0-error,
+1-known-NULL-image_no-row outcome as every prior Stage 2 run this session.
+
+### Open Threads
+
+- Broader export-time validation pass — in progress, next.
 - *(Carried, unchanged)*: thumbnail size gap; Migration Overview's full `rat.*`-comparison
   redesign; the 16 flagged source records; `--mode dml_files` parser rewrite; `PicaLocoBackend`/
   `picaloco` rebrand (still gated on stability); restore procedure not rehearsed; `picaloco_agent`
