@@ -667,14 +667,31 @@ against real `oci`: same result, row count unchanged. See `devlog/worksheet.md` 
 complete discovery-to-fix narrative across all three pieces of work (upsert fix, dead columns,
 general validation).
 
+**Update (Session 23, continued): `rat.collection`/`rat.route`'s scope gaps fixed, then the
+thumbnail size gap closed.** The collection/route gap documented just above was picked back up the
+same session, PII question resolved directly (`anon` confirmed to already have full `SELECT` on
+both tables; `rat.collection.contact` confirmed to hold real people's details; user's explicit call
+to add it anyway, no restriction) rather than left parked — see `devlog/worksheet.md` for the full
+trace, including two real bugs found live (a `lookup_caches` ordering issue for the new FKs, and a
+whitespace-only value that slipped past the first fix attempt). Then: `export_images()`
+(`filemaker_extract.py`) now actually generates a `webp_mobile/` thumbnail — previously **nothing
+in this codebase ever did**, the historical thumbnail folder was a one-time external process, and
+`run_incremental_sync.py`'s own image step had been silently working around the gap by uploading
+the full-size `webp` instead. 320px fixed width (confirmed exactly against real historical files);
+file-size quality (35) is an empirically-tuned approximation, not an exact match — the original
+tool/settings are unknown, single knob left in place to retune. Not validated end-to-end through a
+live FileMaker extraction (needs native Windows Python + ODBC) — worth a live Export Images/Delta
+Sync run to confirm.
+
 Smaller open threads: Migration Overview's full `rat.*`-comparison redesign
 (parked, no clean table mapping); `picture_metadata` untested against real images (no local files); the 16
 flagged source records (FileMaker-side); `--mode dml_files` parser rewrite (low priority,
 `migration_schema` mode works); `requirements.txt`'s `pandas==2.1.4` pin (no Python 3.13 wheel);
 `PicaLocoBackend`/`picaloco` rebrand (explicitly gated until stable — arguably close now, still not done);
 `supabase-edge-functions` crash-loop fix handed to user, not yet confirmed run; the general
-validation pass covers only `rat.catalog` so far, not the other `migrate_*` tables — a natural
-follow-up if further "junk data" turns up elsewhere; `picaloco_agent` builds, installs, and runs
+validation pass covers `rat.catalog`/`rat.builder`/`rat.route`/`rat.collection` now, not
+`organisation`/`location` (checked, deliberately not wired up — see "Verified facts" above); the
+new thumbnail generation not yet confirmed via a live FileMaker run; `picaloco_agent` builds, installs, and runs
 (Session 22) but real distribution to a RAT volunteer is blocked on an unsigned-exe AV
 false-positive (Norton quarantines every build regardless of `--onefile`/`--onedir`) — code signing
 is the only mitigation that would actually generalize, deliberately deferred as a cost decision

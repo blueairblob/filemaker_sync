@@ -3231,13 +3231,68 @@ into a real load.
 `accession_number` 12/66, `contact` 5/66, `remarks` 9/66. Row counts unchanged throughout (`route`
 2874, `collection` 66) — the whole exercise added data, never lost or duplicated any.
 
+### Update, same day — organisation/location checked for the general validation pass too
+
+User asked to extend the general validation pass there too. Both fields' real max lengths in live
+staging are tiny (`organisation` 78 chars, `organisation_type` 14, `location` 39) and 0 flags came
+back from a direct check against every distinct value. Deliberately **not wired up**, and said so
+plainly rather than doing it mechanically to tick the box: `organisation.name`/`location.name` are
+the tables' own natural keys (the upsert conflict target and the in-batch dedup key), so nulling one
+out on a false flag would break the row's identity — a real design cost for a check that's found
+nothing across two full sweeps now. Same conclusion as `photographer` earlier: checked, clean, no
+code change.
+
+### Update, same day — the thumbnail size gap, actually closed
+
+Picked the next item off the list: the long-carried "thumbnail size gap" (new images upload at full
+size, ~13KB, instead of the historical thumbnail size, ~5.6KB). Traced the real mechanism before
+touching anything: `filemaker_extract.py`'s `export_images()` has only ever written ONE `.webp`
+variant, straight to the full-size `images/webp/` folder — no resize, no thumbnail step, anywhere,
+ever. `run_incremental_sync.py`'s own Delta Sync image step already knew this and worked around it
+deliberately: it explicitly passed `--webp-dir <export_path>/images/webp` to `upload_images_oci.py`,
+overriding that script's own correct default (`webp_mobile`, Session 17) to point at the full-size
+folder instead — not an oversight, a conscious stopgap for a gap that was never actually closed.
+
+**Reverse-engineered the historical convention from real files, not guessed.** Compared several
+`webp_mobile/` thumbnails against their `webp/` full-size counterparts directly: consistently
+**320px fixed width, height scaled proportionally** to preserve aspect ratio. `PIL`'s own
+`image.thumbnail((320, big))` does exactly this (constrained only by the unbounded height side).
+
+**File size took real back-and-forth, not a first-guess parameter.** Resizing the already-converted
+full-size `webp` and re-encoding landed consistently ~2x the historical byte size, regardless of
+quality tuning (tried 90 down to 50, plus max compression effort — the gap barely moved). Asked the
+user directly rather than keep guessing blind; they confirmed the real historical process went
+**JPG → webp**, not webp → webp. Testing that path (using the real local `.jpg` files as source)
+still landed ~2x too big at PIL's default quality — pushed the quality parameter down further
+(tested 45/40/35/30) until landing close: **quality=35** lands within roughly 10-40% of each
+individual historical file's size on a small sample, and **1.27x the historical total on a random
+15-file sample** (down from ~2x) — checked broadly, not just on the files already used for tuning.
+One real, low-impact edge case found in that same broad check: an already-smaller-than-320px source
+image stays unscaled (`PIL`'s `thumbnail()` never enlarges), where the historical process
+apparently applied a small extra scale-down even to already-small images — affects a minority of
+a large archive, size difference trivial, not chased further.
+
+**Built correctly the first time, not by accident:** the actual code opens `image_data` (the raw
+JPG bytes from FileMaker's container field, the same source the `.jpg` export branch writes
+unmodified) independently for each variant needed, rather than reusing a single mutated `Image`
+object across both saves — avoids an ordering bug where `webp_file` already existing from an
+earlier run (skipping that branch) would otherwise have left `image` undefined for the thumbnail
+branch. `webp_mobile_pth` (using config's own `[export].thumbnail_path` key, matching
+`upload_images_oci.py`'s existing convention) added alongside `jpg_pth`/`webp_pth` in the
+path-creation block. `run_incremental_sync.py`'s `--webp-dir` override removed — `upload_images_oci.py`'s
+own default is correct now that there's something real to find there.
+
+**Not validated end-to-end** — this whole trace was validated by testing the actual resize/encode
+logic directly against real local `.jpg`/`webp_mobile` files (not a live FileMaker run, which needs
+native Windows Python + ODBC, unavailable from this session). A real Export Images or Delta Sync
+run against live FileMaker is the natural next confirmation step, not yet done.
+
 ### Open Threads
 
-- General validation pass still only covers `migrate_catalog()`/`migrate_builder()` — the shared
-  `_quarantine_data_entry_errors()` helper now exists and is used by `migrate_route()`/
-  `migrate_collection()` too, but `organisation`/`location` still don't have it (lower priority,
-  neither has shown any real issue in two separate sweeps).
-- *(Carried, unchanged)*: thumbnail size gap; Migration Overview's full `rat.*`-comparison
+- Live FileMaker run to confirm the new thumbnail generation actually works end-to-end through the
+  real extraction path (Export Images or Delta Sync) — validated so far only by testing the same
+  logic directly against real local files.
+- *(Carried, unchanged)*: Migration Overview's full `rat.*`-comparison
   redesign; the 16 flagged source records; `--mode dml_files` parser rewrite; `PicaLocoBackend`/
   `picaloco` rebrand (still gated on stability); restore procedure not rehearsed; `picaloco_agent`
   distribution blocked on the deferred AV/code-signing decision (Session 22); `gui/logs/` stray
