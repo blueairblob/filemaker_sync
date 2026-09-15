@@ -3157,6 +3157,12 @@ flags, clean — no outliers this time, unlike `cmuk0089`), then backfilled live
 populated respectively, `builder` count unchanged at 518, same 0-error/1-known-NULL-row outcome
 as every other Stage 2 run this session.
 
+**Photographer checked too, same day — no gap.** `rat.photographer` has only `id`/`name`/audit
+columns (nothing else to be dead), derived from `ratcatalogue`'s own column like organisation/
+location, not a separate staging table. Confirmed against `rat_lookup__photographer.png` (a plain
+name-pick dropdown) — nothing richer captured on the FileMaker side either. Count 270, matches the
+already-documented figure. Nothing to fix.
+
 ### Open Threads
 
 - General validation pass now covers `migrate_catalog()` and `migrate_builder()` — other
