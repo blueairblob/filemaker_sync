@@ -3342,12 +3342,49 @@ known count, and careful code review of the widget's `None`-handling) wasn't wor
 capturing more unrelated personal content on what's clearly an actively-used personal/work machine.
 Widget correctness rests on code review + the live JSON validation, not a screenshot, for this one.
 
+### Update, same day — the 16 flagged source records, turned into an actual hand-off artifact
+
+Second half of the combined pick. `db_sync_manifest.py --preview` has reported this same debris
+every run since Session 5 — 13 duplicate `image_no` values, 3 NULL-`image_no` rows — but only ever
+as bare identifiers in scrollback: a `br690530` or a FileMaker `ROWID` with no description/date to
+help a volunteer actually find the record in the FileMaker UI, and nothing persisted once the
+terminal output scrolled away. No prior session had turned this into something actionable.
+
+**New `scripts/audit_key_debris.py`** re-runs the same skinny-scan logic (not duplicated — it's a
+`SELECT image_no, ROWID FROM ratcatalogue` scan) to find the current UNKEYED/DUPLICATE rows, then
+does one follow-up ODBC query per bucket to pull real context (`description`, `category`,
+`date_taken`, `entry_date`, `collection`, `organisation`, `route`, `location`) for just those rows.
+Each row is logged into `rat_migration.reject_log` via `reject_log.log_reject()` (severity
+`"reject"`, `source_script="audit_key_debris.py"`, left unresolved — this is a standing FileMaker-
+side issue, not something this pipeline can fix itself) with a reason string a volunteer can act on
+directly, e.g. *"Duplicate image_no 'br703412' (4 FileMaker rows share this exact key, distinct
+photos)... Fix: retype this row's image_no to a unique value in FileMaker."* `--export` reuses
+`reject_log.py`'s own `_export_xlsx()` so there's still only one report shape in this codebase, not
+a second bespoke one.
+
+**Confirmed live (2026-09-15) against real FileMaker + `oci`:** 13 duplicate `image_no` values
+across 28 source rows (`br703412` actually has *4* rows sharing one key, not 2 — the manifest's
+truncated console display only ever showed the bare list of 13 values, never the per-value row
+count) + 3 NULL-`image_no` rows = **16 distinct issues**, matching the "16 flagged source records"
+figure exactly (13 + 3, not 16 physical rows). Pulling real context confirmed something worth
+knowing: every duplicate group's rows have genuinely different descriptions/dates (e.g. `br801023`
+is a Duro Đaković 2-6-2 at Nadiad Junction *and*, under the same key, a WAM4 electric at the same
+station) — these are **not** accidental double-scans of one photo, they're distinct photos that
+independently got the same mistyped `image_no`. The 3 unkeyed rows are blank stubs (every field
+NULL except an `entry_date` — 2008-04-02, 2009-11-30, 2023-05-05), consistent with abandoned drafts
+rather than photos missing just their key. 31 rows (28 dup + 3 unkeyed) logged to
+`rat_migration.reject_log` (`run_id=20260915T202747Z-1c0a04`) and exported to
+`rejects_key_debris_20260915.xlsx` for a volunteer without DB access. Re-running later is safe and
+self-correcting: fixed rows simply won't be found by the scan any more, nothing to clean up here.
+
 ### Open Threads
 
 - Migration Overview's widget rendering not visually confirmed (see the privacy note above) —
   correctness rests on code review + live JSON validation instead. Worth a real look next time
   someone's at the GUI with a mouse.
-- 16 flagged source records — next.
+- The 16 flagged source records are now a persisted, actionable hand-off (`reject_log` +
+  `rejects_key_debris_20260915.xlsx`) — still needs an actual RAT volunteer with FileMaker access
+  to do the retyping/deletion; nothing left for this pipeline to do until that happens.
 - *(Carried, unchanged)*: `--mode dml_files` parser rewrite; `PicaLocoBackend`/`picaloco` rebrand
   (still gated on stability); restore procedure not rehearsed; `picaloco_agent` distribution
   blocked on the deferred AV/code-signing decision (Session 22); `gui/logs/` stray leftover

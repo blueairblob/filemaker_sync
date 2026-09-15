@@ -529,6 +529,7 @@ python.exe scripts/fm_metadata_probe.py --selftest
 | Incremental sync engine (scan/diff/manifest) | `scripts/db_sync_manifest.py` |
 | Incremental sync orchestrator (the actual periodic sync) | `scripts/run_incremental_sync.py` |
 | Persisted reject history (writer + admin CLI reader) — see "Current focus" Session 20 | `scripts/reject_log.py` |
+| The 16 flagged source records (dup/unkeyed `image_no`) — re-scan + hand-off report | `scripts/audit_key_debris.py` |
 | FileMaker metadata probe | `scripts/fm_metadata_probe.py` |
 | Shared secret resolution | `scripts/env_secrets.py` |
 | Ground-truth schema (reference only, not re-appliable) | `rat_schema_original.sql` |
@@ -690,8 +691,23 @@ tool/settings are unknown, single knob left in place to retune. Not validated en
 live FileMaker extraction (needs native Windows Python + ODBC) — worth a live Export Images/Delta
 Sync run to confirm.
 
+**Update (Session 23, continued): the 16 flagged source records turned into an actual hand-off, not
+just a console count.** New `scripts/audit_key_debris.py` re-scans the live source for the same
+UNKEYED/DUPLICATE debris `db_sync_manifest.py --preview` has always reported, pulls real context
+(description/date/collection/etc — the skinny scan alone only ever has `image_no`/`ROWID`) for each,
+and persists every row into `rat_migration.reject_log` plus an exportable `.xlsx`, giving a RAT
+volunteer something they can actually act on instead of bare `image_no`s/rowids in scrollback.
+Confirmed live 2026-09-15: 31 rows (28 duplicate-key rows across the 13 known values — `br703412`
+actually has 4 rows sharing one key, not 2 — plus 3 unkeyed) logged and exported to
+`rejects_key_debris_20260915.xlsx`. Pulling context also confirmed something worth knowing: every
+duplicate group's rows are genuinely distinct photos independently mistyped onto the same key, not
+double-scans of one photo. Remediation is still FileMaker-side (out of this pipeline's control by
+design) — this only makes the hand-off real.
+
 Smaller open threads: `picture_metadata` untested against real images (no local files); the 16
-flagged source records (FileMaker-side); `--mode dml_files` parser rewrite (low priority,
+flagged source records are now a persisted hand-off (`rat_migration.reject_log` +
+`rejects_key_debris_20260915.xlsx`) — still need a RAT volunteer with FileMaker access to actually
+fix them; `--mode dml_files` parser rewrite (low priority,
 `migration_schema` mode works); `requirements.txt`'s `pandas==2.1.4` pin (no Python 3.13 wheel);
 `PicaLocoBackend`/`picaloco` rebrand (explicitly gated until stable — arguably close now, still not done);
 `supabase-edge-functions` crash-loop fix handed to user, not yet confirmed run; the general
