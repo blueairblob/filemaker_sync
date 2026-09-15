@@ -1050,6 +1050,13 @@ def export_data(tab: dict, name: str, header_req: bool = True, footer_req = True
                     logger.error(f"Caused by: {cause}")
                 raise
                 
+# Empirically-tuned approximation of the historical webp_mobile/ thumbnails'
+# compression -- see export_images()'s own thumbnail-generation comment for
+# the full story and how this number was chosen. Not a reverse-engineered
+# exact match (the original tool/settings are unknown); retune here if a
+# closer or different balance is ever wanted.
+THUMBNAIL_WEBP_QUALITY = 35
+
 def export_images(table):
     # Export Content
     # Special Case of RATcatalogue.picture which is FMP "container" (blob) data - JPG images!
@@ -1122,24 +1129,69 @@ def export_images(table):
             # Check if the image file already exists in the export destination
             jpg_file = Path(f"{jpg_pth}/{image_name}.jpg")
             webp_file = Path(f"{webp_pth}/{image_name}.webp")
-            
+            webp_mobile_file = Path(f"{webp_mobile_pth}/{image_name}.webp")
+
             #jpg_b64 = base64.b64encode(image_data).decode('utf-8')
             # Temp
             #decoded_data=base64.b64decode((image_data))
             #write the decoded data back to original format in  file
             if 'jpg' in export_image_formats and not jpg_file.exists():
                 with open(jpg_file, 'wb') as f:
-                    f.write(image_data)       
+                    f.write(image_data)
                 f.close()
 
-            if 'webp' in export_image_formats and not webp_file.exists():
-                # Convert to webp
-                image = Image.open(BytesIO(image_data))
-                webp_data = BytesIO()
-                image.save(webp_data, format="webp")
-                with open(webp_file, 'wb') as f:
-                    f.write(webp_data.getvalue())
-                f.close()
+            # Thumbnail (webp_mobile) generation -- added 2026-09-15. Never
+            # existed anywhere in this pipeline before: the historical
+            # webp_mobile/ folder (~5.6KB/file avg, 320px fixed width,
+            # proportional height -- reverse-engineered live from the real
+            # files, not guessed) was a one-time external process, never
+            # reproduced by this script. Every image synced since then (any
+            # Delta Sync, or a Full Sync re-run) had nothing to put there, so
+            # run_incremental_sync.py's own image step worked around the gap
+            # by uploading the FULL-SIZE webp instead (~13KB/file, 2.5x the
+            # bytes) -- see devlog/worksheet.md Session 23 for the trace.
+            # image.thumbnail((320, big)) resizes to fit within that box
+            # preserving aspect ratio -- since the height bound is
+            # effectively unbounded, this always resizes to exactly 320px
+            # wide, matching the historical convention exactly (confirmed
+            # live against real historical files). Loads `image` from
+            # `image_data` directly (the JPG bytes from FileMaker's
+            # container field, same source the jpg branch above writes
+            # unmodified) rather than re-encoding the just-written full-size
+            # webp -- per the user directly: the historical thumbnails were
+            # made by converting JPG -> webp, not webp -> webp, and a
+            # from-webp resize measurably doesn't compress as well. Not
+            # reusing a variable from the full-size branch above for the
+            # same reason plus practicality: that branch is independently
+            # skipped whenever webp_file already exists from an earlier run.
+            #
+            # THUMBNAIL_WEBP_QUALITY=35 is an empirical approximation, not a
+            # reverse-engineered exact match -- the original tool/settings
+            # are unknown (a one-time external process, not code in this
+            # repo). Tested against 4 real historical files at several
+            # quality levels: 35 lands within ~10-40% of each file's real
+            # historical size (default PIL quality=80 was ~2x too big).
+            # Single easy knob to retune if a closer/different match is
+            # ever wanted.
+            need_webp = 'webp' in export_image_formats and not webp_file.exists()
+            need_mobile = 'webp' in export_image_formats and not webp_mobile_file.exists()
+            if need_webp or need_mobile:
+                if need_webp:
+                    image = Image.open(BytesIO(image_data))
+                    webp_data = BytesIO()
+                    image.save(webp_data, format="webp")
+                    with open(webp_file, 'wb') as f:
+                        f.write(webp_data.getvalue())
+                    f.close()
+
+                if need_mobile:
+                    thumb = Image.open(BytesIO(image_data))
+                    thumb.thumbnail((320, 1_000_000))
+                    webp_mobile_data = BytesIO()
+                    thumb.save(webp_mobile_data, format="webp", quality=THUMBNAIL_WEBP_QUALITY)
+                    with open(webp_mobile_file, 'wb') as f:
+                        f.write(webp_mobile_data.getvalue())
+                    f.close()
 
             # Convert to Base64
             #image_data_webp_b64 = base64.b64encode(webp_data.getvalue()).decode('utf-8')
@@ -1336,8 +1388,12 @@ if __name__ == "__main__":
         exp_pth = Path(export_dir).resolve()
     jpg_pth = Path(f"{exp_pth}/images/jpg")
     webp_pth = Path(f"{exp_pth}/images/webp")
+    # Same folder upload_images_oci.py already reads by default (config's
+    # own [export].thumbnail_path) -- see export_images()'s thumbnail
+    # generation for why this is needed now (Session 23).
+    webp_mobile_pth = Path(f"{exp_pth}/images/{cfg['export'].get('thumbnail_path', 'webp_mobile')}")
     # Check Paths exist
-    for pth in [exp_pth, jpg_pth, webp_pth]:
+    for pth in [exp_pth, jpg_pth, webp_pth, webp_mobile_pth]:
         if not os.path.exists(pth):
             logger.warning(f"{pth} does not exist creating")
             os.makedirs(pth)

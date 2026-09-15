@@ -494,10 +494,15 @@ def main() -> int:
                 finally:
                     os.unlink(img_delta_file)
 
-                export_path = cfg.get("export", {}).get("path", "export")
-                webp_dir = os.path.join(export_path, "images", "webp")
+                # No --webp-dir override -- upload_images_oci.py's own default
+                # (config's [export].thumbnail_path, i.e. webp_mobile) is correct
+                # now that filemaker_extract.py --get-images actually generates a
+                # real thumbnail there (Session 23; it never used to, which is why
+                # this explicitly pointed at the full-size webp/ folder before --
+                # uploading the wrong, 2.5x-larger file was a deliberate stopgap
+                # for a gap that's now closed, not the intended behaviour).
                 run_subprocess([
-                    "upload_images_oci.py", "--webp-dir", webp_dir,
+                    "upload_images_oci.py",
                     "--image-nos", ",".join(images_to_sync), "--force",
                 ] + debug_flag, "upload_images_oci.py (images, delta)")
                 images_uploaded = len(images_to_sync)
