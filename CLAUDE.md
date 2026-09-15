@@ -142,12 +142,19 @@ launched the real GUI and confirmed the startup connection-test's own log line s
 `--target-profile oci` reaching the real subprocess and connecting for real — widget rendering
 itself not visually confirmed (no way to see the Windows desktop from that session).
 
+**Migration Overview redesigned (Session 23) — no longer a limitation.** It now compares FileMaker
+against the real `rat.*` schema, not `rat_migration` staging. The stated blocker (no target for
+`ratcopyright`/`ratlabels`/`prompts`) turned out to only block those 3 tables, not the whole
+redesign: new `RAT_TARGET_TABLE_MAP` (`database_connections.py`) maps the 4 tables that *do* have a
+real target (`ratcatalogue`→`catalog`, `ratbuilders`→`builder`, `ratcollections`→`collection`,
+`ratroutes`→`route`); the 3 without one get an honest `no_target` status (not styled as a failure)
+rather than blocking anything. Validated live: every number matched this document's own already-known
+live counts exactly (`ratcatalogue` 141,262→141,244, `ratbuilders` 520→518, `ratroutes` 2892→2874,
+`ratcollections` 66→66). See `devlog/worksheet.md` Session 23.
+
 **Known, accepted limitations** (deliberate choices, not bugs):
 - Stop Action only cancels Full/Incremental/Delta Sync, Load to Target, and Export operations — Test
   Connections/Update Dashboard use a separate code path it doesn't touch.
-- Migration Overview's numbers reflect `rat_migration` staging, not the final `rat.*` schema — no clean
-  1:1 table mapping exists for `ratcopyright`/`ratlabels`/`prompts` to do a proper `rat.*`-comparison
-  redesign; parked as a separate, bigger piece of work.
 
 **`config.toml`'s `active_profile` is now `oci`** (was `supabase`). The old cloud project's pooler no
 longer resolves the tenant (`FATAL: tenant/user postgres.kmoehqdowgdupzdxtbei not found` — found live in
@@ -683,8 +690,7 @@ tool/settings are unknown, single knob left in place to retune. Not validated en
 live FileMaker extraction (needs native Windows Python + ODBC) — worth a live Export Images/Delta
 Sync run to confirm.
 
-Smaller open threads: Migration Overview's full `rat.*`-comparison redesign
-(parked, no clean table mapping); `picture_metadata` untested against real images (no local files); the 16
+Smaller open threads: `picture_metadata` untested against real images (no local files); the 16
 flagged source records (FileMaker-side); `--mode dml_files` parser rewrite (low priority,
 `migration_schema` mode works); `requirements.txt`'s `pandas==2.1.4` pin (no Python 3.13 wheel);
 `PicaLocoBackend`/`picaloco` rebrand (explicitly gated until stable — arguably close now, still not done);

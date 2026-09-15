@@ -3292,10 +3292,65 @@ run against live FileMaker is the natural next confirmation step, not yet done.
 - Live FileMaker run to confirm the new thumbnail generation actually works end-to-end through the
   real extraction path (Export Images or Delta Sync) — validated so far only by testing the same
   logic directly against real local files.
-- *(Carried, unchanged)*: Migration Overview's full `rat.*`-comparison
-  redesign; the 16 flagged source records; `--mode dml_files` parser rewrite; `PicaLocoBackend`/
-  `picaloco` rebrand (still gated on stability); restore procedure not rehearsed; `picaloco_agent`
-  distribution blocked on the deferred AV/code-signing decision (Session 22); `gui/logs/` stray
-  leftover cleanup.
+- *(Carried, unchanged)*: the 16 flagged source records; `--mode dml_files` parser rewrite;
+  `PicaLocoBackend`/`picaloco` rebrand (still gated on stability); restore procedure not rehearsed;
+  `picaloco_agent` distribution blocked on the deferred AV/code-signing decision (Session 22);
+  `gui/logs/` stray leftover cleanup.
+
+### Update, same day — Migration Overview redesigned, the blocker turned out to be narrower than assumed
+
+User picked two items together: Migration Overview's redesign and the 16 flagged source records.
+Migration Overview first. The stated blocker for several sessions ("no clean 1:1 table mapping
+exists for `ratcopyright`/`ratlabels`/`prompts`") turned out, on actually looking, to only block
+those *3 tables specifically* — the other 4 staging tables (`ratcatalogue`/`ratbuilders`/
+`ratcollections`/`ratroutes`) map cleanly to `catalog`/`builder`/`collection`/`route`, and nothing
+about the 3 orphans should have stopped a real comparison for the other 4.
+
+**New `RAT_TARGET_TABLE_MAP`** (`database_connections.py`) encodes that mapping explicitly, and a
+new `get_final_target_table_counts()` queries the real `rat` schema (not `rat_migration`) using it.
+`filemaker_extract_refactored.py`'s `run_migration_status()` now uses this, with a new `no_target`
+status for the 3 excluded tables — deliberately distinct from `source_error`/`target_error` (a real
+connection failure) and `not_migrated` (implies a target exists and is empty), so they show up
+honestly rather than looking like 3 failures. Also fixed the completion percentage's denominator to
+only sum source rows for tables that *have* a target — summing all 7 tables' source rows against
+only 4 tables' worth of target rows would have made the percentage artificially low for reasons
+that have nothing to do with migration completeness.
+
+**GUI**: relabeled "Staging"/"Staging Match %" back to "Target"/"Target Match %" — Session 13's
+relabeling was honest at the time (it really was only staging), and is now honest again in the
+other direction. Added the `no_target` display (`"— No target"`, not styled as an error), fixed
+`target_rows` formatting to handle `None` safely (the old staging-only code never needed to, since
+staging always returns a real count or an error sentinel), and excluded no-target tables from the
+"Tables Migrated" stat's own denominator for the same "don't look like 3 failures" reasoning.
+
+**Validated live**, not just by reading the diff: ran `filemaker_extract_refactored.py
+--migration-status --json` against real FileMaker + `oci` (via `python.exe`, WSL interop). Every
+number matched this document's own already-known live counts exactly — `ratcatalogue` 141,262→
+141,244 (99.99%), `ratbuilders` 520→518, `ratroutes` 2892→2874, `ratcollections` 66→66 (100%) — and
+`prompts`/`ratcopyright`/`ratlabels` correctly showed `no_target`, not counted as errors.
+
+**A real privacy incident, handled directly rather than glossed over.** Tried to also verify the
+GUI widget's rendering visually: since Migration Overview only updates on a button click this
+session has no way to simulate (no mouse control), built a standalone harness that feeds the real
+captured JSON straight into `MigrationOverview.update_overview()` and takes a full-desktop
+screenshot. The harness window auto-closed (a 1-second timer, too short) before the screenshot
+fired, so the resulting image captured **the user's actual desktop** instead — WhatsApp
+conversations, contact names, other personal browser tabs. Flagged this to the user immediately and
+plainly, deleted the file right away, and did **not** retry with a longer delay — decided the
+marginal value of a visual confirmation (on top of already-strong evidence: live JSON matching every
+known count, and careful code review of the widget's `None`-handling) wasn't worth the risk of
+capturing more unrelated personal content on what's clearly an actively-used personal/work machine.
+Widget correctness rests on code review + the live JSON validation, not a screenshot, for this one.
+
+### Open Threads
+
+- Migration Overview's widget rendering not visually confirmed (see the privacy note above) —
+  correctness rests on code review + live JSON validation instead. Worth a real look next time
+  someone's at the GUI with a mouse.
+- 16 flagged source records — next.
+- *(Carried, unchanged)*: `--mode dml_files` parser rewrite; `PicaLocoBackend`/`picaloco` rebrand
+  (still gated on stability); restore procedure not rehearsed; `picaloco_agent` distribution
+  blocked on the deferred AV/code-signing decision (Session 22); `gui/logs/` stray leftover
+  cleanup.
 
 ---
