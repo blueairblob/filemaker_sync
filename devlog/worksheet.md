@@ -3169,10 +3169,78 @@ already-documented figure. Nothing to fix.
   `migrate_*` functions (organisation, location, route, collection, etc.) still don't have it.
   Lower priority now that a second real staging-vs-target sweep (collection/route/organisation/
   location/builder) only turned up the one further case.
+
+### Update, next day (2026-09-15) — the collection/route gaps, picked back up and fixed
+
+User picked "1" off the open-threads list — the collection/route scope gaps, parked the prior
+session pending the PII question. Resolved the actual question first rather than assuming: queried
+live `oci` directly and confirmed `anon` already has full `SELECT` on `rat.collection`/`rat.route`
+as whole tables (not just via `mobile_catalog_view`) — so any column added becomes instantly public,
+not a hypothetical. Broke down which of the missing fields were actually risky: `rat.route`'s three
+(`organisation`/`country`/`remarks`) are all structural/geographic, no concern. `rat.collection`'s
+`contact` was the real one — sampled the live data before asking, and it's genuinely real people's
+details (`'[real name and full postal address - redacted]'`, full names). Presented three real options
+(restrict `contact` via column-level grants / skip it entirely / add it with no restriction, same as
+the already-public `owner`/`donor`) rather than picking one. **User's explicit call: add everything,
+no restriction.** Proceeding on that basis, not a default.
+
+**Schema:** new `supabase/schema/add_collection_route_columns.sql` — `rat.route` gets
+`organisation_id`/`country_id` (FKs, matching the `location_id`/`country_id` convention already used
+everywhere else in this schema, not raw duplicated text) and `remarks`; `rat.collection` gets
+`photographer_id` (FK, same reasoning), `print_sales`/`internet_use`/`publications_use` (booleans,
+matching `usage`'s own identically-named columns), `accession_number`, `contact`, `remarks`. Applied
+directly against live `oci` (not blocked by anything, unlike DDL/grants in some past sessions — ran
+clean via the same `psycopg2` connection path used for every other live operation this session).
+Folded the same columns into `bootstrap_rat_schema.sql` for fresh-install parity — the two new FK
+constraints (`route_organisation_id_fkey`, `collection_photographer_id_fkey`) had to go in a
+separate guarded `DO $$` block after every `CREATE TABLE`, since `organisation`/`photographer` are
+defined *later* in that file than `route`/`collection`, so an inline FK there would fail at
+CREATE-TABLE time on a fresh install.
+
+**Loader:** `migrate_route()`/`migrate_collection()` now read and write all of it. Found and fixed a
+real ordering bug getting the new FKs to resolve: `lookup_caches['organisation']`/
+`['photographer']` were only ever rebuilt via the full `create_lookup_index_cache()` call *after*
+`migrate_catalog()` — too late, since `migrate_route()`/`migrate_collection()` run *before* that,
+same as the existing `country`/`location` caching already had to work around. Fixed by adding
+`cache_lookup_table('organisation', 'name')` right after `migrate_organisation()` and moving
+`migrate_photographer()` earlier (before `migrate_route`/`migrate_collection`) with its own cache
+call right after — matching the pattern the code already used for country/location, just extended
+to the two new FK types. Factored the by-now-three-times-repeated data-entry-error quarantine block
+into a shared `_quarantine_data_entry_errors()` (used for the two new call sites, `route.remarks`
+and `collection.contact`/`remarks`; left `migrate_catalog()`/`migrate_builder()`'s already-verified
+inline versions alone rather than risk touching working code for an unrelated fix).
+
+**A second real bug, found by not accepting "no data was lost" as good enough.** First backfill
+logged `"invalid input syntax for type numeric"` for 2 collections. Checked immediately rather than
+assuming it was benign: confirmed via count + name comparison that all 66 collections *did* land
+correctly (the bulk-insert failure fell back to a per-row retry that succeeded) — genuinely zero
+data loss. But traced the actual cause anyway instead of leaving noisy, misleading "Database error"
+lines for something that wasn't really an error: `accession_number` held a literal single space
+`' '` for exactly those two rows. First fix attempt (`pd.notna(...)`) didn't catch it — that only
+catches pandas `NaN`, not a whitespace-only string that's technically "not NA". Second attempt
+(`stripy(...) or None`) did. Re-ran a third time to confirm zero warnings, not just assumed the fix
+worked from reading the diff.
+
+**Dry-run validated before ever touching live data**, same discipline as every other fix this
+session: pulled all real `route.remarks`/`collection.contact`/`collection.remarks` values from
+staging first, ran the quarantine check against all of them read-only — 0 flags — before wiring it
+into a real load.
+
+**Final live counts:** `route.organisation_id` 2670/2874, `country_id` 2835/2874, `remarks`
+602/2874; `collection.photographer_id` 41/66, `print_sales`/`internet_use`/`publications_use` 64/66,
+`accession_number` 12/66, `contact` 5/66, `remarks` 9/66. Row counts unchanged throughout (`route`
+2874, `collection` 66) — the whole exercise added data, never lost or duplicated any.
+
+### Open Threads
+
+- General validation pass still only covers `migrate_catalog()`/`migrate_builder()` — the shared
+  `_quarantine_data_entry_errors()` helper now exists and is used by `migrate_route()`/
+  `migrate_collection()` too, but `organisation`/`location` still don't have it (lower priority,
+  neither has shown any real issue in two separate sweeps).
 - *(Carried, unchanged)*: thumbnail size gap; Migration Overview's full `rat.*`-comparison
   redesign; the 16 flagged source records; `--mode dml_files` parser rewrite; `PicaLocoBackend`/
   `picaloco` rebrand (still gated on stability); restore procedure not rehearsed; `picaloco_agent`
   distribution blocked on the deferred AV/code-signing decision (Session 22); `gui/logs/` stray
-  leftover cleanup; the collection/route scope gaps (documented only, PII question unresolved).
+  leftover cleanup.
 
 ---

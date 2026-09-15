@@ -383,17 +383,26 @@ changing a value in transit, before assuming either.
     `Description` (further down the same screen) landing in `Year built` instead. The same
     adjacency appears on both layouts, so it's a systemic form-design pattern, not a one-off.
   - **Two real scope gaps, found by comparing the `RATcollections`/`RATroutes` layouts against what
-    actually lands in `rat.*`:** `rat_migration.ratcollections` already carries `photographer`,
-    `print_sales`, `internet_use`, `publications_use`, `contact`, `remarks`, `accession_number` —
-    none of which `rat.collection` has a column for (today just `name`/`owner`/`donor`/
-    `storage_location`). `rat_migration.ratroutes` already carries `organisation` ("Owning
-    organisation"), `country`, `remarks` — `rat.route` has none of them (today just `name`/
-    `start_location_id`/`end_location_id`). Both are genuinely extracted by Stage 1 already, just
-    never migrated by Stage 2. **Deliberately not acted on** — user's call: document only, don't
-    add the columns/migration logic yet. Worth flagging if picked up later: `rat.collection`'s
-    `owner`/`donor`/`contact` likely hold real people's names/contact details (donors/collectors,
-    not archive subjects) — the same kind of non-public-by-default consideration already applied to
-    `catalog.valuation`/`owners_ref` in `anon`'s grants (see `picaloco_web` Session 14).
+    actually lands in `rat.*` — since fixed.** `rat_migration.ratcollections` already carried
+    `photographer`, `print_sales`, `internet_use`, `publications_use`, `contact`, `remarks`,
+    `accession_number`; `rat_migration.ratroutes` already carried `organisation` ("Owning
+    organisation"), `country`, `remarks` — both genuinely extracted by Stage 1, neither ever
+    migrated by Stage 2. Initially documented only (user's call, given the PII angle below), then
+    picked back up the same session: `rat.route` gained `organisation_id`/`country_id` (FKs,
+    matching the existing `location_id`/`country_id` convention, not raw duplicated text) and
+    `remarks`; `rat.collection` gained `photographer_id` (FK, same reasoning), `print_sales`/
+    `internet_use`/`publications_use` (booleans), `accession_number`, `contact`, `remarks`. DDL:
+    `supabase/schema/add_collection_route_columns.sql`, applied live and folded into
+    `bootstrap_rat_schema.sql`. `migrate_route()`/`migrate_collection()` now populate all of it —
+    see `devlog/worksheet.md` Session 23 for the full trace, including two real bugs found live
+    (a `lookup_caches` staleness issue for the new FKs, and a whitespace-only `accession_number`
+    value that `pd.notna()` alone didn't catch).
+    **Confirmed live: `contact` (real donor/collector names and at least one full postal address —
+    e.g. "[real name and full postal address - redacted]") is now public** — `anon` already had full
+    `SELECT` on `rat.collection` (same as the already-public `owner`/`donor`), and the user chose to
+    add `contact` with no column-level restriction, explicitly, after being shown this exact fact.
+    Not an oversight — if this ever needs revisiting, it's a deliberate decision to reverse, not a
+    bug to fix.
   - Full layout screenshots referenced above live in
     `FileMakerPro_source_details/RAT_Original_App_Images/` (`rat_form__common_carrier.png`,
     `rat_form__industrial.png`, `rat_form__ratcollections.png`, `rat_form__ratroutes.png`,
@@ -519,6 +528,7 @@ python.exe scripts/fm_metadata_probe.py --selftest
 | Fresh-target bootstrap DDL (idempotent, corrections baked in, incl. `mobile_catalog_view`/`anon` grants) | `supabase/schema/bootstrap_rat_schema.sql` |
 | **Disaster recovery** — full rebuild of `oci` from FileMaker Pro, verified live, a primary use case | `devlog/worksheet.md`'s "Reference: Disaster Recovery" section, right after the intro |
 | Constraint DDL (already-applied patches, cloud target only) | `supabase/schema/fix_rat_constraints.sql`, `fix_rat_idempotency.sql` |
+| `rat.collection`/`rat.route` column additions (already-applied, also folded into bootstrap) | `supabase/schema/add_collection_route_columns.sql` |
 | Sanitisation fixtures | `test/` |
 | Source field meanings / valid values | `FileMakerPro_source_details/` |
 | History + open threads | `devlog/worksheet.md` |
