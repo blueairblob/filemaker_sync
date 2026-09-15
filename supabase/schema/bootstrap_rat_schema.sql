@@ -81,6 +81,13 @@ CREATE TABLE IF NOT EXISTS rat.route (
   created_date timestamp with time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
   modified_by uuid,
   modified_date timestamp with time zone,
+  -- organisation_id/country_id/remarks added Session 23 (see
+  -- add_collection_route_columns.sql) -- FK constraints added further below,
+  -- after rat.organisation exists (organisation is created after route in
+  -- this file, so an inline FK here would fail).
+  organisation_id uuid,
+  country_id uuid,
+  remarks text,
   CONSTRAINT route_pkey PRIMARY KEY (id),
   CONSTRAINT route_start_location_id_fkey FOREIGN KEY (start_location_id) REFERENCES rat.location(id),
   CONSTRAINT route_end_location_id_fkey FOREIGN KEY (end_location_id) REFERENCES rat.location(id)
@@ -109,6 +116,21 @@ CREATE TABLE IF NOT EXISTS rat.collection (
   created_date timestamp with time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
   modified_by uuid,
   modified_date timestamp with time zone,
+  -- photographer_id/print_sales/internet_use/publications_use/
+  -- accession_number/contact/remarks added Session 23 (see
+  -- add_collection_route_columns.sql). photographer_id's FK constraint is
+  -- added further below, after rat.photographer exists. contact holds real
+  -- people's names/contact details (donors/collectors) -- anon already has
+  -- full SELECT on rat.collection (same as owner/donor, already public), so
+  -- this makes contact public too; a deliberate call, not an oversight --
+  -- see devlog/worksheet.md Session 23.
+  photographer_id uuid,
+  print_sales boolean,
+  internet_use boolean,
+  publications_use boolean,
+  accession_number numeric,
+  contact text,
+  remarks text,
   CONSTRAINT collection_pkey PRIMARY KEY (id)
 );
 
@@ -262,6 +284,28 @@ CREATE TABLE IF NOT EXISTS rat.picture_metadata (
   CONSTRAINT picture_metadata_pkey PRIMARY KEY (id),
   CONSTRAINT picture_metadata_catalog_id_fkey FOREIGN KEY (catalog_id) REFERENCES rat.catalog(id)
 );
+
+-- Deferred FK constraints for the Session 23 columns above (route.organisation_id/
+-- collection.photographer_id) -- added here, after every CREATE TABLE, because
+-- the referenced tables (organisation, photographer) are created later in this
+-- file than the tables that reference them. Guarded/idempotent, same pattern as
+-- fix_rat_idempotency.sql's constraint-adding. See add_collection_route_columns.sql
+-- for the equivalent standalone migration (this block mirrors it for fresh installs).
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'route_organisation_id_fkey') THEN
+        ALTER TABLE rat.route ADD CONSTRAINT route_organisation_id_fkey
+            FOREIGN KEY (organisation_id) REFERENCES rat.organisation(id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'route_country_id_fkey') THEN
+        ALTER TABLE rat.route ADD CONSTRAINT route_country_id_fkey
+            FOREIGN KEY (country_id) REFERENCES rat.country(id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'collection_photographer_id_fkey') THEN
+        ALTER TABLE rat.collection ADD CONSTRAINT collection_photographer_id_fkey
+            FOREIGN KEY (photographer_id) REFERENCES rat.photographer(id);
+    END IF;
+END $$;
 
 -- =============================================================================
 -- rat_migration support tables with NO discoverable DDL anywhere in the repo --

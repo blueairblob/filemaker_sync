@@ -1132,7 +1132,12 @@ def migrate_route(df):
     """Migrate route data to Supabase."""
     tgt_table = 'route'
     logger.info(f"{tgt_table}: Starting migration")
-    routes = df[[tgt_table, 'start_location', 'end_location']].dropna(subset=['route']).drop_duplicates()
+    # organisation_id/country_id/remarks added Session 23 -- rat_migration.ratroutes
+    # already carried 'organisation'/'country'/'Remarks', but rat.route had no
+    # columns for them and this function never read them. See
+    # devlog/worksheet.md Session 23 and supabase/schema/add_collection_route_columns.sql.
+    routes = df[[tgt_table, 'start_location', 'end_location', 'organisation', 'country', 'Remarks']] \
+        .dropna(subset=['route']).drop_duplicates()
     route_data = OrderedDict()
     Location = get_table('location', tgt_schema)
     for _, row in routes.iterrows():
@@ -1140,11 +1145,16 @@ def migrate_route(df):
         # Get FKs
         start_location_id = get_location_id(Location, row['start_location'], route)
         end_location_id = get_location_id(Location, row['end_location'], route)
-        route_data[route] = {
+        record = {
             'name': route,
             'start_location_id': start_location_id,
-            'end_location_id': end_location_id
+            'end_location_id': end_location_id,
+            'organisation_id': lookup_caches['organisation'].get(stripy(row['organisation'])),
+            'country_id': lookup_caches['country'].get(stripy(row['country'])),
+            'remarks': row['Remarks'],
         }
+        _quarantine_data_entry_errors(record, ['remarks'], tgt_table, route)
+        route_data[route] = record
     route_data_lst = list(route_data.values())
     batch_upsert(f"{tgt_schema}.{tgt_table}", route_data_lst, uniq_columns=['name'])
     logger.info(f"{tgt_table}: Completed migration. Migrated {len(routes)} routes")
@@ -1191,6 +1201,39 @@ def _looks_like_runaway_repetition(value: str) -> bool:
         return False  # too short for a compression ratio to mean anything
     compressed = zlib.compress(value.encode('utf-8', errors='ignore'), level=9)
     return len(compressed) / len(value) < 0.10
+
+def _quarantine_data_entry_errors(record, columns, table_name, ref_id):
+    """Shared version of the "looks like a FileMaker data-entry accident"
+    guard, for tables added Session 23 (route/collection) that don't have an
+    image_no of their own -- ref_id is whatever human-readable identifier
+    that table's rows actually have (route/collection name, builder code),
+    used in the reject_log reason instead. Mutates `record` in place, same
+    semantics as migrate_catalog()/migrate_builder()'s own inline versions
+    (kept inline there rather than retrofitted to this shared version, to
+    avoid touching already-verified, already-live code for this session's
+    unrelated route/collection fix)."""
+    for col in columns:
+        val = record.get(col)
+        if not isinstance(val, str):
+            continue
+        stripped = val.strip()
+        if not stripped:
+            record[col] = None
+            continue
+        if len(stripped) > GENERAL_TEXT_MAX_LEN:
+            reason = f"{len(stripped)} chars, exceeds the generous sanity ceiling ({GENERAL_TEXT_MAX_LEN})"
+        elif _looks_like_runaway_repetition(stripped):
+            reason = f"{len(stripped)} chars, looks like a repeated/copy-paste accident (compresses to under 10% of its size)"
+        else:
+            continue
+        reject_log.log_reject(
+            config, target_profile, source_script="db_dml_loader.py", stage="load",
+            severity="reject", table_name=table_name,
+            reason=(f"{table_name}.{col} (ref={ref_id!r}) looks like a FileMaker data-entry "
+                    f"error: {reason}. Not loaded. First 200 chars: {stripped[:200]!r}"),
+            source_data={col: val}, run_id=run_id,
+        )
+        record[col] = None
 
 def migrate_catalog(df):
     """Migrate catalog data to Supabase."""
@@ -1368,18 +1411,47 @@ def migrate_usage(df):
 def migrate_collection(df):
     """Migrate collection data to Supabase."""
     logger.info("Starting collection migration")
-    
-    # Filter and prepare collection data
-    collections = df[['collection', 'owner', 'donor', 'storage_location']].dropna(subset=['collection']).drop_duplicates()
+
+    # photographer_id/print_sales/internet_use/publications_use/accession_number/
+    # contact/remarks added Session 23 -- rat_migration.ratcollections already
+    # carried all of these, but rat.collection had no columns for them and this
+    # function never read them. contact holds real people's names/contact
+    # details (donors/collectors) -- anon already has full SELECT on
+    # rat.collection (same as owner/donor, already public), so this makes
+    # contact public too; a deliberate call, not an oversight -- see
+    # devlog/worksheet.md Session 23 and supabase/schema/add_collection_route_columns.sql.
+    collections = df[['collection', 'owner', 'donor', 'storage_location', 'photographer',
+                       'print_sales', 'internet_use', 'publications_use', 'accession_number',
+                       'contact', 'remarks']].dropna(subset=['collection']).drop_duplicates()
     collection_data = []
-    for _, row in collections.iterrows():              
-        collection_data.append({
+    for _, row in collections.iterrows():
+        record = {
             'name': row['collection'],
             'owner': row['owner'],
             'donor': row['donor'],
-            'storage_location': row['storage_location']
-        })
-    
+            'storage_location': row['storage_location'],
+            'photographer_id': lookup_caches['photographer'].get(stripy(row['photographer'])),
+            'print_sales': row['print_sales'] == 'yes',
+            'internet_use': row['internet_use'] == 'yes',
+            'publications_use': row['publications_use'] == 'yes',
+            # stripy(...) or None: a blank source cell can be a pandas NaN
+            # (float) OR a whitespace-only string (confirmed live 2026-09-15:
+            # exactly 2 real rows hold a single space ' ') -- either one
+            # choked the numeric column's bulk-insert path ("invalid input
+            # syntax for type numeric"). pd.notna() alone only catches the
+            # NaN case, not whitespace-only strings (stripy(' ') == '', still
+            # not valid numeric input) -- `or None` catches both by treating
+            # any falsy stripped result as NULL. Individual-record retry
+            # happened to succeed anyway both times (no data actually lost,
+            # verified: all 66 collections landed correctly either way), but
+            # the warning was noise for a non-error.
+            'accession_number': stripy(row['accession_number']) or None,
+            'contact': row['contact'],
+            'remarks': row['remarks'],
+        }
+        _quarantine_data_entry_errors(record, ['contact', 'remarks'], 'collection', row['collection'])
+        collection_data.append(record)
+
     # Perform batch upsert
     batch_upsert(f'{tgt_schema}.collection', collection_data, uniq_columns=['name'])
     logger.info(f"Completed collection migration. Migrated {len(collection_data)} collections")
@@ -1795,11 +1867,13 @@ def main():
         migrate_country(catalog_df)
         cache_lookup_table('country', 'name')  # needed by migrate_organisation/migrate_location next
         migrate_organisation(catalog_df)
+        cache_lookup_table('organisation', 'name')  # needed by migrate_route next (Session 23: route.organisation_id)
         migrate_location(catalog_df)
         cache_lookup_table('location', 'name')  # needed by migrate_route/migrate_builder next
+        migrate_photographer(catalog_df)
+        cache_lookup_table('photographer', 'name')  # needed by migrate_collection next (Session 23: collection.photographer_id)
         migrate_route(routes_df)
         migrate_collection(collections_df)
-        migrate_photographer(catalog_df)
         migrate_builder(builders_df)
         ensure_unknown_builder()  # before the cache rebuild below, so 'UNK' gets cached like any other builder
         migrate_catalog(catalog_df)
