@@ -152,7 +152,7 @@ class MigrationOverview(ttk.Frame):
         self.stat_frames = {}  # kept so show_delta_result()/update_overview() can relabel them
         stat_configs = [
             ('tables_done', 'Tables Migrated'),
-            ('completion', 'Staging Match %')
+            ('completion', 'Target Match %')
         ]
 
         for i, (key, label) in enumerate(stat_configs):
@@ -185,14 +185,16 @@ class MigrationOverview(ttk.Frame):
         self.table_tree.column('Status', width=100, minwidth=80)
         self.table_tree.column('Progress', width=80, minwidth=60)
         
-        # 'Target' is the internal column id (kept as-is -- it's referenced
-        # positionally elsewhere, e.g. update_overview()'s values= tuple);
-        # only the displayed heading text changes, to be honest about what
-        # this actually shows (rat_migration staging counts, not the final
-        # rat.* schema -- see the caption below the table).
-        column_headings = {'Target': 'Staging'}
+        # Session 13 relabeled this column's heading text from 'Target' to
+        # 'Staging' because migration_status --json only ever measured
+        # rat_migration staging at the time (the internal column id is
+        # unrelated -- 'Target' there is just an id referenced positionally
+        # elsewhere, e.g. update_overview()'s values= tuple, unaffected by
+        # heading text). Session 23 made this genuinely true again: the
+        # script now compares against the real rat.* schema, so the honest
+        # label is 'Target' once more -- see the caption below the table.
         for col in columns:
-            self.table_tree.heading(col, text=column_headings.get(col, col))
+            self.table_tree.heading(col, text=col)
         
         # Scrollbar for treeview (only show when needed)
         scrollbar = ttk.Scrollbar(self.table_frame, orient='vertical', command=self.table_tree.yview)
@@ -202,8 +204,10 @@ class MigrationOverview(ttk.Frame):
         # Don't pack scrollbar initially - will show only when needed
 
         ttk.Label(
-            self, text="Reflects the last extract's staging snapshot -- Delta Sync intentionally narrows "
-                       "this to just the changed rows. See the summary above for what actually happened.",
+            self, text="Compares FileMaker against the real rat.* schema (not staging). "
+                       "ratcopyright/ratlabels/prompts show — No target: extracted but never "
+                       "migrated further. Delta Sync's own summary above is the source of truth "
+                       "for what actually happened in the last run.",
             font=('Arial', 8), foreground='gray', wraplength=460, justify='left',
         ).pack(fill='x', padx=4, pady=(2, 0))
 
@@ -212,7 +216,7 @@ class MigrationOverview(ttk.Frame):
         try:
             # Restore the normal labels in case show_delta_result() last relabeled them.
             self.stat_frames['tables_done'].configure(text='Tables Migrated')
-            self.stat_frames['completion'].configure(text='Staging Match %')
+            self.stat_frames['completion'].configure(text='Target Match %')
 
             # Extract summary data safely
             summary = data.get('summary', {})
@@ -220,10 +224,16 @@ class MigrationOverview(ttk.Frame):
             # Update summary stats - ONLY essential ones
             tables_migrated = summary.get('tables_migrated', 0)
             total_tables = summary.get('total_tables', 0)
+            tables_no_target = summary.get('tables_no_target', 0)
             source_total = summary.get('source_total_rows', 0)
             target_total = summary.get('target_total_rows', 0)
-            
-            self.stat_boxes['tables_done'].configure(text=f"{tables_migrated}/{total_tables}")
+
+            # Denominator excludes no-target tables (ratcopyright/ratlabels/
+            # prompts) -- they were never candidates for migration, so
+            # counting them here would make this look like 3 failures
+            # rather than 3 tables outside this comparison's scope.
+            self.stat_boxes['tables_done'].configure(
+                text=f"{tables_migrated}/{total_tables - tables_no_target}")
             
             completion = 0
             if source_total > 0:
@@ -251,25 +261,30 @@ class MigrationOverview(ttk.Frame):
             
             for table_name, table_info in tables_data.items():
                 source_rows = table_info.get('source_rows', 0)
-                target_rows = table_info.get('target_rows', 0)
+                target_rows = table_info.get('target_rows')  # None for no_target -- see below
                 status = table_info.get('status', 'unknown')
                 percentage = table_info.get('migration_percentage', 0)
-                
-                # Format status for display
+
+                # Format status for display. 'no_target' (ratcopyright/
+                # ratlabels/prompts -- extracted but no migrate_*() function
+                # reads them, see RAT_TARGET_TABLE_MAP) is deliberately not
+                # styled as an error or an incomplete migration -- neither
+                # is true, there's just nothing to compare against.
                 status_display = {
                     'fully_migrated': '✓ Complete',
                     'partially_migrated': '⚠ Partial',
                     'not_migrated': '✗ Not Done',
                     'source_error': '❌ Src Error',
-                    'target_error': '❌ Tgt Error'
+                    'target_error': '❌ Tgt Error',
+                    'no_target': '— No target',
                 }.get(status, status)
-                
+
                 self.table_tree.insert('', 'end', values=(
                     table_name,
                     f"{source_rows:,}" if source_rows >= 0 else "N/A",
-                    f"{target_rows:,}" if target_rows >= 0 else "N/A",
+                    f"{target_rows:,}" if target_rows is not None and target_rows >= 0 else "—",
                     status_display,
-                    f"{percentage:.1f}%"
+                    f"{percentage:.1f}%" if target_rows is not None else "—"
                 ))
                 
         except Exception as e:

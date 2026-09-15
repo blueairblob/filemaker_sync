@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 # Import our new modules
 from config_manager import ConfigManager
-from database_connections import DatabaseManager
+from database_connections import DatabaseManager, RAT_TARGET_TABLE_MAP
 from data_exporter import DataExporter, ExportOptions
 
 
@@ -468,20 +468,31 @@ class FileMakerMigrationManager:
             else:
                 source_counts = {table: -1 for table in tables}
             
+            # Session 23: compare against the REAL rat.* target schema, not
+            # rat_migration staging -- this is what "Migration Overview"
+            # always should have measured (CLAUDE.md's "Known, accepted
+            # limitations" carried this as parked for several sessions).
+            # get_final_target_table_counts() only returns an entry for
+            # tables with a real 1:1 rat.* mapping (RAT_TARGET_TABLE_MAP);
+            # ratcopyright/ratlabels/prompts are absent from it on purpose --
+            # handled as their own 'no_target' status below, not folded into
+            # source_error/target_error (a real connection failure) or
+            # not_migrated (implies a target exists and is just empty).
             if target_available:
                 try:
-                    target_counts = self.db_manager.get_target_table_counts(tables)
+                    target_counts = self.db_manager.get_final_target_table_counts(tables)
                 except Exception as e:
                     self.logger.warning(f"Error getting target counts: {e}")
-                    target_counts = {table: -1 for table in tables}
+                    target_counts = {}
             else:
-                target_counts = {table: -1 for table in tables}
-            
+                target_counts = {table: -1 for table in tables if table in RAT_TARGET_TABLE_MAP}
+
             status = {
                 'timestamp': datetime.now().isoformat(),
                 'source_database': self.config.source_db.name[1],
                 'target_database': f"{self.config.target_db.name[1]} ({self.config.db_type})",
                 'migration_schema': self.config.mig_schema,
+                'target_schema': self.config.tgt_schema,
                 'connection_status': {
                     'filemaker': self.connection_status['filemaker'],
                     'target': self.connection_status['target']
@@ -489,20 +500,33 @@ class FileMakerMigrationManager:
                 'tables': {},
                 'summary': {
                     'total_tables': len(tables),
-                    'source_total_rows': sum(count for count in source_counts.values() if count >= 0),
+                    # source_total_rows deliberately only sums tables that
+                    # also HAVE a target (i.e. are in target_counts) -- so
+                    # target_total_rows / source_total_rows is a fair,
+                    # apples-to-apples percentage. Summing every table's
+                    # source rows here (including the no-target ones) would
+                    # make the percentage artificially low for reasons that
+                    # have nothing to do with migration completeness.
+                    'source_total_rows': sum(count for table, count in source_counts.items()
+                                              if count >= 0 and table in target_counts),
                     'target_total_rows': sum(count for count in target_counts.values() if count >= 0),
                     'tables_migrated': 0,
                     'tables_empty_target': 0,
-                    'tables_with_errors': 0
+                    'tables_with_errors': 0,
+                    'tables_no_target': 0
                 }
             }
-            
+
             for table in tables:
                 source_count = source_counts.get(table, -1)
+                has_target = table in target_counts
                 target_count = target_counts.get(table, -1)
-                
+
                 # Calculate status
-                if source_count == -1 and target_count == -1:
+                if not has_target:
+                    table_status = 'no_target'
+                    status['summary']['tables_no_target'] += 1
+                elif source_count == -1 and target_count == -1:
                     table_status = 'both_error'
                 elif source_count == -1:
                     table_status = 'source_error'
@@ -517,15 +541,16 @@ class FileMakerMigrationManager:
                 else:
                     table_status = 'partially_migrated'
                     status['summary']['tables_migrated'] += 1
-                
+
                 if 'error' in table_status:
                     status['summary']['tables_with_errors'] += 1
-                
+
                 status['tables'][table] = {
                     'source_rows': source_count,
-                    'target_rows': target_count,
+                    'target_rows': target_count if has_target else None,
                     'status': table_status,
-                    'migration_percentage': (target_count / source_count * 100) if source_count > 0 else 0
+                    'migration_percentage': (target_count / source_count * 100)
+                                             if has_target and source_count > 0 else 0
                 }
             
             if output_json:

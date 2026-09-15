@@ -31,6 +31,29 @@ except ImportError:                       # self-contained fallback (identical b
 
 
 
+# Session 23: which rat.* table each FileMaker staging table's data actually
+# ends up in, for a real Migration Overview comparison against the final
+# target schema instead of just rat_migration staging counts (which is all
+# get_target_table_counts() below has ever measured). ratcatalogue maps to
+# `catalog` specifically (not catalog_metadata/catalog_builder/usage/
+# picture_metadata, its other downstream tables) -- catalog is the spine
+# table, and its count tracks the other four exactly in the normal case, so
+# it's the one meaningful representative for this comparison.
+# ratcopyright/ratlabels/prompts are deliberately absent: extracted into
+# staging, but no migrate_*() function in db_dml_loader.py reads any of the
+# three, so there is no target table to compare against -- see CLAUDE.md's
+# "Known, accepted limitations" for the history of this being parked, and
+# devlog/worksheet.md Session 23 for why it's no longer fully parked (the
+# other four tables get a real comparison now; these three are just
+# reported as having none, rather than blocking the other four too).
+RAT_TARGET_TABLE_MAP = {
+    'ratcatalogue': 'catalog',
+    'ratbuilders': 'builder',
+    'ratcollections': 'collection',
+    'ratroutes': 'route',
+}
+
+
 class DatabaseConnectionError(Exception):
     """Custom exception for database connection issues"""
     pass
@@ -424,7 +447,24 @@ class DatabaseManager:
         if tables is None:
             tables = self.get_filemaker_tables()
         return self.target_db.get_table_row_counts(tables, schema)
-    
+
+    def get_final_target_table_counts(self, tables: List[str]) -> Dict[str, int]:
+        """Row counts from the REAL rat.* target schema (self.config.tgt_schema),
+        not rat_migration staging -- see RAT_TARGET_TABLE_MAP's own docstring.
+        Keyed by the STAGING table name (matching `tables`, for easy merging
+        with get_source_table_counts()'s own return), but each count is
+        queried against that staging table's mapped rat.* table. A staging
+        table with no entry in RAT_TARGET_TABLE_MAP (ratcopyright/ratlabels/
+        prompts) is simply absent from the returned dict -- callers should
+        treat a missing key as "no target table exists", not as zero or an
+        error (both of which mean something different and are still
+        possible for a table that DOES have a real mapping)."""
+        mapped = {t: RAT_TARGET_TABLE_MAP[t] for t in tables if t in RAT_TARGET_TABLE_MAP}
+        if not mapped:
+            return {}
+        raw_counts = self.target_db.get_table_row_counts(list(mapped.values()), schema=self.config.tgt_schema)
+        return {staging_name: raw_counts.get(target_name, -1) for staging_name, target_name in mapped.items()}
+
     def get_migration_status(self, tables: List[str] = None) -> Dict[str, Any]:
         """Get comprehensive migration status comparing source and target"""
         if tables is None:
