@@ -1,13 +1,23 @@
 # requirements.txt
 # Core dependencies for the FileMaker Sync application
 pyodbc>=5.0.1
-pandas==2.1.4
-sqlalchemy==2.0.23
-pillow==10.1.0
-tqdm==4.66.1
-tomli==2.0.1
+# pandas/sqlalchemy/pillow/tqdm/tomli loosened from exact pins to floors
+# (Session 24) -- the pinned versions have no Python 3.13 wheel and fail
+# building from source, which is what this pipeline's real Windows install
+# runs (confirmed live, Session 5: had to install these five unpinned to get
+# a working environment at all -- see CLAUDE.md's "How to run"). A floor
+# keeps the same minimum guarantee as every other dependency below (which
+# already use >=, not ==) without blocking a newer interpreter.
+pandas>=2.1.4
+sqlalchemy>=2.0.23
+pillow>=10.1.0
+tqdm>=4.66.1
+tomli>=2.0.1
 tomli-w==1.0.0
-pyinstaller==6.3.0
+# Also no Python 3.13 wheel at 6.3.0 (found live while checking the fix
+# above with `pip install --dry-run` -- same class of problem, first
+# compatible release for 3.13 is 6.10.0).
+pyinstaller>=6.3.0
 
 # Enhanced GUI dependencies
 # tkinter is built into Python, but these enhance the experience

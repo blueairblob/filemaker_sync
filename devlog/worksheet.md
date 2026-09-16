@@ -3495,6 +3495,26 @@ going forward); a backup of the originals still exists in scratch if ever wanted
 
 This was the last piece of the Session 23 thumbnail work still marked unconfirmed — closed.
 
+---
+
+### Update, same day — requirements.txt's Python 3.13 wheel problem actually fixed, not just documented
+
+Picked off the roadmap list. `pandas==2.1.4` (and, as Session 5 already found live, `sqlalchemy`/
+`pillow`/`tqdm`/`tomli` at their own exact pins) has never had a wheel for the real Windows Python
+3.13 this pipeline actually runs on — worked around by installing those five unpinned back in
+Session 5, but `requirements.txt` itself never got fixed, so a fresh install would still hit the
+same wall. Loosened all five from `==` to `>=` at their existing floor version — matching the
+convention every other dependency in the file already uses, not a version bump, just removing the
+upper-bound-by-accident.
+
+**Checked, not assumed, via `python.exe -m pip install --dry-run -r requirements.txt` against the
+real Windows 3.13 install** — and that surfaced a sixth, previously-undocumented instance of the
+exact same problem: `pyinstaller==6.3.0` also has no 3.13 wheel (`ERROR: Could not find a version
+that satisfies the requirement` — the highest pre-3.13-compatible release is `6.9.0`, first
+3.13-compatible is `6.10.0`). Fixed the same way (`>=6.3.0`). Second dry-run resolved every line in
+the file clean, no errors — confirmed against the live environment `picaloco_agent` packaging
+(Session 22) and every FileMaker-side script in this repo actually depend on, not a synthetic check.
+
 ### Open Threads
 
 - *(Carried, unchanged)*: Migration Overview's widget rendering not visually confirmed;

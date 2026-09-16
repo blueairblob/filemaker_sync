@@ -479,9 +479,13 @@ and committed. All `postgresql://` URLs must wrap the password in `url_quote()`.
   FileMaker file and a live OCI load, not just theory) — no separate Windows session needed, this session's
   agent ran Stage 1 + Stage 2 directly via `python.exe scripts/...` from WSL.
 - Windows Python tooling: `pyodbc`, `psycopg2-binary`, `python-dotenv` were already installed; Session 5
-  added `pandas`, `SQLAlchemy`, `tomli`, `pillow`, `tqdm` **unpinned** (that Windows Python is 3.13;
-  `requirements.txt`'s `pandas==2.1.4` has no 3.13 wheel and fails building from source — pin needs
-  loosening, outstanding).
+  added `pandas`, `SQLAlchemy`, `tomli`, `pillow`, `tqdm` **unpinned** (that Windows Python is 3.13,
+  and the exact pins these had at the time had no 3.13 wheel). **Fixed in `requirements.txt` itself
+  (Session 24):** those five, plus `pyinstaller` (found live while verifying the fix — `==6.3.0` has
+  no 3.13 wheel either, first compatible release is `6.10.0`), loosened from `==` to `>=` at the same
+  floor version, matching how every other dependency in the file is already expressed. Confirmed with
+  `pip install --dry-run -r requirements.txt` against the real Windows 3.13 install: resolves clean,
+  no version errors anywhere in the file.
 
 ```bash
 # incremental sync preview (dry-run; the "what would change" view)
@@ -723,7 +727,7 @@ design) — this only makes the hand-off real.
 Smaller open threads: `picture_metadata` untested against real images (no local files); the 16
 flagged source records are now a persisted hand-off (`rat_migration.reject_log` +
 `rejects_key_debris_20260915.xlsx`) — still need a RAT volunteer with FileMaker access to actually
-fix them; `requirements.txt`'s `pandas==2.1.4` pin (no Python 3.13 wheel);
+fix them;
 `PicaLocoBackend`/`picaloco` rebrand (explicitly gated until stable — arguably close now, still not done);
 `supabase-edge-functions` crash-loop fix handed to user, not yet confirmed run; the general
 validation pass covers `rat.catalog`/`rat.builder`/`rat.route`/`rat.collection` now, not
