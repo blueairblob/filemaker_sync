@@ -699,9 +699,13 @@ in this codebase ever did**, the historical thumbnail folder was a one-time exte
 `run_incremental_sync.py`'s own image step had been silently working around the gap by uploading
 the full-size `webp` instead. 320px fixed width (confirmed exactly against real historical files);
 file-size quality (35) is an empirically-tuned approximation, not an exact match — the original
-tool/settings are unknown, single knob left in place to retune. Not validated end-to-end through a
-live FileMaker extraction (needs native Windows Python + ODBC) — worth a live Export Images/Delta
-Sync run to confirm.
+tool/settings are unknown, single knob left in place to retune. **Confirmed end-to-end live
+(Session 24):** a scoped `--get-images --image-nos-file` run against 3 real image_nos (FileMaker
+open, real ODBC connection) correctly regenerated exactly the deleted `webp_mobile` files and
+nothing else — 320px-wide cap confirmed on two wider originals, correctly **no upscaling** on one
+already narrower than 320px, full-size `webp` files byte-identical/untouched (selective
+regeneration working as designed), new sizes landing at 1.22–1.37× the originals (consistent with
+the earlier local-only 1.27× sample).
 
 **Update (Session 23, continued): the 16 flagged source records turned into an actual hand-off, not
 just a console count.** New `scripts/audit_key_debris.py` re-scans the live source for the same
@@ -723,8 +727,8 @@ fix them; `requirements.txt`'s `pandas==2.1.4` pin (no Python 3.13 wheel);
 `PicaLocoBackend`/`picaloco` rebrand (explicitly gated until stable — arguably close now, still not done);
 `supabase-edge-functions` crash-loop fix handed to user, not yet confirmed run; the general
 validation pass covers `rat.catalog`/`rat.builder`/`rat.route`/`rat.collection` now, not
-`organisation`/`location` (checked, deliberately not wired up — see "Verified facts" above); the
-new thumbnail generation not yet confirmed via a live FileMaker run; `picaloco_agent` builds, installs, and runs
+`organisation`/`location` (checked, deliberately not wired up — see "Verified facts" above);
+`picaloco_agent` builds, installs, and runs
 (Session 22) but real distribution to a RAT volunteer is blocked on an unsigned-exe AV
 false-positive (Norton quarantines every build regardless of `--onefile`/`--onedir`) — code signing
 is the only mitigation that would actually generalize, deliberately deferred as a cost decision

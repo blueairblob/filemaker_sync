@@ -3463,3 +3463,44 @@ real gap in a fallback that had always silently produced wrong data instead of f
   leftover cleanup.
 
 ---
+
+### Update, same day — thumbnail generation confirmed live end-to-end, closing the last gap
+
+The one item left on the "what's next" list I could actually pick up myself (the other three all
+need the user: someone at the GUI with a mouse, real image files, or a revisited AV decision) — the
+new `webp_mobile` thumbnail code (Session 23) had only ever been proven against local files, never
+through a real FileMaker ODBC run, which is the one thing that actually exercises the whole wiring
+(`--image-nos-file` scoping → container-field blob fetch → `export_images()`'s thumbnail branch).
+
+**First attempt failed for an expected, not a code, reason:** FileMaker Pro wasn't open on the
+Windows desktop, so the ODBC connection itself failed before any new code ran — exactly the
+"someone needs to reopen FileMaker after a reboot" pain point that motivated the whole
+remote-agent direction (`CLAUDE.md`'s "What this project is", Session 18). Backed up 3 real local
+`webp_mobile` files, deleted them to force regeneration, hit the FileMaker-closed error, and
+restored the backups immediately rather than leave production-folder files missing while waiting.
+User opened FileMaker Pro; re-ran the identical scoped test from a clean backup.
+
+**Confirmed clean on the real run:** `python.exe scripts/filemaker_extract.py --get-images
+--image-nos-file <3 image_nos>` connected, scoped the query to exactly 3 rows (not a 141k-row
+scan), and `export_images()`'s `need_mobile` branch correctly regenerated all 3 deleted files.
+Checked, not assumed: dimensions matched the documented design exactly — 320px-wide cap on the two
+originals wider than that (374→320, 377→320), and correctly **no upscaling** on the one already
+narrower (171px stayed 171px, proving Pillow's `.thumbnail()` never-enlarges behavior holds in the
+live path, not just in isolated testing). New sizes landed at 1.22–1.37× the originals — consistent
+with Session 23's local-only 15-file sample (1.27×), now proven through the real pipeline instead
+of a synthetic call. Full-size `webp` files stayed byte-identical with their original 2025 mtimes
+— confirms the "only regenerate what's missing" logic didn't touch anything it shouldn't have. The
+3 regenerated files were left in place (correct, and exactly what a real Delta Sync would produce
+going forward); a backup of the originals still exists in scratch if ever wanted back.
+
+This was the last piece of the Session 23 thumbnail work still marked unconfirmed — closed.
+
+### Open Threads
+
+- *(Carried, unchanged)*: Migration Overview's widget rendering not visually confirmed;
+  `picture_metadata` untested against real images (no local files); `PicaLocoBackend`/`picaloco`
+  rebrand (still gated on stability); restore procedure not rehearsed; `picaloco_agent`
+  distribution blocked on the deferred AV/code-signing decision (Session 22); `gui/logs/` stray
+  leftover cleanup.
+
+---
