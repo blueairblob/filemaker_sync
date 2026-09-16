@@ -3385,9 +3385,81 @@ self-correcting: fixed rows simply won't be found by the scan any more, nothing 
 - The 16 flagged source records are now a persisted, actionable hand-off (`reject_log` +
   `rejects_key_debris_20260915.xlsx`) — still needs an actual RAT volunteer with FileMaker access
   to do the retyping/deletion; nothing left for this pipeline to do until that happens.
-- *(Carried, unchanged)*: `--mode dml_files` parser rewrite; `PicaLocoBackend`/`picaloco` rebrand
-  (still gated on stability); restore procedure not rehearsed; `picaloco_agent` distribution
-  blocked on the deferred AV/code-signing decision (Session 22); `gui/logs/` stray leftover
-  cleanup.
+- *(Carried, unchanged)*: `PicaLocoBackend`/`picaloco` rebrand (still gated on stability); restore
+  procedure not rehearsed; `picaloco_agent` distribution blocked on the deferred AV/code-signing
+  decision (Session 22); `gui/logs/` stray leftover cleanup.
+
+---
+
+## Session 24 — 2026-09-16 — `--mode dml_files` parser rewrite
+
+**Focus:** Picked off the "what's next" list — the two other open items (Migration Overview widget
+visual confirmation, `picture_metadata` testing) are both genuinely blocked on things this session
+can't do alone (needs someone at the real Windows GUI with a mouse; needs local image files that
+have never been present in any session). The parser rewrite was the one item actually actionable
+right now, even though it's long been tagged low-priority since `--mode migration_schema` is the
+real, live-tested production path and always has been.
+**Status:** `completed`, validated against fixtures (Golden Rule #4 — never iterate against the
+live DB for this kind of change; `--mode dml_files` doesn't touch `oci` directly anyway, but the
+rule's spirit — use `test/` fixtures, not guesswork — still applied).
+
+**What was actually broken:** `parse_insert_statement()` fed the entire multi-row `VALUES (...),
+(...), ...;` blob from one `INSERT` statement through `pd.read_csv()`, via a placeholder-substitution
+preprocessing step (`preprocess_values()`/`postprocess_dataframe()`) that tried to hide quoted
+content from the CSV parser. This never had a chance against a realistic FileMaker export: CSV has
+no concept of a parenthesised row-tuple, no concept of `Timestamp('...')` as a single value, and
+the placeholder swap didn't handle double-quoted strings containing commas/embedded parens (both
+present in real `description`/`corporate_body` values, confirmed in `test/test.sql`) correctly
+across multiple rows in one call.
+
+**The fix:** a real character-level tokenizer, not a smarter regex. `_split_top_level(s, sep=',')`
+walks the string once, tracking paren depth and quote spans (handling doubled-quote-char escaping
+for both `'` and `"`), and only splits on `sep` at depth 0 outside any quote — used twice: once to
+split a whole VALUES blob into its `(...)`-wrapped rows, once to split a row's insides into fields.
+`_parse_sql_value(token)` then converts each isolated token: `NULL` → `None`, `Timestamp('...')` →
+its inner string (matching how the same column looks when *not* Timestamp-wrapped — both forms
+appear in `test/test.sql` for `entry_date`), a quoted string → its unescaped content (leading `E`/`e`
+stripped first — Postgres's `E'...'` extended-string-literal prefix, which `filemaker_extract.py`'s
+`df_to_sql_bulk_insert()` always emits for the `supabase` dialect branch, only marks
+backslash-escape support, it doesn't change how the quoted span is delimited), a bare number →
+`int`/`float`, anything else → the raw text. Table-name extraction also fixed to handle a
+schema-qualified header (`INSERT INTO rat_migration.ratcatalogue (...)`, what a real export
+actually writes) — the old regex only handled a bare or backtick-quoted name.
+
+**A discovery mid-investigation: `test/test.sql` no longer represents the actual default export
+format.** It models the *legacy* `--db-type mysql` dialect (backtick columns, double-quoted
+strings, `Timestamp(...)`). `filemaker_extract.py --db-type` actually defaults to `'supabase'`
+(confirmed via `get_args()`), which `format_value()`/`df_to_sql_bulk_insert()` render completely
+differently: schema-qualified `INSERT INTO rat_migration.<table>`, double-quoted column
+identifiers, and every string value wrapped as Postgres `E'...'` with doubled-single-quote
+escaping — no `Timestamp(...)`, no double-quoted string values. Rather than assume which dialect a
+real file would use, the tokenizer was written to handle both correctly (same code path, since
+quote-type and the `E` prefix are just data the tokenizer reads, not a mode switch).
+
+**Validated against fixtures, not the live DB:** `test/test.sql` (legacy dialect) — 6/6 rows
+parsed, 69/69 columns each, `Timestamp('...')` unwrapped correctly, the embedded-comma
+(`corporate_body`: "Ministry of Defence, Army Department"), embedded-apostrophe (`description`:
+"...their 2' gauge system"), and embedded-unmatched-paren (`description`: "...built by North
+British), heads away...") cases all preserved exactly, zero rows written to `test/test.sql.reject`.
+`test/test.sql.bad_data_examples` — 5/5 rows, same checks. A synthetic `E'...'`-dialect statement
+(schema-qualified header, doubled-single-quote escaping, `NULL` mixed in) — parsed correctly,
+confirming the *actual current default* format works too, which `test/test.sql` alone couldn't have
+proven. A deliberate malformed-row test (wrong column count) confirmed the reject path still works:
+the good row loads, the bad one is quarantined into `.reject` with a clear reason instead of
+crashing or silently mis-mapping columns — Golden Rule #1 still holds.
+
+**Not changed:** `read_dml_extracts()`'s file-level statement splitting (`;[\s\n]*INSERT INTO` —
+correct for splitting multiple top-level statements in one file, orthogonal to the VALUES-blob
+problem this fixed). `--mode migration_schema` remains the real, live-tested production path;
+`dml_files` was never the thing standing between anyone and a working migration — this closes a
+real gap in a fallback that had always silently produced wrong data instead of failing loudly.
+
+### Open Threads
+
+- *(Carried, unchanged)*: Migration Overview's widget rendering not visually confirmed;
+  `picture_metadata` untested against real images (no local files); `PicaLocoBackend`/`picaloco`
+  rebrand (still gated on stability); restore procedure not rehearsed; `picaloco_agent`
+  distribution blocked on the deferred AV/code-signing decision (Session 22); `gui/logs/` stray
+  leftover cleanup.
 
 ---

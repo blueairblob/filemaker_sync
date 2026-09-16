@@ -62,7 +62,6 @@ import logging
 import argparse
 import glob
 from tqdm import tqdm
-import io
 from collections import OrderedDict
 from sqlalchemy.exc import IntegrityError, DataError
 from psycopg2.errors import UniqueViolation, ForeignKeyViolation, StringDataRightTruncation
@@ -205,75 +204,127 @@ def clear_existing_reject_file(file_path):
         os.remove(reject_file_path)
         print(f"Deleted existing reject file: {reject_file_path}")
         
-def preprocess_values(values_part):
-    """Preprocess the VALUES part to handle both single and double quotes."""
-    # Replace escaped quotes with placeholder
-    values_part = values_part.replace("''", "§SINGLE§").replace('""', "§DOUBLE§")
-    
-    # Replace content inside quotes with placeholders
-    single_quoted = re.findall(r"'(.*?)'", values_part)
-    double_quoted = re.findall(r'"(.*?)"', values_part)
-    
-    for i, content in enumerate(single_quoted):
-        values_part = values_part.replace(f"'{content}'", f"§S{i}§", 1)
-    for i, content in enumerate(double_quoted):
-        values_part = values_part.replace(f'"{content}"', f"§D{i}§", 1)
-    
-    return values_part, single_quoted, double_quoted
+def _split_top_level(s: str, sep: str = ',') -> list:
+    """Split `s` on top-level `sep`, ignoring separators (and parens) that
+    fall inside a single- or double-quoted span. Handles doubled-quote-char
+    escaping (a doubled quote char inside a span of the same quote type,
+    e.g. two single-quotes back to back inside a single-quoted string)
+    so an embedded quote doesn't end the span early. This is the one
+    primitive both row-splitting
+    (`(r1), (r2), ...`) and field-splitting (within one `(...)` row) go
+    through below -- a real FileMaker DML export mixes single- and
+    double-quoted strings, NULL, bare numbers, and Timestamp(...)-wrapped
+    values, and free-text fields routinely contain commas/parens/the other
+    quote character as literal content (confirmed against test/test.sql,
+    e.g. a description with an embedded unmatched ')'). Depth-tracking
+    parens (rather than a flat split) is what makes this safe for
+    Timestamp('...') and for splitting a whole multi-row VALUES blob into
+    its `(...)`-wrapped rows in one pass."""
+    parts, buf, depth = [], [], 0
+    i, n = 0, len(s)
+    while i < n:
+        c = s[i]
+        if c in ("'", '"'):
+            quote = c
+            buf.append(c)
+            i += 1
+            while i < n:
+                if s[i] == quote:
+                    if i + 1 < n and s[i + 1] == quote:
+                        buf.append(s[i]); buf.append(s[i + 1])
+                        i += 2
+                        continue
+                    buf.append(s[i])
+                    i += 1
+                    break
+                buf.append(s[i])
+                i += 1
+            continue
+        if c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+        if c == sep and depth == 0:
+            parts.append(''.join(buf))
+            buf = []
+        else:
+            buf.append(c)
+        i += 1
+    parts.append(''.join(buf))
+    return parts
 
-def postprocess_dataframe(df, single_quoted, double_quoted):
-    """Postprocess the DataFrame to restore quoted content."""
-    for column in df.columns:
-        df[column] = df[column].apply(lambda x: x.replace("§SINGLE§", "'").replace("§DOUBLE§", '"') if isinstance(x, str) else x)
-        for i, content in enumerate(single_quoted):
-            df[column] = df[column].apply(lambda x: content if x == f"§S{i}§" else x)
-        for i, content in enumerate(double_quoted):
-            df[column] = df[column].apply(lambda x: content if x == f"§D{i}§" else x)
-    return df
+def _parse_sql_value(token: str):
+    """Convert one raw VALUES token (already isolated by _split_top_level)
+    into a Python value: NULL -> None; Timestamp('...') -> its inner string
+    (matches how the same column already looks when NOT Timestamp-wrapped
+    -- see test/test.sql, where entry_date appears both ways); a quoted
+    string -> its unescaped content (doubled-quote-char escape undone,
+    leading E/e stripped first -- Postgres's E'...' extended-string-literal
+    prefix, which df_to_sql_bulk_insert()'s 'supabase' dialect branch always
+    emits, marks backslash-escape support only, it doesn't change how the
+    quoted span itself is delimited); a bare number -> int/float; anything
+    else -> the raw stripped text."""
+    token = token.strip()
+    if not token:
+        return None
+    if token.upper() == 'NULL':
+        return None
+    m = re.match(r'^[Tt]imestamp\s*\((.*)\)$', token, re.DOTALL)
+    if m:
+        token = m.group(1).strip()
+    if len(token) >= 3 and token[0] in ('E', 'e') and token[1] in ("'", '"'):
+        token = token[1:]
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in ("'", '"'):
+        quote = token[0]
+        return token[1:-1].replace(quote * 2, quote)
+    try:
+        return int(token) if re.match(r'^[+-]?\d+$', token) else float(token)
+    except ValueError:
+        return token
 
 def parse_insert_statement(insert_statement, file_path, first_reject=True):
-    """Parse a SQL INSERT statement using pandas, handling both single and double quotes."""
+    """Parse a SQL INSERT statement via a real character-level tokenizer
+    (see _split_top_level/_parse_sql_value) instead of pd.read_csv, which
+    has no notion of SQL quoting and breaks on any of: double-quoted
+    strings, Timestamp('...')-wrapped values, or embedded punctuation
+    inside a free-text field (all confirmed present in a realistic
+    FileMaker export -- test/test.sql). Handles a statement with many
+    VALUES row-tuples (the real per-table export shape -- one INSERT per
+    table, thousands of rows), not just one."""
     table_name = "Unknown"
     columns = []
     try:
-        # Extract table name
-        table_match = re.search(r'INSERT INTO `?(\w+)`?', insert_statement)
+        # Table name: INSERT INTO [schema.][`"]tbl[`"] ( -- schema-qualified
+        # (rat_migration.ratcatalogue) is what a real export actually
+        # writes (df_to_sql_bulk_insert()'s insert_header); bare or
+        # quote-wrapped table names (as in test/test.sql) also match.
+        table_match = re.search(r'INSERT INTO\s+(?:[\w"]+\.)?[`"]?(\w+)[`"]?\s*\(', insert_statement)
         table_name = table_match.group(1) if table_match else "Unknown"
 
         # Extract column names
         columns_match = re.search(r'\((.*?)\)[\s\n]*VALUES', insert_statement, re.DOTALL)
-        if columns_match:
-            columns = [col.strip('` ') for col in columns_match.group(1).split(',')]
-        else:
-            columns = []
+        columns = [col.strip(' `"') for col in columns_match.group(1).split(',')] if columns_match else []
 
         # Extract VALUES part
-        values_part = re.split(r'VALUES\s*', insert_statement, flags=re.IGNORECASE)[1]
-        values_part = values_part.strip().rstrip(';')
-        
-        # Preprocess VALUES part
-        processed_values, single_quoted, double_quoted = preprocess_values(values_part)
-        
-        # Use pandas to read the values
-        df = pd.read_csv(io.StringIO(processed_values), 
-                         header=None, 
-                         names=columns, 
-                         skipinitialspace=True,
-                         keep_default_na=False,
-                         na_values=['NULL'])
-        
-        # Postprocess the DataFrame
-        df = postprocess_dataframe(df, single_quoted, double_quoted)
+        values_part = re.split(r'VALUES\s*', insert_statement, maxsplit=1, flags=re.IGNORECASE)[1]
+        values_part = values_part.strip().rstrip(';').strip()
 
-        # Convert DataFrame to list of dictionaries
-        data_list = df.to_dict('records')
-
-        # Check for mismatches
-        if len(df.columns) != len(columns):
-            reason = f"Mismatch in column count. Expected: {len(columns)}, Found: {len(df.columns)}"
-            print(reason)
-            write_rejected_data(file_path, values_part, values_part, reason, table_name, columns, first_reject)
-            first_reject = False
+        data_list = []
+        for row_idx, row_text in enumerate(_split_top_level(values_part, ',')):
+            row_text = row_text.strip()
+            if not (row_text.startswith('(') and row_text.endswith(')')):
+                reason = f"Row {row_idx}: not a parenthesised tuple: {row_text[:120]!r}"
+                write_rejected_data(file_path, row_text, row_text, reason, table_name, columns, first_reject)
+                first_reject = False
+                continue
+            fields = _split_top_level(row_text[1:-1], ',')
+            if len(fields) != len(columns):
+                reason = f"Row {row_idx}: mismatch in column count. Expected: {len(columns)}, Found: {len(fields)}"
+                print(reason)
+                write_rejected_data(file_path, row_text, row_text, reason, table_name, columns, first_reject)
+                first_reject = False
+                continue
+            data_list.append({col: _parse_sql_value(val) for col, val in zip(columns, fields)})
 
         return table_name, data_list
     except Exception as e:

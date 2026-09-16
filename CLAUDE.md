@@ -513,10 +513,22 @@ python.exe scripts/fm_metadata_probe.py --selftest
 - **Line endings:** Windows checkout is CRLF; `.gitattributes` normalises. Patches from Linux are LF - use
   `git apply --3way` if one won't apply.
 - `scripts/scripts.old/` and other `*.old` paths are cruft - don't build on them.
-- **`db_dml_loader.py --mode dml_files` cannot parse a realistic FileMaker export** (confirmed against
-  `test/test.sql`: mixed quoting, `Timestamp('...')`-style values, embedded punctuation all break its
-  `pd.read_csv`-based parser). Use `--mode migration_schema` instead (reads `rat_migration.*` staging
-  tables populated by `filemaker_extract.py --db-exp`) until the parser gets a real rewrite.
+- **`db_dml_loader.py --mode dml_files` parser rewritten (Session 24) — it now parses a realistic
+  FileMaker export.** The old `pd.read_csv`-based parser genuinely couldn't (mixed single/double
+  quoting, `Timestamp('...')`-wrapped values, embedded punctuation inside free-text fields all broke
+  it, confirmed against `test/test.sql`). Replaced with a real character-level tokenizer
+  (`_split_top_level()`/`_parse_sql_value()` in `db_dml_loader.py`) that walks the VALUES blob
+  respecting quote spans and paren depth, instead of pretending it's CSV. Handles both dialects this
+  codebase has ever produced: the legacy MySQL-style export `test/test.sql` models (backtick columns,
+  double-quoted strings, `Timestamp(...)`) **and** the actual current default
+  (`filemaker_extract.py --db-type supabase`, the argparse default): schema-qualified
+  `INSERT INTO rat_migration.ratcatalogue`, double-quoted column identifiers, Postgres `E'...'`
+  extended-string literals with doubled-quote escaping. Validated against `test/test.sql` (6/6 rows,
+  69/69 columns each, embedded commas/apostrophes/an unmatched `)` inside free-text fields all
+  preserved correctly) and `test/test.sql.bad_data_examples` (5/5), plus a synthetic `E'...'`-dialect
+  statement covering the modern format specifically — `--mode migration_schema` is still the
+  live-tested, actually-used production path, this closes a real gap in the fallback rather than
+  replacing it.
 
 ---
 
@@ -707,8 +719,7 @@ design) — this only makes the hand-off real.
 Smaller open threads: `picture_metadata` untested against real images (no local files); the 16
 flagged source records are now a persisted hand-off (`rat_migration.reject_log` +
 `rejects_key_debris_20260915.xlsx`) — still need a RAT volunteer with FileMaker access to actually
-fix them; `--mode dml_files` parser rewrite (low priority,
-`migration_schema` mode works); `requirements.txt`'s `pandas==2.1.4` pin (no Python 3.13 wheel);
+fix them; `requirements.txt`'s `pandas==2.1.4` pin (no Python 3.13 wheel);
 `PicaLocoBackend`/`picaloco` rebrand (explicitly gated until stable — arguably close now, still not done);
 `supabase-edge-functions` crash-loop fix handed to user, not yet confirmed run; the general
 validation pass covers `rat.catalog`/`rat.builder`/`rat.route`/`rat.collection` now, not
