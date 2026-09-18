@@ -3602,3 +3602,56 @@ for time — the expensive part is `process_image_folder()` opening 141k files t
   `gui/logs/` stray leftover cleanup.
 
 ---
+
+## Session 26 — 2026-09-18, same day — the 132 stale files, and one of them wasn't stale
+
+Picked up the open thread from Session 25: delete the 132 space-stripped local `.webp` files
+identified as `picture_metadata`'s orphans. Checking them individually (not deleting on the strength
+of last session's summary) found the 132 was actually two different situations.
+
+**Verified each one's replacement genuinely exists before touching anything.** For each of the 132,
+computed the "correct" `image_no` (spaces restored) and checked two things: does a file already
+exist on disk under that correct name (no — 0 of 131 did, contradicting my own Session 25 phrasing
+that "both now sit on disk"; only the wrong-named file was ever present locally), and is the correct
+name already uploaded to `oci` Storage. **130 of 131 were: confirmed live via `object/info`, all
+dated 2026-09-10** — matching Session 19's own "recovered ~130 previously-invisible real photos in
+one re-run" note exactly, so this was the missing other half of that story: the fix uploaded the
+correct copies straight to Storage without ever regenerating a correctly-named file on *this*
+machine's local export folder.
+
+**One did not check out: `` jjw2415307Póvoa line ``.** Storage returned `InvalidKey` for it — not a
+transient error, the same permanent rejection class as the backtick cases, just triggered by the
+accented `ó` instead (`upload_images_oci.py`'s `InvalidKeyError` docstring already names "at least
+one accented character" as a known second trigger, alongside the backtick — this is the first
+concrete instance of it actually surfacing). This case had **never been logged anywhere** — not in
+`reject_log`, not in any `.xlsx` report — because normal Storage upload runs only see whatever's in
+the local webp folder under whatever name it currently has, and this row's name never round-tripped
+correctly. Logged it now (`severity="reject"`, reusing the exact `INVALID_KEY_REASON` text the
+backtick cases use, since it's the same underlying Storage behaviour) and left its local file
+**alone** — it's the only surviving copy of this photo under any name, not stale.
+
+**Deleted the remaining 130**, from both `webp/` and `webp_mobile/` (the thumbnail mirror carries the
+identical wrong-named files for the identical reason). Backed up first: copied all 260 files
+(2 folders × 130) to a scratch tarball, then verified every single one byte-identical
+(`cmp`) against its source before deleting anything. Deletion itself guarded on exact expected
+counts (`before − 130 == after`) in both folders — held in both. Confirmed the two files that must
+**not** be touched (`` jjw2415307Póvoaline.webp ``, `msmsa0265.webp`) were still present afterward.
+
+One hiccup along the way, not a data issue: the very first backup pass silently dropped one file
+(`nBaghdadRailwayg11209.webp`) due to a shell-loop glitch, caught by comparing the backup folder's
+count against the expected 130 rather than trusting the loop's own success — copied it again
+directly and re-verified before proceeding. Worth remembering: count-check every bulk file
+operation in this pipeline, the loop mechanics aren't trustworthy on their own.
+
+### Open Threads
+
+- **Resolved**: the 132 stale files — 130 deleted (backed up first), 1 correctly identified as not
+  stale and logged as a real `InvalidKey` case instead.
+- *(Carried, unchanged)*: `msmsa0265`'s disappearance from `rat.catalog` between 2026-09-12 and
+  2026-09-18 unexplained; the `picture_metadata` skip path not yet exercised through a real full
+  Stage 2 run; Migration Overview's widget rendering not visually confirmed; `PicaLocoBackend`/
+  `picaloco` rebrand (still gated on stability); restore procedure not rehearsed; `picaloco_agent`
+  distribution blocked on the deferred AV/code-signing decision (Session 22); `gui/logs/` stray
+  leftover cleanup.
+
+---

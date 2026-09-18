@@ -260,9 +260,15 @@ for ~12 sessions): it held 142,042 rows — 141,111 correct + 931 accumulated NU
 cleaned out (snapshotted first; the 45 backtick-named images among them already had correct rows, the
 other 132 were stale files). Verified against real data: 141,243 local files → 141,111 insert,
 132 skip, exactly matching the live table, so a re-run is now genuinely idempotent. Those 132 are
-mostly **pre-Session-19 space-stripped filenames** (`Barreiro(1).webp` vs the real `Barreiro (1)`) —
-stale exports left behind when that bug's fix re-exported them under correct names; deleting them
-from disk is a separate, not-yet-taken call. See `devlog/worksheet.md` Session 25.
+mostly **pre-Session-19 space-stripped filenames** (`Barreiro(1).webp` vs the real `Barreiro (1)`).
+**Session 26 deleted 130 of them** — first confirmed each one's correctly-named replacement was
+already live in Storage (uploaded 2026-09-10, the Session 19 fix's own re-export), archived a
+byte-verified backup, then removed both the full-size `webp/` and `webp_mobile/` copies. One of the
+132, `` jjw2415307Póvoa line ``, turned out **not** to be a stale duplicate at all — Storage has
+never held a correct copy of it (`InvalidKey`, the same class of permanent rejection as the backtick
+cases, just an accented character instead — previously unlogged; now in `reject_log`) — so its local
+file is the only surviving copy and was deliberately left alone. See `devlog/worksheet.md`
+Sessions 25–26.
 
 **Fixed a silent one-row-per-table loss (Session 5):** `read_data_from_migration_schema()` had a dead
 debug line (`first_row = result.fetchone()`) that consumed a row off the cursor before the real read
@@ -745,10 +751,10 @@ duplicate group's rows are genuinely distinct photos independently mistyped onto
 double-scans of one photo. Remediation is still FileMaker-side (out of this pipeline's control by
 design) — this only makes the hand-off real.
 
-Smaller open threads: the 132 stale space-stripped image files still sitting in the local export
-folder (harmless, now logged rather than duplicating — deleting them from disk is an untaken call);
-`msmsa0265` was in `rat.catalog` on 2026-09-12 but is not now, noticed in passing during the
-Session 25 `picture_metadata` work and not chased down; the 16
+Smaller open threads: `msmsa0265` was in `rat.catalog` on 2026-09-12 but is not now, noticed in
+passing during the Session 25 `picture_metadata` work and not chased down (its correctly-named local
+file was deliberately left alone during the Session 26 stale-file cleanup, since it's real, not
+stale); the 16
 flagged source records are now a persisted hand-off (`rat_migration.reject_log` +
 `rejects_key_debris_20260915.xlsx`) — still need a RAT volunteer with FileMaker access to actually
 fix them;
