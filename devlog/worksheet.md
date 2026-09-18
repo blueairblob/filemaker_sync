@@ -3524,3 +3524,81 @@ the file clean, no errors — confirmed against the live environment `picaloco_a
   leftover cleanup.
 
 ---
+
+## Session 25 — 2026-09-18 — `picture_metadata`: the open thread was wrong, and hid a real bug
+
+Picked up "populate `picture_metadata`" — listed for ~12 sessions as **0 rows, blocked on having no
+local image files**. Both halves of that turned out to be false, and checking why surfaced a genuine
+duplication bug.
+
+**First, a PII near-miss on the way in.** Before any of this, a pre-push repo audit (user asked to
+double-check nothing would be lost or overwritten) found that 2 of the 37 unpushed commits carried a
+real donor's full name and home address in `CLAUDE.md`, `devlog/worksheet.md` and
+`add_collection_route_columns.sql`, as an illustrative example of what `rat.collection.contact`
+holds. `filemaker_sync` is a **public** repo and the commits were unpushed, so this was the last
+moment it was cheap to fix. Scrubbed via `git filter-branch --index-filter` over the unpushed range
+only (index-filter, not tree-filter — the repo is ~1GB packed), replacing it with `[real name and
+full postal address - redacted]`. Verified: exactly 4 lines changed and nothing else
+(`git diff backup..main --stat`), all 37 commit messages and order preserved, and no trace in any of
+the 114 remote commits afterward. Backup branch `backup/pre-pii-scrub-20260918` left in place. Note
+the *live* exposure is unchanged and deliberate: `anon` still has `SELECT` on
+`rat.collection.contact` (Session 23's explicit call).
+
+**The blocker was stale.** `config.toml`'s `[export].path` was fixed 2026-09-07, and
+`process_image_folder()` resolves it under WSL via `resolve_export_path()` to
+`/mnt/c/dev/RAT_Trains_Project_Exports/exports/images/webp` — which holds **141,243 real `.webp`
+files**. And the table wasn't empty: live `rat.picture_metadata` read **142,042**.
+
+**That number is larger than both `rat.catalog` (141,244) and the local file count — which is what
+gave the bug away.** Breakdown: 141,111 rows with a real `catalog_id`, **931 with NULL**, 141,243
+distinct `file_name`, and 177 `file_name`s duplicated — *all 177 inside the NULL set*, zero
+duplicates among the non-NULL rows. Worst offenders sat at **12 copies each**.
+
+**Root cause: the exact bug Session 7 fixed for `catalog_builder`/`catalog_metadata`, missed here.**
+`migrate_picture_metadata()` upserts on `uniq_columns=['catalog_id']`. A local file whose stem
+matches no catalog row gets `catalog_id = None`; SQL `NULL != NULL`, so it never conflicts with its
+own earlier insert and every Stage 2 run appends another copy. `migrate_catalog_metadata()`'s own
+in-code comment already describes this trap precisely ("catalog_id is UNIQUE-constrained (SQL NULL !=
+NULL means every re-run would insert yet another orphan row). Skip rather than accumulate them") —
+`picture_metadata` simply never got the same guard. 12 copies = 12 historical full loads.
+
+**What the 177 orphans actually are** (worth knowing — none are mysterious):
+- **131** are **pre-Session-19 space-stripped filenames** — `Barreiro(1).webp` on disk vs the real
+  `image_no` `Barreiro (1)`. Session 19 fixed `export_images()`'s space-strip and re-exported ~130
+  photos under correct names, but never deleted the old wrongly-named files, so both now sit on disk
+  and the stale ones can never resolve.
+- **45** are the backtick names (`` merd113` ``). These *do* match `rat.catalog` exactly today —
+  their NULL rows are stale, from runs predating Session 19's removal of the backtick→doublequote
+  mangling (catalog then stored `merd113"`, so the lookup missed). Confirmed each of these 45 already
+  has a correctly-linked row alongside the NULL ones, i.e. the NULL copies are pure duplicates.
+- **1** — `msmsa0265` — matches nothing. Notable because it *was* in `rat.catalog` on 2026-09-12
+  (it came back from `compute_missing_image_nos()` during Session 21's Storage-relay test, and was
+  uploaded then). Not chased down; logged as an open thread.
+
+**Fixed:** `migrate_picture_metadata()` now partitions on `catalog_id` before upserting — inserts
+only linked records, and logs each unlinkable one to `rat_migration.reject_log`
+(`severity="ambiguous"`, lazily-opened shared connection, same pattern as the two Session 7 call
+sites) instead of silently dropping it. A file on disk that no catalog row claims is worth surfacing.
+
+**Cleaned:** the 931 NULL rows deleted from live `oci` — snapshotted to CSV first, and executed
+inside a transaction guarded on `deleted == 931 AND linked_count unchanged`, committing only if both
+held (they did). `picture_metadata` now reads **141,111**.
+
+**Verified against real data, not assumed:** replayed the new partition logic over the real 141,243
+local files against the real live catalog lookup — 141,111 would insert, 132 would skip, and 141,111
+is *exactly* the live row count. So a re-run now inserts nothing and adds no NULL rows: genuinely
+idempotent, which is the property that was broken. (Stopped short of a full live Stage 2 run purely
+for time — the expensive part is `process_image_folder()` opening 141k files through PIL.)
+
+### Open Threads
+
+- **New**: 132 stale space-stripped `.webp` files still on disk in the export folder — now harmless
+  (logged, not duplicated), but deleting them is an untaken call; `msmsa0265`'s disappearance from
+  `rat.catalog` between 2026-09-12 and 2026-09-18 unexplained; the new skip path not yet exercised
+  through a real full Stage 2 run (logic verified against live data instead).
+- *(Carried, unchanged)*: Migration Overview's widget rendering not visually confirmed;
+  `PicaLocoBackend`/`picaloco` rebrand (still gated on stability); restore procedure not rehearsed;
+  `picaloco_agent` distribution blocked on the deferred AV/code-signing decision (Session 22);
+  `gui/logs/` stray leftover cleanup.
+
+---

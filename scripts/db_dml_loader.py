@@ -1818,13 +1818,47 @@ def migrate_picture_metadata(df):
         # Process all images
         metadata_data = process_image_folder()
         logger.info(f"Processed {len(metadata_data)} images")
-        
+
         # Update catalog IDs
         update_picture_catalog_ids(metadata_data)
-        
+
+        # A local image file whose name matches no catalog row is unlinkable, and
+        # catalog_id is UNIQUE-constrained -- SQL NULL != NULL, so every re-run
+        # inserted yet another orphan copy of it (same trap migrate_catalog_metadata()
+        # already guards against; picture_metadata was missed when that was fixed).
+        # Skip rather than accumulate, and surface each one instead of dropping it
+        # silently -- a file on disk that no catalog row claims is worth seeing.
+        linked = [r for r in metadata_data if r['catalog_id'] is not None]
+        unlinked = [r for r in metadata_data if r['catalog_id'] is None]
+        reject_conn = None
+        for rec in unlinked:
+            if reject_conn is None:
+                try:
+                    reject_conn = reject_log.open_connection(config, target_profile)
+                except Exception:
+                    reject_conn = False
+            if reject_conn:
+                reject_log.log_reject(
+                    config, target_profile, source_script="db_dml_loader.py", stage="load",
+                    severity="ambiguous", image_no=Path(rec['file_name']).stem,
+                    table_name=tgt_table,
+                    reason="picture_metadata: local image file matches no catalog row -- "
+                           "its image_no may have been renamed/removed in FileMaker, or the "
+                           "file is a stale export under an outdated filename.",
+                    source_data={'file_name': rec['file_name']}, run_id=run_id, conn=reject_conn,
+                )
+        if reject_conn:
+            try:
+                reject_conn.close()
+            except Exception:
+                pass
+        if unlinked:
+            logger.warning(f"{tgt_table}: Skipped {len(unlinked)} image file(s) with no matching "
+                           f"catalog row (logged to reject_log)")
+
         # Insert records
-        batch_upsert(f"{tgt_schema}.picture_metadata", metadata_data, uniq_columns=['catalog_id'], quiet=True)
-        logger.info(f"{tgt_schema}: Completed picture_metadata migration. Migrated {len(metadata_data)} picture metadata entries")
+        batch_upsert(f"{tgt_schema}.picture_metadata", linked, uniq_columns=['catalog_id'], quiet=True)
+        logger.info(f"{tgt_schema}: Completed picture_metadata migration. Migrated {len(linked)} picture metadata entries")
         
     except Exception as e:
         logger.error(f"Error during picture metadata migration: {str(e)}")

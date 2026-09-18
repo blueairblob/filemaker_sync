@@ -247,6 +247,23 @@ its own `catalog` insert already failed, no sentinel makes sense for the spine t
 by running Stage 2 twice and confirming zero growth; 58,326 + 9 accumulated legacy duplicates cleaned up
 once. See `devlog/worksheet.md` Session 7.
 
+**`picture_metadata` had the SAME bug, missed by that fix — found and fixed Session 25.**
+`migrate_picture_metadata()` upserts on `uniq_columns=['catalog_id']`, but a local image file whose
+name matches no `rat.catalog` row gets `catalog_id = None` — and SQL `NULL != NULL`, so those rows
+never conflicted and **every Stage 2 run inserted another copy** (worst offenders observed at **12×**,
+i.e. twelve accumulated runs). `migrate_catalog_metadata()`'s own comment already spelled out this
+exact trap; `picture_metadata` just never got the same guard. Now it partitions before upserting:
+unlinkable records are skipped and each one logged to `rat_migration.reject_log`
+(`severity="ambiguous"`) rather than silently dropped — a file on disk that no catalog row claims is
+worth seeing. **The table was never "0 rows / no local images"** (a claim that sat in this document
+for ~12 sessions): it held 142,042 rows — 141,111 correct + 931 accumulated NULL-key junk, since
+cleaned out (snapshotted first; the 45 backtick-named images among them already had correct rows, the
+other 132 were stale files). Verified against real data: 141,243 local files → 141,111 insert,
+132 skip, exactly matching the live table, so a re-run is now genuinely idempotent. Those 132 are
+mostly **pre-Session-19 space-stripped filenames** (`Barreiro(1).webp` vs the real `Barreiro (1)`) —
+stale exports left behind when that bug's fix re-exported them under correct names; deleting them
+from disk is a separate, not-yet-taken call. See `devlog/worksheet.md` Session 25.
+
 **Fixed a silent one-row-per-table loss (Session 5):** `read_data_from_migration_schema()` had a dead
 debug line (`first_row = result.fetchone()`) that consumed a row off the cursor before the real read
 loop. This plausibly explains the long-standing "catalog is 1 short of the manifest" mystery below —
@@ -338,8 +355,10 @@ changing a value in transit, before assuming either.
 - **Migration is whole.** Freshest live counts on `oci` (Session 13, 2026-09-04, post-cleanup — supersedes
   older per-session figures below, kept for historical context): `catalog` / `catalog_metadata` / `usage` =
   **141,244**; `builder` 518 (517 real + `'UNK'` sentinel); `catalog_builder` 116,538; `organisation` 1,520;
-  `location` 14,178; `route` 2,874; `photographer` 270; `collection` 66; `picture_metadata` 0 (needs local
-  image files, none present in any session so far). `rat_migration.*` staging tables now exactly match the
+  `location` 14,178; `route` 2,874; `photographer` 270; `collection` 66; `picture_metadata` **141,111**
+  (Session 25 — the long-standing "0, needs local image files" claim was stale on both counts: the files
+  have been present since the Session 19 re-export, and the table had in fact been populated; see the
+  `picture_metadata` entry under "Loader status" below). `rat_migration.*` staging tables now exactly match the
   live FileMaker source row-for-row (no accumulated duplication — see "GUI status" above for the bug that
   caused and then fixed that). Older snapshot (Sessions 3–5, `catalog` **141,243**, `builder` 516, `route`
   2863, `location` 14176, `organisation` 1519, `catalog_builder` 116530, `picture_metadata` 141420 — that
@@ -355,8 +374,10 @@ changing a value in transit, before assuming either.
   141,262 rows, 0 NULL, moves on edit). Two-pass: skinny scan `SELECT image_no, ROWID, ROWMODID` -> extract
   only the delta. Manifest = `rat_migration.sync_manifest`, keyed on `image_no`, storing last-loaded ROWMODID.
 - **Known data-quality debris (surfaced, mostly report-only):** 13 duplicate `image_no` (12 `br...`, plus
-  `lwp8181`); 3 NULL `image_no` (ROWIDs 42279, 47343, 145873); 354 `picture_metadata` rows with NULL
-  `catalog_id`. **The "catalog is 1 short of the manifest" mystery is solved (Session 5):** root cause was
+  `lwp8181`); 3 NULL `image_no` (ROWIDs 42279, 47343, 145873); `picture_metadata` rows with NULL
+  `catalog_id` (354 on the old cloud target; had grown to 931 on `oci` — **root-caused, fixed and cleaned
+  out in Session 25**, now 0, see "Loader status" below).
+  **The "catalog is 1 short of the manifest" mystery is solved (Session 5):** root cause was
   `read_data_from_migration_schema()`'s dead `first_row = result.fetchone()` line silently consuming a row
   off the cursor. Fixed; a fresh full load on the `oci` target landed `catalog` at exactly 141,244, matching
   the manifest. (The cloud target itself wasn't re-loaded this session, so its `catalog` may still read
@@ -724,7 +745,10 @@ duplicate group's rows are genuinely distinct photos independently mistyped onto
 double-scans of one photo. Remediation is still FileMaker-side (out of this pipeline's control by
 design) — this only makes the hand-off real.
 
-Smaller open threads: `picture_metadata` untested against real images (no local files); the 16
+Smaller open threads: the 132 stale space-stripped image files still sitting in the local export
+folder (harmless, now logged rather than duplicating — deleting them from disk is an untaken call);
+`msmsa0265` was in `rat.catalog` on 2026-09-12 but is not now, noticed in passing during the
+Session 25 `picture_metadata` work and not chased down; the 16
 flagged source records are now a persisted hand-off (`rat_migration.reject_log` +
 `rejects_key_debris_20260915.xlsx`) — still need a RAT volunteer with FileMaker access to actually
 fix them;
