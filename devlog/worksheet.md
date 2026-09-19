@@ -46,6 +46,12 @@ step below has been independently verified live (not assumed), most recently 202
 - Also note: each step above has been proven *individually*, at different times — not yet rehearsed
   as one single, continuous, start-from-nothing drill in one sitting.
 
+**A second, faster recovery path exists for "data lost, host survives"**: restoring `oci`'s own
+automated `pg_dump`/Storage-tar backups (Session 17) instead of rebuilding from FileMaker — see
+`picaloco_web/DEVOPS.md` §10, rehearsed for real Session 27. Different mechanics, different gotcha
+(that path's dump expects a Supabase-bootstrapped `extensions` schema; this FileMaker-rebuild chain
+self-provisions its own extension in `bootstrap_rat_schema.sql` and is unaffected).
+
 See `picaloco_web/DEVOPS.md` §3 for the same schema/grants steps from that repo's own perspective,
 and Session 17 below for the exact verification performed.
 
@@ -3653,5 +3659,69 @@ operation in this pipeline, the loop mechanics aren't trustworthy on their own.
   `picaloco` rebrand (still gated on stability); restore procedure not rehearsed; `picaloco_agent`
   distribution blocked on the deferred AV/code-signing decision (Session 22); `gui/logs/` stray
   leftover cleanup.
+
+---
+
+## Session 27 — 2026-09-19 — Restore procedure rehearsed for real; a genuine gap found and fixed
+
+Picked up the oldest standing open thread — carried since Session 17 (2026-09-07): `oci`'s automated
+`pg_dump`/Storage-tar backups had never actually been restored, only trusted. Rehearsed both, live,
+against the real 2026-09-19 backups.
+
+**Deliberately deviated from `picaloco_web/DEVOPS.md` §10's literal documented restore command.**
+That command (`pg_restore -U supabase_admin -d postgres --clean --if-exists`, and the Storage tar
+extracted straight into `/var/lib/storage`) is correct for a *real* disaster, where there's nothing
+live left to protect — but rehearsing it literally would mean running `--clean` against the actual
+live `rat`/`rat_migration` schemas and overwriting the actual live Storage volume. Designed an
+isolated version instead: Postgres restored into a throwaway `rat_restore_test` database on the same
+cluster (not `-d postgres`); Storage extracted into a throwaway `/tmp/storage_restore_test`
+directory (not `/var/lib/storage`). Both cleaned up (dropped/removed) after verification.
+
+**Execution split between assistant and user, deliberately.** Read-only checks (container health,
+backup file listing, confirming `id_rsa_oci` — not the unqualified `huey` SSH config entry, which
+had no `IdentityFile` and silently fell back to the wrong default key — is the right key for the
+`huey` host) were run directly. The actual mutating steps (creating a scratch database, `docker cp`,
+extracting an archive, even into throwaway locations) were handed to the user to run themselves as a
+single script, consistent with this project's standing pattern for any live-`oci`-host action.
+
+**First run failed — and that's exactly what a rehearsal is for.** `pg_restore` errored on the very
+first `CREATE TABLE`: `schema "extensions" does not exist`, cascading into 87 errors (every
+downstream `COPY`/constraint/grant references a table that was never created). Root cause: every
+`rat.*` table's `id` column defaults to `extensions.uuid_generate_v4()`, and Supabase's own project
+bootstrap installs that schema+extension into the live `postgres` database automatically — but a
+hand-created scratch database never goes through that bootstrap, so it starts genuinely empty.
+Confirmed live what's actually installed (`uuid-ossp` **and** `pgcrypto`, both in schema
+`extensions`) rather than guessing, fixed the rehearsal script to provision both before `pg_restore`,
+and the second run went clean.
+
+**Second run — clean, and the numbers prove it, not just the exit code.** Postgres: all four
+spot-checked tables in the restored scratch database matched the live database **exactly** —
+`catalog` 141,244/141,244, `catalog_metadata` 141,244/141,244, `picture_metadata` 141,111/141,111
+(the exact number Session 25's cleanup left it at), `sync_manifest` 141,244/141,244. Storage:
+141,327 files extracted — matching the real live bucket's object count already confirmed in Session
+21's relay test — and a spot-checked file (`msmsa0265.webp`) was present with real content, stored
+under Supabase's own directory-per-object-plus-UUID-version-file convention (not corruption, just
+what a correct extraction of that backend's on-disk layout looks like).
+
+**Documented the finding where it actually matters, not just in this log.** Updated
+`picaloco_web/DEVOPS.md` §10 (where the restore commands themselves live) with the rehearsal result
+and the extensions-schema prerequisite, and this file's own Disaster Recovery reference section with
+a pointer distinguishing the two now-real recovery paths: rebuild from FileMaker (self-provisions
+its own extension in `bootstrap_rat_schema.sql`, unaffected by this gap) vs. restore from backup
+(needs the fix above, but only when restoring onto a target that never went through Supabase's own
+bootstrap — a fresh host after a full host loss, not the existing live database, which already has
+both extensions).
+
+### Open Threads
+
+- **Resolved**: restore procedure — rehearsed live for both Postgres and Storage, one real gap found
+  and fixed (documented in `picaloco_web/DEVOPS.md` §10), not just assumed to work.
+- *(Carried, unchanged)*: `msmsa0265`'s disappearance from `rat.catalog` unexplained; the
+  `picture_metadata` skip path not yet exercised through a real full Stage 2 run; Migration
+  Overview's widget rendering not visually confirmed; `PicaLocoBackend`/`picaloco` rebrand (still
+  gated on stability); `picaloco_agent` distribution blocked on the deferred AV/code-signing
+  decision (Session 22); `gui/logs/` stray leftover cleanup; the disaster-recovery chain still not
+  rehearsed as one single continuous start-from-nothing drill (each piece proven separately); off-host
+  backup copy still deliberately deferred.
 
 ---
