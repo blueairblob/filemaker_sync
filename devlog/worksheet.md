@@ -3725,3 +3725,78 @@ both extensions).
   backup copy still deliberately deferred.
 
 ---
+
+## Session 28 — 2026-09-19, same day — `msmsa0265` "disappearance" solved: it never happened
+
+Picked up the oldest still-open thread from this same session's earlier work. It wasn't a
+disappearance at all — the row was there the whole time, and finding out why exposed a real,
+previously-unknown gap in how a broken source value can silently become unlinkable.
+
+**Went to the actual source rather than re-checking Postgres a third time.** WSL↔Windows interop
+happened to be working this session (unlike earlier in this conversation), so queried the real,
+live FileMaker file directly instead of speculating from the target side alone. `image_no =
+'msmsa0265'` (exact match): 0 rows — consistent with the earlier finding. But `image_no LIKE
+'msmsa02%'` turned up the real story: a clean `msmsa020`–`msmsa029` sequence (De Aar shed yard
+photos, all `entry_date` 2019-06-12 — old data, not a recent edit), except one:
+`` msmsa026<CR>5 `` — a literal embedded carriage return sitting between `026` and `5`, and three
+neighbours (`msmsa027<CR>`, `msmsa028<CR>`, `msmsa029<CR>`) with a *trailing* CR each.
+
+**The trailing-CR ones are a red herring — they explain nothing, because they resolve cleanly.**
+`stripy()` (`db_dml_loader.py`) is `txt.strip()`, which removes leading/trailing whitespace
+including `\r` — so `msmsa027<CR>` becomes `msmsa027` on the way into `rat.catalog.image_no`,
+exactly matching its neighbours. Confirmed directly: `rat.catalog` holds clean `msmsa027`/`028`/`029`
+rows. **The one with the *internal* CR is different** — `.strip()` only touches the ends of a
+string, so `msmsa026<CR>5` survives completely unchanged into `rat.catalog.image_no`. This is the
+loader behaving *correctly*, not a bug — Golden Rule #1 says quarantine broken source data, never
+silently coerce it, and preserving the raw value (even a broken one) is exactly that principle
+working as intended.
+
+**Re-checked `rat.catalog` with the right query and found the row immediately.** My own Session 25/26
+"0 rows, must be deleted" conclusion came from `image_no ILIKE '%msmsa0265%'` — a substring match
+that can *never* succeed against a value with a character sitting in the middle of that substring.
+`image_no LIKE 'msmsa02%'` (a plain prefix match) found all 10 rows immediately, `msmsa026<CR>5`
+among them, present the whole time. **Nothing was ever deleted; nothing in this codebase's history
+supports a deletion path existing at all** (confirmed by grepping every script for any `DELETE FROM
+rat.catalog` — none exists outside a single documented one-off manual cleanup in Session 19, for a
+different, named row). The "disappearance" was purely an artifact of the wrong query.
+
+**But solving the false alarm exposed a real, different bug — the actual reason
+`picture_metadata` couldn't link this photo.** `export_images()`'s local-filename builder
+deliberately strips embedded `\r`/`\n` (Session 19's fix — a filesystem literally can't store a
+filename containing one), so this photo exports to disk as the clean `msmsa0265.webp` and — since
+`upload_images_oci.py`/`process_image_folder()` both key off the *local file's stem*, never the raw
+DB value — uploads to Storage and gets looked up under that same clean key. But `rat.catalog`'s real,
+raw `image_no` for this row is `msmsa026<CR>5`, not `msmsa0265` — so
+`update_picture_catalog_ids()`'s `lookup_caches['catalog'].get(stripy(image_no))` can never find a
+match (`stripy()` doesn't touch the internal CR either), and the photo stays permanently unlinkable
+under this row's real key. This is the exact same mechanism that made Session 25/26's cleanup
+classify `msmsa0265.webp` as an orphan with "no matching catalog row" — that classification was
+correct, just for a different reason than either of us assumed at the time (a stale duplicate vs. a
+live-but-mismatched key).
+
+**Scope confirmed narrow, not systemic**: `image_no ~ '[\r\n]'` across the entire 141,244-row live
+catalog found exactly **1** match — this one row. Not worth a general-purpose fix for a single
+instance; logged it instead, the same way `audit_key_debris.py` already handles this class of
+FileMaker-side problem — `rat_migration.reject_log`, `severity="reject"`, id
+`bfa15e27-fd52-4c37-9f27-402a91ce2f47`, reason naming the exact record, its likely intended value,
+and the mechanism by which it's silently unlinkable. Left the stored value untouched — Golden Rule
+#1 again: don't guess a fix for hand-entered data, however obvious it looks.
+
+### Open Threads
+
+- **Resolved**: `msmsa0265`'s "disappearance" — it never disappeared; root-caused to a genuinely
+  broken source value plus a mismatch between the DB's whitespace-preserving natural key and the
+  filesystem-safe local export filename. Logged for a volunteer to fix at the source.
+- **New, deliberately not fixed**: the underlying mechanism (an embedded `\r`/`\n` in `image_no`
+  makes a photo permanently unlinkable in `picture_metadata`, even though its catalog row exists) is
+  real and could recur — currently affects exactly 1 row, not treated as worth a code fix at this
+  volume. Revisit if the general validation pass (Session 23, currently scoped to free-text
+  columns) is ever extended to `image_no` itself.
+- *(Carried, unchanged)*: the `picture_metadata` skip path not yet exercised through a real full
+  Stage 2 run; Migration Overview's widget rendering not visually confirmed; `PicaLocoBackend`/
+  `picaloco` rebrand (still gated on stability); `picaloco_agent` distribution blocked on the
+  deferred AV/code-signing decision (Session 22); `gui/logs/` stray leftover cleanup; the
+  disaster-recovery chain still not rehearsed as one single continuous drill; off-host backup copy
+  still deliberately deferred.
+
+---

@@ -270,6 +270,26 @@ cases, just an accented character instead — previously unlogged; now in `rejec
 file is the only surviving copy and was deliberately left alone. See `devlog/worksheet.md`
 Sessions 25–26.
 
+**A fourth instance of the same family, found Session 27 — `msmsa0265` never disappeared from
+`rat.catalog`; it was never there under that exact string.** Chasing the Session 25/26 open thread
+("was in `rat.catalog` on 2026-09-12, wasn't there by 2026-09-18") turned up a real, currently-live
+source-data defect instead of a deletion: FileMaker's real value for this record is
+`` msmsa026<CR>5 `` — a literal embedded carriage return between `026` and `5`, almost certainly
+meant to be `msmsa0265` (its neighbours are a clean `msmsa020`–`msmsa029` sequence). `stripy()`
+(`.strip()`) only trims leading/trailing whitespace, so this internal `\r` survives unchanged into
+`rat.catalog.image_no` — correctly honouring Golden Rule #1, not a bug in the loader. The actual gap:
+`export_images()`'s local-filename builder *does* strip embedded `\r`/`\n` (Session 19's fix, since a
+filename genuinely can't contain one), so the exported photo lands on disk as the clean
+`msmsa0265.webp` and gets uploaded to Storage under that clean key — which no longer matches this
+row's real, raw `image_no`, so `picture_metadata`'s filename-based lookup can never link it. My own
+Session 25/26 write-ups treated this as "disappeared" based on an `ILIKE '%msmsa0265%'` substring
+check, which can never match a value with a character embedded inside it — a false negative, not
+evidence of deletion. Confirmed live: only **1** row in the entire 141,244-row catalog has any
+embedded CR/LF in `image_no` (queried `image_no ~ '[\r\n]'` directly) — this is a rare one-off, not a
+systemic pattern. Logged to `reject_log` (`severity="reject"`, id `bfa15e27-fd52-4c37-9f27-402a91ce2f47`)
+for a volunteer to retype in FileMaker; left the stored value itself untouched, per Golden Rule #1 —
+this pipeline doesn't guess a fix for hand-entered data, even an obvious-looking one.
+
 **Fixed a silent one-row-per-table loss (Session 5):** `read_data_from_migration_schema()` had a dead
 debug line (`first_row = result.fetchone()`) that consumed a row off the cursor before the real read
 loop. This plausibly explains the long-standing "catalog is 1 short of the manifest" mystery below —
@@ -751,10 +771,7 @@ duplicate group's rows are genuinely distinct photos independently mistyped onto
 double-scans of one photo. Remediation is still FileMaker-side (out of this pipeline's control by
 design) — this only makes the hand-off real.
 
-Smaller open threads: `msmsa0265` was in `rat.catalog` on 2026-09-12 but is not now, noticed in
-passing during the Session 25 `picture_metadata` work and not chased down (its correctly-named local
-file was deliberately left alone during the Session 26 stale-file cleanup, since it's real, not
-stale); the 16
+Smaller open threads: the 16
 flagged source records are now a persisted hand-off (`rat_migration.reject_log` +
 `rejects_key_debris_20260915.xlsx`) — still need a RAT volunteer with FileMaker access to actually
 fix them;
