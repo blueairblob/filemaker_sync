@@ -76,16 +76,21 @@ def _fetch_records(conn, image_nos: list[str] | None) -> list[tuple[str, str | N
         return cur.fetchall()
 
 
-def write_csv(path: Path, rows: list[FixRow], descriptions: dict[str, str | None]) -> None:
+def row_descriptions(records: list[tuple[str, str | None]]) -> list[str | None]:
+    """One description per FixRow, parallel to build_rows(records) (2 rows per record).
+    Kept per record, not keyed by image_no, because image_no has known duplicates."""
+    return [d for _, d in records for _ in FIX_IDS]
+
+
+def write_csv(path: Path, rows: list[FixRow], descriptions: list[str | None]) -> None:
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["image_no", "fix_id", "confidence", "values", "description"])
-        for r in rows:
-            w.writerow([r.image_no, r.fix_id, r.confidence, VALUE_SEP.join(r.values),
-                        descriptions.get(r.image_no) or ""])
+        for r, d in zip(rows, descriptions, strict=True):
+            w.writerow([r.image_no, r.fix_id, r.confidence, VALUE_SEP.join(r.values), d or ""])
 
 
-def print_report(rows: list[FixRow], descriptions: dict[str, str | None],
+def print_report(rows: list[FixRow], descriptions: list[str | None],
                  sample_high: int, seed: int = 2026) -> None:
     summary = summarise(rows)
     print("Summary:")
@@ -98,11 +103,12 @@ def print_report(rows: list[FixRow], descriptions: dict[str, str | None],
         return
     rng = random.Random(seed)
     for fix in FIX_IDS:
-        high = [r for r in rows if r.fix_id == fix and r.confidence == "high"]
+        high = [k for k, r in enumerate(rows) if r.fix_id == fix and r.confidence == "high"]
         picks = rng.sample(high, min(sample_high, len(high)))
         print(f"\n{len(picks)} random high {fix} rows (seed {seed}):")
-        for i, r in enumerate(picks, 1):
-            desc = " ".join((descriptions.get(r.image_no) or "").split())
+        for i, k in enumerate(picks, 1):
+            r = rows[k]
+            desc = " ".join((descriptions[k] or "").split())
             print(f"  {i:2d}. {r.image_no} | {VALUE_SEP.join(r.values)} | {desc}")
 
 
@@ -116,7 +122,7 @@ def dry_run(cfg: dict, target_profile: str | None, image_nos: list[str] | None,
         records = _fetch_records(conn, image_nos)
     finally:
         conn.close()
-    descriptions = dict(records)
+    descriptions = row_descriptions(records)
     rows = build_rows(records, place_names)
     if out_csv:
         write_csv(out_csv, rows, descriptions)

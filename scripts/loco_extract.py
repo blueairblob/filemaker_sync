@@ -94,7 +94,7 @@ NOT_NAME = frozenset({"Class", "Railway", "Railways", "Diesel", "Electric", "Tan
                       "Shed", "Station", "Junction", "Yard"})
 # Marker words are never name words ("No. 60103 ..." must not read "No" as a name).
 MARKER_NOT_NAME = frozenset({"No", "Nos", "Nr", "Number", "Numbers"})
-CONNECTORS = frozenset({"of", "the", "de", "del", "du", "la"})
+CONNECTORS = frozenset({"of", "the", "de", "del", "du", "la", "&"})
 # Type and place words: a candidate containing one is a description, not a name
 # ("Garratt", "No. 5 Colliery").
 TYPE_WORDS = frozenset({"Colliery", "Garratt", "Garratts", "Mallet", "Mallets", "Fireless",
@@ -104,6 +104,9 @@ _WHEEL_RE = re.compile(r"\d-\d+-\d+(?:-\d+)*[A-Z]{0,3}")
 _WORD_RE = re.compile(r"[A-Za-z][A-Za-z'\u2019\-]*(?![\w])")
 # Dotted initials ("G.H.", "T.W.Lewis", "V.C.") or a short abbreviation ("Jr.").
 _INITIALS_RE = re.compile(r"(?:[A-Z]\.)+(?:[A-Z][a-z][A-Za-z'\-]*(?![\w.]))?|[A-Z][a-z]\.(?=\s|$)")
+# A regnal numeral ends a name ("King Edward 1", "King Charles II"); single I/V/X are
+# already ordinary name words.
+_REGNAL_RE = re.compile(r"(?:II|III|IV|VI|VII|VIII|IX|[1-9])(?![\w/\-]|\.\d)")
 _QUOTED_RE = re.compile(r"\"([^\"\n]{1,60})\"|\u2018([^\u2019\n]{1,60})\u2019|'([^'\n]{1,60})'")
 _LEVEL = {"low": 1, "med": 2, "high": 3}
 
@@ -115,14 +118,33 @@ def _is_name_word(w: str) -> bool:
 
 
 def _name_at(text: str, pos: int) -> str | None:
-    """Parse a run of Title-case words (with connectors) starting at/after pos."""
+    """Parse a run of Title-case words (with connectors) starting at/after pos.
+
+    '&' joins a name only if the run then ends cleanly (stop word, punctuation or
+    end of text): "Peninsular & Orient S. N. Co stands" keeps it, while
+    "Duchess of Gloucester & English Electric type 4" falls back to before '&'."""
     words: list[str] = []
+    amp = None  # len(words) before the latest '&'
+    clean = False  # did the run end cleanly?
     i = pos
     while True:
         j = i
         while j < len(text) and text[j] in " \t":
             j += 1
         if words and j == i:  # no whitespace: punctuation or end follows
+            clean = True
+            break
+        if j >= len(text):
+            clean = True
+            break
+        if words and text[j] == "&":
+            amp = len(words)
+            words.append("&")
+            i = j + 1
+            continue
+        if words and words[-1] != "&" and (m := _REGNAL_RE.match(text, j)):
+            words.append(m.group())
+            clean = True
             break
         m = _INITIALS_RE.match(text, j)
         if m and m.group().rstrip(".") not in MARKER_NOT_NAME:
@@ -131,9 +153,11 @@ def _name_at(text: str, pos: int) -> str | None:
             continue
         m = _WORD_RE.match(text, j)
         if not m:
+            clean = not text[j].isalnum()
             break
         w = m.group()
         if w.lower() in STOP_WORDS:
+            clean = True
             break
         if w in CONNECTORS:
             if not words:
@@ -142,6 +166,8 @@ def _name_at(text: str, pos: int) -> str | None:
             break
         words.append(w)
         i = m.end()
+    if amp is not None and not clean:
+        words = words[:amp]
     while words and words[-1] in CONNECTORS:
         words.pop()
     return " ".join(words) if words else None
@@ -154,27 +180,23 @@ def extract_loco_names(description: str | None, place_names: frozenset[str]) -> 
 
     found: dict[str, int] = {}  # name -> best level
 
-    def add(name: str | None, level: str) -> bool:
-        """Record a candidate; True when it was dropped as a place name."""
-        if not name:
-            return False
-        if name.lower() in place_names:
-            return True
+    def add(name: str | None, level: str, filter_places: bool = True) -> None:
+        if not name or (filter_places and name.lower() in place_names):
+            return
         if not any(w in TYPE_WORDS for w in name.split()):
             found[name] = max(found.get(name, 0), _LEVEL[level])
-        return False
 
-    # A marked name dropped as a place is usually a 2nd loco named after a place
-    # ("34102 Lapford ... D826 Jupiter"), so what is left cannot be high.
+    # Straight after a marked number, a name is kept even when it is also a place:
+    # many locos are named after places ("34102 Lapford", "W24 Calbourne").
+    # A plural marker with one number means a 2nd loco went unmarked: never high.
     capped = False
     for start, end in _marked_spans(text):
         if text[start:end].endswith("."):  # "No. 734. This was ..." -- sentence ended
             continue
-        if add(_name_at(text, end), "high") or _plural_single(text, start, end):
-            capped = True
+        add(_name_at(text, end), "high", filter_places=False)
+        capped = capped or _plural_single(text, start, end)
     for m in _WHEEL_RE.finditer(text):
-        hit = _name_at(text, m.end())
-        add(hit, "med")
+        add(_name_at(text, m.end()), "med")
     for m in _QUOTED_RE.finditer(text):
         inner = next(g for g in m.groups() if g is not None).strip()
         hit = _name_at(inner, 0)

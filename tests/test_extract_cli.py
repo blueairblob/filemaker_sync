@@ -22,3 +22,20 @@ def test_summarise_counts():
         "loco_number": {"high": 1, "low": 1, "none": 1},
         "loco_name": {"high": 1, "none": 2},
     }
+
+
+def test_dry_run_keeps_description_per_record(tmp_path, capsys):
+    import csv
+
+    from extract_loco_fields import print_report, row_descriptions, write_csv
+    records = [("dup", "Class 4 number 42616 Flying Fox heads"), ("dup", "Car number 19 departs")]
+    rows = build_rows(records, frozenset())
+    descs = row_descriptions(records)
+    out = tmp_path / "o.csv"
+    write_csv(out, rows, descs)
+    got = [(r["values"], r["description"]) for r in csv.DictReader(open(out, encoding="utf-8"))
+           if r["fix_id"] == "loco_number"]
+    assert got == [("42616", records[0][1]), ("19", records[1][1])]
+    print_report(rows, descs, 5)
+    shown = capsys.readouterr().out
+    assert records[0][1] in shown and records[1][1] in shown
