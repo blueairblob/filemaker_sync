@@ -38,13 +38,24 @@ def _clean(value: str) -> str:
     return value.rstrip(".,;:)-/")
 
 
+def _normalise(description: str) -> str:
+    """Blank out works numbers and the phrase 'number of' (not running numbers)."""
+    return _NUMBER_OF_RE.sub(" ", _WORKS_RE.sub(" ", description))
+
+
+def _marked_spans(text: str) -> list[tuple[int, int]]:
+    """Spans of marker-introduced number lists in already-normalised text."""
+    return [m.span() for m in _LIST_RE.finditer(text)]
+
+
 def extract_loco_numbers(description: str | None) -> Extraction:
     if not description or not description.strip():
         return Extraction((), "none")
-    text = _NUMBER_OF_RE.sub(" ", _WORKS_RE.sub(" ", description))
+    text = _normalise(description)
 
     values: list[str] = []
-    for m in _LIST_RE.finditer(text):
+    for start, end in _marked_spans(text):
+        m = _LIST_RE.match(text, start, end)
         for tok in [m.group(1)] + _TOKEN_RE.findall(m.group(2) or ""):
             tok = _clean(tok)
             if tok and tok not in values:
@@ -61,6 +72,88 @@ def extract_loco_numbers(description: str | None) -> Extraction:
         if not _YEAR_RE.match(cand):
             return Extraction((cand,), "low")
     return Extraction((), "none")
+
+
+# --- names -----------------------------------------------------------------
+STOP_WORDS = frozenset("""stands standing heads heading built is was at on with in near pilots
+piloting departs leaves arrives climbs passes shunts runs takes waits approaches crosses hauls
+seen pulls enters and being after from to for by""".split())
+NOT_NAME = frozenset({"Class", "Railway", "Railways", "Diesel", "Electric", "Tank", "Works",
+                      "Shed", "Station", "Junction", "Yard"})
+# Marker words are never name words ("No. 60103 ..." must not read "No" as a name).
+MARKER_NOT_NAME = frozenset({"No", "Nos", "Nr", "Number", "Numbers"})
+CONNECTORS = frozenset({"of", "the", "de", "du", "la"})
+
+_WHEEL_RE = re.compile(r"\d-\d+-\d+(?:-\d+)*[A-Z]{0,3}")
+_WORD_RE = re.compile(r"[A-Za-z][A-Za-z'\u2019\-]*(?![\w])")
+_QUOTED_RE = re.compile(r"\"([^\"\n]{1,60})\"|\u2018([^\u2019\n]{1,60})\u2019|'([^'\n]{1,60})'")
+_LEVEL = {"low": 1, "med": 2, "high": 3}
+
+
+def _is_name_word(w: str) -> bool:
+    if not w[0].isupper() or w in NOT_NAME or w in MARKER_NOT_NAME:
+        return False
+    return not (len(w) >= 2 and w.isupper())  # LMS, BR
+
+
+def _name_at(text: str, pos: int) -> str | None:
+    """Parse a run of Title-case words (with connectors) starting at/after pos."""
+    words: list[str] = []
+    i = pos
+    while True:
+        j = i
+        while j < len(text) and text[j] in " \t":
+            j += 1
+        if words and j == i:  # no whitespace: punctuation or end follows
+            break
+        m = _WORD_RE.match(text, j)
+        if not m:
+            break
+        w = m.group()
+        if w.lower() in STOP_WORDS:
+            break
+        if w in CONNECTORS:
+            if not words:
+                break
+        elif not _is_name_word(w):
+            break
+        words.append(w)
+        i = m.end()
+    while words and words[-1] in CONNECTORS:
+        words.pop()
+    return " ".join(words) if words else None
+
+
+def extract_loco_names(description: str | None, place_names: frozenset[str]) -> Extraction:
+    if not description or not description.strip():
+        return Extraction((), "none")
+    text = _normalise(description)
+
+    found: dict[str, int] = {}  # name -> best level
+
+    def add(name: str | None, level: str) -> None:
+        if not name or name.lower() in place_names:
+            return
+        found[name] = max(found.get(name, 0), _LEVEL[level])
+
+    for _, end in _marked_spans(text):
+        hit = _name_at(text, end)
+        add(hit, "high")
+    for m in _WHEEL_RE.finditer(text):
+        hit = _name_at(text, m.end())
+        add(hit, "med")
+    for m in _QUOTED_RE.finditer(text):
+        inner = next(g for g in m.groups() if g is not None).strip()
+        hit = _name_at(inner, 0)
+        if hit == inner and len(inner.split()) <= 4:
+            add(inner, "low")
+
+    if not found:
+        return Extraction((), "none")
+    if len(found) > 1:
+        return Extraction(tuple(found), "med")
+    (name, level), = found.items()
+    return Extraction((name,), {v: k for k, v in _LEVEL.items()}[level])
 
 
 def description_hash(description: str | None) -> str:
