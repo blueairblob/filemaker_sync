@@ -242,7 +242,9 @@ BEGIN
                  AS i(image_no text, updated_at timestamptz)) AS item
    WHERE v.fix_id = p_fix_id
      AND v.image_no = item.image_no
-     AND v.updated_at = item.updated_at;   -- stale items simply don't match
+     AND v.updated_at = item.updated_at    -- stale items simply don't match
+     AND v.status = 'extracted';           -- never overwrite a person's review
+                                           -- (e.g. a needs-recheck correction)
   GET DIAGNOSTICS v_count = ROW_COUNT;
   PERFORM pg_catalog.set_config('rat.review_context', '', true);
 
@@ -365,9 +367,31 @@ DROP POLICY IF EXISTS admin_user_self_select ON rat.admin_user;
 CREATE POLICY admin_user_self_select ON rat.admin_user
   FOR SELECT TO authenticated USING (user_id = auth.uid());
 
+-- Live oci's default ACL on schema rat ({anon=r, authenticated=r,
+-- picaloco_agent=arw}) auto-grants on every new table, so revoke explicitly.
+-- picaloco_agent only exists on oci, hence the guard.
 REVOKE ALL ON rat.data_fix, rat.data_fix_value, rat.data_fix_history, rat.admin_user
   FROM anon, authenticated, PUBLIC;
 REVOKE ALL ON SEQUENCE rat.data_fix_history_id_seq FROM anon, authenticated, PUBLIC;
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'picaloco_agent') THEN
+    REVOKE ALL ON rat.data_fix, rat.data_fix_value, rat.data_fix_history, rat.admin_user
+      FROM picaloco_agent;
+    REVOKE ALL ON SEQUENCE rat.data_fix_history_id_seq FROM picaloco_agent;
+  END IF;
+END $$;
+
+-- This feature makes authenticated sessions real (admin sign-in), and live oci
+-- has authenticated holding SELECT on the private base tables (from the same
+-- default ACL). Close them to authenticated, matching anon: rat.catalog's
+-- valuation/owners_ref and picture_metadata.file_location are never public.
+-- Also revoked from anon, so a fresh bootstrap under the same default ACL ends
+-- in the same state. The public surface (mobile_catalog_view, the lookup
+-- tables, sync_status) keeps its SELECT for both roles.
+REVOKE ALL ON rat.catalog, rat.catalog_metadata, rat.catalog_builder,
+              rat.usage, rat.picture_metadata
+  FROM anon, authenticated;
 
 -- authenticated needs schema USAGE to reach anything in rat (anon already has
 -- it from bootstrap_rat_schema.sql, for mobile_catalog_view).

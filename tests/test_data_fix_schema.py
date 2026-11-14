@@ -198,6 +198,22 @@ def test_confirm_skips_stale(pg):
         assert cur.fetchone()[0] == 1
 
 
+def test_confirm_never_overwrites_correction(pg):
+    ts = seed_fix_value(pg, "s_confcorr_1", values=["CORR"], suggested_values=["NEW"],
+                        status="corrected", needs_recheck=True)
+    uid = make_admin(pg)
+    pg.commit()
+    items = psycopg2.extras.Json([{"image_no": "s_confcorr_1", "updated_at": ts.isoformat()}])
+    as_user(pg, uid)
+    with pg.cursor() as cur:
+        cur.execute("select rat.confirm_fix_values(%s, %s)", ("loco_number", items))
+        assert cur.fetchone()[0] == 0
+    pg.commit()
+    values, status, _, needs_recheck, updated_at, _, suggested = _row(pg, "s_confcorr_1")
+    assert (values, status, needs_recheck, suggested, updated_at) == (
+        ["CORR"], "corrected", True, ["NEW"], ts)
+
+
 def test_view_text_semantics(pg):
     for n in range(1, 5):
         seed_catalog(pg, f"s_view_{n}", f"view photo {n}")
@@ -319,21 +335,70 @@ def test_rpc_execute_grants(pg):
     assert "permission denied for function" in str(exc.value)
 
 
+DATA_FIX_TABLES = ("rat.data_fix", "rat.data_fix_value", "rat.data_fix_history", "rat.admin_user")
+PRIVS = ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER")
+
+
 def test_table_grants(pg):
+    """Only the briefed authenticated SELECT survives live's default ACL
+    (anon=r, authenticated=r, picaloco_agent=arw on every new rat table)."""
+    allowed = {("authenticated", t, "SELECT") for t in DATA_FIX_TABLES[:3]}
     with pg.cursor() as cur:
-        for table in ("rat.data_fix", "rat.data_fix_value", "rat.data_fix_history", "rat.admin_user"):
+        for table in DATA_FIX_TABLES:
             cur.execute("select relrowsecurity from pg_class where oid = %s::regclass", (table,))
             assert cur.fetchone()[0] is True, table
-            for role in ("anon", "authenticated"):
-                for priv in ("INSERT", "UPDATE", "DELETE", "TRUNCATE"):
+            for role in ("anon", "authenticated", "picaloco_agent", "public"):
+                for priv in PRIVS:
                     cur.execute("select has_table_privilege(%s, %s, %s)", (role, table, priv))
-                    assert cur.fetchone()[0] is False, (role, table, priv)
-            cur.execute("select has_table_privilege('anon', %s, 'SELECT')", (table,))
-            assert cur.fetchone()[0] is False, table
+                    assert cur.fetchone()[0] is ((role, table, priv) in allowed), (role, table, priv)
+
+
+PRIVATE_TABLES = ("rat.catalog", "rat.catalog_metadata", "rat.catalog_builder",
+                  "rat.usage", "rat.picture_metadata")
+
+
+def test_private_tables_closed_to_anon_and_authenticated(pg):
+    with pg.cursor() as cur:
+        for table in PRIVATE_TABLES:
+            for role in ("anon", "authenticated"):
+                cur.execute("select has_table_privilege(%s, %s, 'SELECT')", (role, table))
+                assert cur.fetchone()[0] is False, (role, table)
+        # The public surface stays readable by both, as on live.
+        for table in ("rat.mobile_catalog_view", "rat.collection", "rat.builder"):
+            for role in ("anon", "authenticated"):
+                cur.execute("select has_table_privilege(%s, %s, 'SELECT')", (role, table))
+                assert cur.fetchone()[0] is True, (role, table)
+
+
+@pytest.mark.parametrize("who", ["anon", "user", "admin"])
+def test_select_catalog_denied(pg, who):
+    seed_catalog(pg, f"s_privcat_{who}", "private")
+    uid = make_admin(pg) if who == "admin" else make_user(pg)
+    pg.commit()
+    if who == "anon":
+        as_anon(pg)
+    else:
+        as_user(pg, uid)
+    with pytest.raises(psycopg2.errors.InsufficientPrivilege):
+        with pg.cursor() as cur:
+            cur.execute("select image_no, valuation from rat.catalog limit 1")
 
 
 def test_ddl_idempotent(pg):
-    apply_sql_file(DATA_FIX_SQL)
+    ts = seed_fix_value(pg, "s_idem_1", values=["42"], suggested_values=["43"],
+                        status="corrected", needs_recheck=True)
     with pg.cursor() as cur:
-        cur.execute("select count(*) from rat.data_fix where id in ('loco_number', 'loco_name')")
-        assert cur.fetchone()[0] == 2
+        cur.execute("update rat.data_fix set instructions = 'client rules v1' "
+                    "where id = 'loco_number'")
+    pg.commit()
+    before = _row(pg, "s_idem_1")
+    pg.rollback()   # leave no open transaction holding locks during the re-apply
+
+    apply_sql_file(DATA_FIX_SQL)
+
+    with pg.cursor() as cur:
+        cur.execute("select id, instructions from rat.data_fix "
+                    "where id in ('loco_number', 'loco_name') order by sort_order")
+        assert cur.fetchall() == [("loco_number", "client rules v1"), ("loco_name", "")]
+    after = _row(pg, "s_idem_1")
+    assert after == before and after[4] == ts
