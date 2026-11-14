@@ -1,6 +1,6 @@
 """Extract loco numbers and names from rat.catalog descriptions.
 
---dry-run reads the catalog in a read-only session and writes a CSV report;
+--dry-run (the default when neither flag is given) reads the catalog in a read-only session and writes a CSV report;
 it never writes to the database. --apply upserts rat.data_fix_value; rows a
 person has reviewed keep their values/status (only suggestions refresh).
 
@@ -199,8 +199,10 @@ def run(conn, image_nos: list[str] | None, dry_run: bool, out_csv: Path | None =
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    mode = p.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--dry-run", action="store_true", help="read-only report, no DB writes")
+    # Dry run is the default: --apply is the only way to write.
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true",
+                      help="read-only report, no DB writes (the default)")
     mode.add_argument("--apply", action="store_true", help="upsert rat.data_fix_value")
     p.add_argument("--config", default="config.toml")
     p.add_argument("--target-profile", default=None)

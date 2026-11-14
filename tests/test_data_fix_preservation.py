@@ -105,6 +105,13 @@ def test_loader_never_touches_data_fix():
             assert "data_fix" not in src.replace('"data_fix"', ""), name
             assert src.count("extract_loco_fields") == 2, name
             assert "import extract_loco_fields" in src and "extract_loco_fields.run(" in src
+        elif name == "db_dml_loader.py":
+            # Stage 2 may only call the extractor (one import + one .run() call,
+            # best-effort after the load, see refresh_loco_fields()); it must
+            # never name the data_fix tables itself, so it can't write them.
+            assert "data_fix" not in src, name
+            assert src.count("extract_loco_fields") == 2, name
+            assert "import extract_loco_fields" in src and "extract_loco_fields.run(" in src
         else:
             assert "data_fix" not in src and "extract_loco_fields" not in src, name
 

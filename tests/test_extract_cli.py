@@ -39,3 +39,35 @@ def test_dry_run_keeps_description_per_record(tmp_path, capsys):
     print_report(rows, descs, 5)
     shown = capsys.readouterr().out
     assert records[0][1] in shown and records[1][1] in shown
+
+
+def _stub_cli(monkeypatch):
+    """Point extract_loco_fields.main() at fakes: never a real config or DB."""
+    import extract_loco_fields
+    import reject_log
+    calls = {"dry_run": 0, "connect": 0}
+    monkeypatch.setattr(reject_log, "load_config", lambda path: {"cfg": path})
+
+    def fake_connect(*a, **k):
+        calls["connect"] += 1
+        raise AssertionError("dry run must never open a write connection")
+
+    monkeypatch.setattr(reject_log, "open_connection", fake_connect)
+    monkeypatch.setattr(extract_loco_fields, "dry_run",
+                        lambda *a, **k: calls.__setitem__("dry_run", calls["dry_run"] + 1))
+    return extract_loco_fields, calls
+
+
+def test_cli_defaults_to_dry_run(monkeypatch):
+    mod, calls = _stub_cli(monkeypatch)
+    assert mod.main([]) == 0
+    assert calls == {"dry_run": 1, "connect": 0}
+
+
+def test_cli_explicit_dry_run_and_apply_are_exclusive(monkeypatch):
+    import pytest
+    mod, calls = _stub_cli(monkeypatch)
+    assert mod.main(["--dry-run"]) == 0
+    assert calls == {"dry_run": 1, "connect": 0}
+    with pytest.raises(SystemExit):
+        mod.main(["--dry-run", "--apply"])

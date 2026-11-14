@@ -480,7 +480,8 @@ def main() -> int:
                 loco_summary = {"error": str(e)}
                 report.line(f"WARNING: loco field extraction failed, sync itself is unaffected: {e}")
                 try:
-                    reject_log.log_crash("run_incremental_sync.py")
+                    reject_log.log_crash("run_incremental_sync.py", config_path=args.config,
+                                         target_profile=profile, run_id=run_id)
                 except Exception:
                     pass
             finally:

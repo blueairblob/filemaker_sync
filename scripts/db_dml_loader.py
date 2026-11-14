@@ -1873,6 +1873,59 @@ def check_tables(required_tables, schema):
         return False
     return True
       
+def loaded_image_nos(catalog_df) -> list[str]:
+    """The non-blank image_nos in the catalog data this run loaded, stripped
+    the same way migrate_catalog() strips them, sorted and de-duplicated."""
+    if 'image_no' not in getattr(catalog_df, 'columns', []):
+        return []
+    return sorted({v for v in (stripy(x) for x in catalog_df['image_no']) if v})
+
+
+def refresh_loco_fields(image_nos, target_profile, run_id, logger, config_path=None):
+    """Refresh the loco number/name review suggestions for the rows this load
+    just wrote, so new photos join the review queue and an edited description
+    on an already-reviewed photo is flagged for recheck (the extractor itself
+    never overwrites a reviewed value). Mirrors run_incremental_sync.py's hook.
+
+    Best-effort: runs on its OWN connection (the extractor rolls back and may
+    leave its connection aborted), closes it, and never raises -- a failure
+    here is logged (plus a crash row in reject_log) but can never fail the
+    load or change its exit status. Returns a small summary dict, or None if
+    it was skipped or failed."""
+    image_nos = sorted(set(image_nos))
+    if not image_nos:
+        # Never hand the extractor an empty scope (None would mean the whole catalog).
+        logger.info("Loco fields: no catalog rows loaded this run, nothing to refresh")
+        return None
+    if config_path is None:
+        config_path = str(Path(os.getcwd()) / 'config.toml')  # same file load_config() reads
+    conn = None
+    try:
+        import extract_loco_fields
+        conn = reject_log.open_connection(reject_log.load_config(config_path), target_profile)
+        out = extract_loco_fields.run(conn, image_nos, dry_run=False)
+        ap = out.get("apply") or {}
+        summary = {"rows": out["rows"], "inserted": ap.get("inserted", 0),
+                   "refreshed": ap.get("refreshed", 0), "rechecks": ap.get("rechecks", 0)}
+        logger.info(f"Loco fields refreshed for {len(image_nos)} catalog row(s): "
+                    f"{summary['inserted']} new, {summary['refreshed']} refreshed, "
+                    f"{summary['rechecks']} flagged for recheck")
+        return summary
+    except Exception as e:
+        logger.warning(f"Loco field refresh failed; the load itself is unaffected: {e}")
+        try:
+            reject_log.log_crash("db_dml_loader.py", target_profile=target_profile, run_id=run_id)
+        except Exception:
+            pass
+        return None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def main():
     """Main function to orchestrate the migration process."""
     
@@ -1970,6 +2023,10 @@ def main():
         # migrate_prompts(prompts_df)  # not restored: migrate_prompts() doesn't exist in this file
 
     logger.info("Migration process completed")
+
+    # Review suggestions for the catalog rows just loaded (both modes). Best-effort,
+    # own connection, never affects the load's outcome -- see refresh_loco_fields().
+    refresh_loco_fields(loaded_image_nos(catalog_df), target_profile, run_id, logger)
 
 if __name__ == "__main__":
     try:
