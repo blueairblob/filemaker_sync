@@ -1,7 +1,8 @@
 """Extract loco numbers and names from rat.catalog descriptions.
 
 --dry-run reads the catalog in a read-only session and writes a CSV report;
-it never writes to the database. (--apply arrives in a later task.)
+it never writes to the database. --apply upserts rat.data_fix_value; rows a
+person has reviewed keep their values/status (only suggestions refresh).
 
     venv/bin/python scripts/extract_loco_fields.py --dry-run --target-profile oci \
         --out loco_dryrun.csv --sample-high 50
@@ -11,11 +12,11 @@ import csv
 import random
 import sys
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
 
-from loco_extract import description_hash, extract_loco_names, extract_loco_numbers
+from loco_extract import EXTRACTOR_VERSION, description_hash, extract_loco_names, extract_loco_numbers
 
 FIX_IDS = ("loco_number", "loco_name")
 VALUE_SEP = "; "
@@ -131,11 +132,76 @@ def dry_run(cfg: dict, target_profile: str | None, image_nos: list[str] | None,
     return {"rows": len(rows), "summary": summarise(rows)}
 
 
+UPSERT_SQL = """
+INSERT INTO rat.data_fix_value AS d (image_no, fix_id, values, suggested_values, confidence,
+       description_hash, extractor_version)
+VALUES %s
+ON CONFLICT (image_no, fix_id) DO UPDATE SET
+  suggested_values  = EXCLUDED.suggested_values,
+  confidence        = EXCLUDED.confidence,
+  extractor_version = EXCLUDED.extractor_version,
+  values            = CASE WHEN d.status = 'extracted' THEN EXCLUDED.values ELSE d.values END,
+  description_hash  = CASE WHEN d.status = 'extracted' THEN EXCLUDED.description_hash ELSE d.description_hash END,
+  needs_recheck     = CASE WHEN d.status <> 'extracted' AND d.description_hash <> EXCLUDED.description_hash
+                           THEN true ELSE d.needs_recheck END
+WHERE (d.suggested_values, d.confidence, d.extractor_version, d.description_hash, d.needs_recheck)
+      IS DISTINCT FROM (EXCLUDED.suggested_values, EXCLUDED.confidence, EXCLUDED.extractor_version,
+                        CASE WHEN d.status='extracted' THEN EXCLUDED.description_hash ELSE d.description_hash END,
+                        CASE WHEN d.status <> 'extracted' AND d.description_hash <> EXCLUDED.description_hash THEN true ELSE d.needs_recheck END)
+RETURNING (xmax = 0) AS inserted, needs_recheck
+"""
+
+
+@dataclass(frozen=True)
+class ApplyResult:
+    inserted: int
+    refreshed: int
+    rechecks: int
+
+
+def apply_rows(conn, rows: list[FixRow], batch: int = 1000) -> ApplyResult:
+    """Upsert into rat.data_fix_value, one commit per batch. Reviewed rows keep
+    values/status/description_hash; only suggestions refresh (and needs_recheck
+    flips on when the description changed)."""
+    from psycopg2.extras import execute_values
+    # image_no has known duplicates; one batch may not repeat a conflict key.
+    unique = list({(r.image_no, r.fix_id): r for r in rows}.values())
+    inserted = refreshed = rechecks = 0
+    for i in range(0, len(unique), batch):
+        chunk = unique[i:i + batch]
+        data = [(r.image_no, r.fix_id, list(r.values), list(r.values), r.confidence,
+                 r.description_hash, EXTRACTOR_VERSION) for r in chunk]
+        with conn.cursor() as cur:
+            res = execute_values(cur, UPSERT_SQL, data,
+                                 template="(%s,%s,%s::text[],%s::text[],%s,%s,%s)",
+                                 page_size=len(data), fetch=True)
+        conn.commit()
+        for was_inserted, needs_recheck in res:
+            if was_inserted:
+                inserted += 1
+            else:
+                refreshed += 1
+                rechecks += bool(needs_recheck)
+    return ApplyResult(inserted, refreshed, rechecks)
+
+
+def run(conn, image_nos: list[str] | None, dry_run: bool, out_csv: Path | None = None) -> dict:
+    """Extract (read) then optionally apply. image_nos=None means whole catalog."""
+    place_names = load_place_names(conn)
+    records = _fetch_records(conn, image_nos)
+    conn.rollback()  # end the read transaction before apply_rows commits
+    rows = build_rows(records, place_names)
+    if out_csv:
+        write_csv(out_csv, rows, row_descriptions(records))
+    result = None if dry_run else asdict(apply_rows(conn, rows))
+    return {"rows": len(rows), "summary": summarise(rows), "apply": result}
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     mode = p.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true", help="read-only report, no DB writes")
-    mode.add_argument("--apply", action="store_true", help="write rat.data_fix_value (later task)")
+    mode.add_argument("--apply", action="store_true", help="upsert rat.data_fix_value")
     p.add_argument("--config", default="config.toml")
     p.add_argument("--target-profile", default=None)
     p.add_argument("--image-nos-file", default=None, help="one image_no per line")
@@ -144,12 +210,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--seed", type=int, default=2026, help="sample seed (default 2026)")
     args = p.parse_args(argv)
 
-    if args.apply:
-        p.error("--apply is not implemented yet")
-
     import reject_log
     cfg = reject_log.load_config(args.config)
     image_nos = _read_image_nos(args.image_nos_file) if args.image_nos_file else None
+    if args.apply:
+        conn = reject_log.open_connection(cfg, args.target_profile)
+        try:
+            out = run(conn, image_nos, dry_run=False, out_csv=args.out)
+        finally:
+            conn.close()
+        print(f"Applied {out['rows']:,} rows: {out['apply']}")
+        return 0
     dry_run(cfg, args.target_profile, image_nos, args.out, args.sample_high, args.seed)
     return 0
 
