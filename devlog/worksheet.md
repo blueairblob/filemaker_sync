@@ -3800,3 +3800,63 @@ and the mechanism by which it's silently unlinkable. Left the stored value untou
   still deliberately deferred.
 
 ---
+
+## Session 29 — 2026-11-14 — Data Fixes: loco number and loco name, extracted live
+
+**Why.** The client wants to correct the loco numbers buried in `description`, and asked for a
+"Loco Name" filter too. Corrections must survive every future FileMaker sync, and nobody may change
+`description`. So the values live in their own tables (`rat.data_fix_value`, keyed on `image_no`,
+no FK to `rat.catalog`), which the loader never writes. Spec and plan:
+`picaloco_web/docs/superpowers/specs/2026-11-14-data-fixes-loco-number-name-design.md` and
+`picaloco_web/docs/superpowers/plans/2026-11-14-data-fixes-loco-number-name.md`.
+
+**Built (branch `data-fixes`):**
+- `scripts/loco_extract.py`, the rules. Each photo gets values and a confidence of
+  high/med/low/none. A hand-check of 50 random high rows, three seeds: numbers 50/50/49, names
+  49/49/50.
+- `scripts/extract_loco_fields.py`, dry run by default. `--apply` upserts, but never touches
+  `values` on a reviewed row. When the description changed under a reviewed row, it sets
+  `needs_recheck`.
+- `supabase/schema/add_data_fix_tables.sql`. A guard trigger rejects any change to a reviewed
+  value unless it comes from a review RPC. The RPCs check `rat.is_admin()` and an optimistic lock.
+  The file also has RLS, the history table, and the view's 4 new columns. Folded into
+  `bootstrap_rat_schema.sql`.
+- `run_incremental_sync.py` refreshes the loco fields for each verified row on its own connection.
+  A failure logs a crash row, and never fails the sync.
+- `scripts/data_fix_preservation_check.py`, a read-only checksum of every reviewed value.
+- A `tests/` pytest suite: 88 tests, schema tests on a throwaway Docker `postgres:17`.
+
+**Security fix in the same DDL.** Live `oci`'s default ACL had given `authenticated` `SELECT` on
+`rat.catalog` (including `valuation`/`owners_ref`), `catalog_metadata`, `catalog_builder`, `usage`
+and `picture_metadata`. Auth sign-up was on. So anyone who signed up and confirmed an email
+address could read private columns. The DDL revokes them (verified live: `has_table_privilege(
+'authenticated','rat.catalog','SELECT')` = `f`). Disabling sign-up is a separate, user-run step.
+
+**Live rollout (2026-11-14):**
+
+```text
+-- the user applied add_data_fix_tables.sql on huey; read-only checks:
+rat.data_fix rows                    2
+mobile_catalog_view loco_* columns   loco_names, loco_names_text, loco_numbers, loco_numbers_text
+anon REST ...?select=image_no,loco_numbers_text&limit=1   HTTP 200
+
+$ venv/bin/python scripts/extract_loco_fields.py --apply --target-profile oci
+Applied 282,488 rows: {'inserted': 282488, 'refreshed': 0, 'rechecks': 0}     (56 s)
+
+loco_name    high 14,594  med 4,918   low 1,324  none 120,408
+loco_number  high 91,329  med 15,537  low 2,141  none 32,237     (= the final dry run, exactly)
+
+anon REST image_no=eq.gd820040 -> loco_numbers ["2295"]
+
+$ venv/bin/python scripts/data_fix_preservation_check.py --target-profile oci
+{"reviewed": 0, "checksum": "d41d8cd98f00b204e9800998ecf8427e"}
+
+$ venv/bin/python scripts/extract_loco_fields.py --apply --target-profile oci   # re-run
+Applied 282,488 rows: {'inserted': 0, 'refreshed': 0, 'rechecks': 0}
+```
+
+**Open:** confirm that the first nightly backup after this (02:17) contains `data_fix`.
+`picaloco_agent`'s vendored `run_incremental_sync.py` lacks the refresh hook. The web side (search
+on the new fields, admin sign-in, review queue) is `picaloco_web` Tasks 8–13.
+
+---

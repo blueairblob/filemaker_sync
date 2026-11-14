@@ -603,6 +603,11 @@ python.exe scripts/fm_metadata_probe.py --selftest
 | Sanitisation fixtures | `test/` |
 | Source field meanings / valid values | `FileMakerPro_source_details/` |
 | History + open threads | `devlog/worksheet.md` |
+| Data Fixes extractor: loco number/name from `description` into `rat.data_fix_value` (dry run by default; `--apply` never overwrites a reviewed value; also run by Delta Sync for each verified row) | `scripts/extract_loco_fields.py`, rules in `scripts/loco_extract.py` |
+| Data Fixes schema: tables, guard trigger, review RPCs, RLS, the 37-column `mobile_catalog_view` (applied live 2026-11-14, also folded into bootstrap) | `supabase/schema/add_data_fix_tables.sql` |
+| Read-only checksum of every reviewed Data Fixes value (run before and after any reload; must not change) | `scripts/data_fix_preservation_check.py` |
+| Tests (pytest; schema tests run on a throwaway Docker `postgres:17`, never the live DB) | `tests/`, `pytest.ini` |
+| Parked work (builder-filter view change) | `TODO.md` |
 
 ---
 
