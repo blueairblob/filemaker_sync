@@ -93,6 +93,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import db_sync_manifest as dsm
+import extract_loco_fields
 import reject_log
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -388,6 +389,7 @@ def main() -> int:
         staging_rows: dict = {}
         rejected: set = set()
         quarantine_report_path = None
+        loco_summary = None
         mark: dict = {}
         false_positives = 0
         repaired_verified = 0
@@ -462,6 +464,32 @@ def main() -> int:
                 }
             pg.mark_loaded(mark)
 
+            # Loco number/name suggestions for this run's verified rows. Best-effort:
+            # runs on its OWN connection (run() rolls back / may leave the connection
+            # aborted, which must never touch the manifest's), and never fails the sync.
+            fix_conn = None
+            try:
+                fix_conn = reject_log.open_connection(cfg, profile)
+                out = extract_loco_fields.run(fix_conn, sorted(verified), dry_run=False)
+                ap = out.get("apply") or {}
+                loco_summary = {"rows": out["rows"], "inserted": ap.get("inserted", 0),
+                                    "refreshed": ap.get("refreshed", 0),
+                                    "rechecks": ap.get("rechecks", 0)}
+                report.kv("loco fields refreshed:", loco_summary["refreshed"])
+            except Exception as e:
+                loco_summary = {"error": str(e)}
+                report.line(f"WARNING: loco field extraction failed, sync itself is unaffected: {e}")
+                try:
+                    reject_log.log_crash("run_incremental_sync.py")
+                except Exception:
+                    pass
+            finally:
+                if fix_conn is not None:
+                    try:
+                        fix_conn.close()
+                    except Exception:
+                        pass
+
             report.kv("repaired (restored to rat.catalog):", repaired_verified)
             report.kv("false positives (ROWMODID moved, content didn't):", false_positives)
             report.kv("real changes:", len(verified) - false_positives - repaired_verified)
@@ -521,6 +549,8 @@ def main() -> int:
             "images_uploaded": images_uploaded,
             "quarantine_report": quarantine_report_path,
         }
+        if loco_summary is not None:
+            summary["data_fix"] = loco_summary
         write_sync_status(pg.cnxn, summary)
         print(json.dumps(summary))
     finally:

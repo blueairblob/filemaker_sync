@@ -98,7 +98,15 @@ def test_hash_parity(pg, text):
 def test_loader_never_touches_data_fix():
     for name in ("db_dml_loader.py", "filemaker_extract.py", "run_incremental_sync.py"):
         src = (SCRIPTS / name).read_text(encoding="utf-8")
-        assert "data_fix" not in src and "extract_loco_fields" not in src, name
+        if name == "run_incremental_sync.py":
+            # The sync may only call the extractor (one import + one .run() call)
+            # and report under the summary key "data_fix"; any other mention of
+            # data_fix (rat.data_fix_*, SQL, etc.) would be direct table access.
+            assert "data_fix" not in src.replace('"data_fix"', ""), name
+            assert src.count("extract_loco_fields") == 2, name
+            assert "import extract_loco_fields" in src and "extract_loco_fields.run(" in src
+        else:
+            assert "data_fix" not in src and "extract_loco_fields" not in src, name
 
 
 def test_run_scopes_to_image_nos(pg):
