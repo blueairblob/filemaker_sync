@@ -373,6 +373,11 @@ changing a value in transit, before assuming either.
    secret-free and committed. A DB password leaked here once and was rotated - don't repeat it.
 6. **Sequence: stabilise & document -> restructure -> rebrand.** Don't rename `rat`->`picaloco` or reshuffle
    into `PicaLocoBackend` until the pipeline is stable.
+7. **The client's Data Fixes reviews are irreplaceable.** `rat.data_fix_value` rows with a status other
+   than `extracted`, plus `rat.data_fix_history`, are hand-made by RAT and exist nowhere else. The
+   loader never writes these tables, and a SQL guard trigger blocks overwriting a reviewed value. Never
+   `TRUNCATE`/`DROP`/bulk-`DELETE` them, never rebuild them by re-extracting, and run
+   `scripts/data_fix_preservation_check.py` before and after any reload (the checksum must not change).
 
 ---
 
@@ -597,13 +602,13 @@ python.exe scripts/fm_metadata_probe.py --selftest
 | Shared secret resolution | `scripts/env_secrets.py` |
 | Ground-truth schema (reference only, not re-appliable) | `rat_schema_original.sql` |
 | Fresh-target bootstrap DDL (idempotent, corrections baked in, incl. `mobile_catalog_view`/`anon` grants) | `supabase/schema/bootstrap_rat_schema.sql` |
-| **Disaster recovery** — full rebuild of `oci` from FileMaker Pro, verified live, a primary use case | `devlog/worksheet.md`'s "Reference: Disaster Recovery" section, right after the intro |
+| **Disaster recovery** — full rebuild of `oci` from FileMaker Pro, verified live, a primary use case. **Except the client's Data Fixes reviews (`rat.data_fix*`): not rebuildable, restore from backup, never re-extract over them** | `devlog/worksheet.md`'s "Reference: Disaster Recovery" section, right after the intro |
 | Constraint DDL (already-applied patches, cloud target only) | `supabase/schema/fix_rat_constraints.sql`, `fix_rat_idempotency.sql` |
 | `rat.collection`/`rat.route` column additions (already-applied, also folded into bootstrap) | `supabase/schema/add_collection_route_columns.sql` |
 | Sanitisation fixtures | `test/` |
 | Source field meanings / valid values | `FileMakerPro_source_details/` |
 | History + open threads | `devlog/worksheet.md` |
-| Data Fixes extractor: loco number/name from `description` into `rat.data_fix_value` (dry run by default; `--apply` never overwrites a reviewed value; also run by Delta Sync for each verified row) | `scripts/extract_loco_fields.py`, rules in `scripts/loco_extract.py` |
+| Data Fixes extractor: loco number/name from `description` into `rat.data_fix_value` (dry run by default; `--apply` never overwrites a reviewed value; also run automatically after every Stage 2 load (`db_dml_loader.py`) and Delta Sync, for the rows each loaded) | `scripts/extract_loco_fields.py`, rules in `scripts/loco_extract.py` |
 | Data Fixes schema: tables, guard trigger, review RPCs, RLS, the 37-column `mobile_catalog_view` (applied live 2026-11-14, also folded into bootstrap) | `supabase/schema/add_data_fix_tables.sql` |
 | Read-only checksum of every reviewed Data Fixes value (run before and after any reload; must not change) | `scripts/data_fix_preservation_check.py` |
 | Tests (pytest; schema tests run on a throwaway Docker `postgres:17`, never the live DB) | `tests/`, `pytest.ini` |

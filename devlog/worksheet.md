@@ -34,6 +34,18 @@ step below has been independently verified live (not assumed), most recently 202
    required just to repopulate `rat` itself) — `python scripts/db_sync_manifest.py --baseline --yes
    --target-profile oci`.
 
+**⚠ Exception, since 2026-11-14: the client's Data Fixes reviews are NOT rebuildable from
+FileMaker.** `rat.data_fix_value`'s reviewed rows (status `verified`/`corrected`/`none_visible`/
+`no_loco`) and `rat.data_fix_history` exist only in `oci`. Running the chain above on an empty
+target, then `extract_loco_fields.py --apply`, recreates every row as an unreviewed suggestion, and
+all the client's review work is gone. **Restore those tables from the nightly backup
+(`~/backups/rat/db/`, `pg_restore`) before or instead of re-extracting. Never rebuild over them.**
+`rat.admin_user` references `auth.users`, which the `rat` dump doesn't include: on a new host,
+recreate the admin accounts first, then re-insert `admin_user` rows by email. The backup is on the
+same disk as the database (a deliberate choice made when everything was rebuildable), so a
+whole-disk loss would take the reviews with it. An off-host copy of the small `rat.data_fix*`
+tables is recommended.
+
 **Two honest caveats — don't treat this as unconditional:**
 
 - **This recovers *from* FileMaker Pro, not a backup *of* it.** If the FileMaker Pro file/database
@@ -3855,7 +3867,27 @@ $ venv/bin/python scripts/extract_loco_fields.py --apply --target-profile oci   
 Applied 282,488 rows: {'inserted': 0, 'refreshed': 0, 'rechecks': 0}
 ```
 
-**Open:** confirm that the first nightly backup after this (02:17) contains `data_fix`.
+**Web side (same day, `picaloco_web` branch `data-fixes`):**
+- Public search on `loco_numbers_text`, falling back to `description` when there's no value, plus a
+  new Loco name filter.
+- Admin sign-in, with a separate client and RLS that admits only rows listed in `rat.admin_user`.
+- The Data Fixes list with progress.
+- A keyboard review queue with an optimistic lock on the exact `updated_at` string (microseconds;
+  a JS `Date` would make every save stale).
+- A bulk-confirm grid for high confidence.
+- Every task was reviewed by subagents, then the whole branch.
+
+**The final review found three things, all fixed:**
+1. Enter on a needs-recheck card silently kept the old value as `verified`. Enter now *keeps the
+   current review*, `U` *uses the new suggestion*, and a value is `verified` only when it equals the
+   suggestion.
+2. Only Delta Sync refreshed the loco fields. `db_dml_loader.py` now does it after every load, on
+   its own connection, never failing the load. Spec §5 rule 3 is amended to match.
+3. The client's reviews can't be rebuilt from FileMaker, but the Disaster Recovery section said
+   everything could. The caveat is now there, and in CLAUDE.md as golden rule 7.
+
+**Open:** confirm that the first nightly backup after this (02:17) contains `data_fix`, and do one
+scratch restore of it. Decide on an off-host copy.
 `picaloco_agent`'s vendored `run_incremental_sync.py` lacks the refresh hook. The web side (search
 on the new fields, admin sign-in, review queue) is `picaloco_web` Tasks 8–13.
 

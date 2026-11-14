@@ -4,21 +4,23 @@ Parked work, with enough context to pick it up cold. Newest first.
 
 ---
 
-## Loco number: extract it into its own field (extracted live 2026-11-14; web admin in progress)
+## Loco number/name Data Fixes (built 2026-11-14; merge and client onboarding pending)
 
-**Status (2026-11-14):** Postgres side built and live. `add_data_fix_tables.sql` is applied on
-`oci`, and `extract_loco_fields.py --apply` filled `rat.data_fix_value` with 282,488 rows: 141,244
-photos × 2 fixes. A re-run changed nothing. The preservation baseline is `{"reviewed": 0}`.
+**Status:** built on branch `data-fixes` in both repos, and reviewed. Not merged yet: `main` is what
+Vercel deploys. The Postgres side is live: 282,488 rows extracted, preservation baseline
+`{"reviewed": 0}`. Every Stage 2 load and Delta Sync now refreshes the loco fields.
 
-| Fix | High | Med | Low | None |
-|---|---|---|---|---|
-| `loco_number` | 91,329 | 15,537 | 2,141 | 32,237 |
-| `loco_name` | 14,594 | 4,918 | 1,324 | 120,408 |
-
-Low quoted names (e.g. "Cambrian Coast Express") are kept by the user's decision. Remaining:
-`picaloco_web` search on the new fields, the admin sign-in, the review queue and bulk confirm.
-The plan is `picaloco_web/docs/superpowers/plans/2026-11-14-data-fixes-loco-number-name.md`
-(Tasks 8–13). The history below is kept for context.
+**Still open:**
+- **The reviews are irreplaceable, and their backup is on the same disk.** Prove a restore of
+  `rat.data_fix_value` from the nightly dump (command in `picaloco_web/DEVOPS.md` §12). Decide on an
+  off-host copy of the `rat.data_fix*` tables before the client does much reviewing.
+- **`picaloco_agent`'s vendored `run_incremental_sync.py`/`db_dml_loader.py` lack the refresh.** Sync
+  them before it runs at RAT, or run `extract_loco_fields.py --apply` after each agent sync.
+- **Deferred:** the description hash is taken at save time, so an edit that lands mid-review is
+  absorbed without a recheck. The preservation check is manual; it could be recorded in
+  `sync_status` on each sync.
+- **Client questions** (spec §10): format instructions per railway; whether trams, cars and units
+  count as "locos"; works numbers duplicated in `description`.
 
 **Client response, 2026-11-14 (initial):**
 - **They agree:** the data is messy, and a dedicated number field is the right fix.
