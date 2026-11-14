@@ -26,6 +26,7 @@ _NUMBER_OF_RE = re.compile(r"\bnumber of\b", re.I)
 _BARE_RE = re.compile(r"(?<![\w/\-\.])((?:[A-Z]{1,3})?\d{3,6})(?![\w/\-])")
 _YEAR_RE = re.compile(r"^(18[3-9]\d|19\d\d|20[0-2]\d)$")
 _ODD_DIGITS_RE = re.compile(r"\d{7,}")
+_PLURAL_RE = re.compile(r"(?:numbers|Nos|nos)\b")
 
 
 @dataclass(frozen=True)
@@ -48,13 +49,24 @@ def _marked_spans(text: str) -> list[tuple[int, int]]:
     return [m.span() for m in _LIST_RE.finditer(text)]
 
 
+def _plural_single(text: str, start: int, end: int) -> bool:
+    """A plural marker with one number ("numbers 60009 Union of South Africa & 60026 ...")
+    usually means a second loco went unmarked."""
+    if not _PLURAL_RE.match(text, start):
+        return False
+    m = _LIST_RE.match(text, start, end)
+    return not _TOKEN_RE.findall(m.group(2) or "")
+
+
 def extract_loco_numbers(description: str | None) -> Extraction:
     if not description or not description.strip():
         return Extraction((), "none")
     text = _normalise(description)
 
     values: list[str] = []
+    plural = False
     for start, end in _marked_spans(text):
+        plural = plural or _plural_single(text, start, end)
         m = _LIST_RE.match(text, start, end)
         for tok in [m.group(1)] + _TOKEN_RE.findall(m.group(2) or ""):
             tok = _clean(tok)
@@ -64,7 +76,7 @@ def extract_loco_numbers(description: str | None) -> Extraction:
     if len(values) == 1:
         v = values[0]
         odd = "/" in v or len(v) > 10 or _ODD_DIGITS_RE.search(v)
-        return Extraction((v,), "med" if odd else "high")
+        return Extraction((v,), "med" if odd or plural else "high")
     if values:
         return Extraction(tuple(values), "med")
 
@@ -82,10 +94,16 @@ NOT_NAME = frozenset({"Class", "Railway", "Railways", "Diesel", "Electric", "Tan
                       "Shed", "Station", "Junction", "Yard"})
 # Marker words are never name words ("No. 60103 ..." must not read "No" as a name).
 MARKER_NOT_NAME = frozenset({"No", "Nos", "Nr", "Number", "Numbers"})
-CONNECTORS = frozenset({"of", "the", "de", "du", "la"})
+CONNECTORS = frozenset({"of", "the", "de", "del", "du", "la"})
+# Type and place words: a candidate containing one is a description, not a name
+# ("Garratt", "No. 5 Colliery").
+TYPE_WORDS = frozenset({"Colliery", "Garratt", "Garratts", "Mallet", "Mallets", "Fireless",
+                        "Meyer"})
 
 _WHEEL_RE = re.compile(r"\d-\d+-\d+(?:-\d+)*[A-Z]{0,3}")
 _WORD_RE = re.compile(r"[A-Za-z][A-Za-z'\u2019\-]*(?![\w])")
+# Dotted initials ("G.H.", "T.W.Lewis", "V.C.") or a short abbreviation ("Jr.").
+_INITIALS_RE = re.compile(r"(?:[A-Z]\.)+(?:[A-Z][a-z][A-Za-z'\-]*(?![\w.]))?|[A-Z][a-z]\.(?=\s|$)")
 _QUOTED_RE = re.compile(r"\"([^\"\n]{1,60})\"|\u2018([^\u2019\n]{1,60})\u2019|'([^'\n]{1,60})'")
 _LEVEL = {"low": 1, "med": 2, "high": 3}
 
@@ -106,6 +124,11 @@ def _name_at(text: str, pos: int) -> str | None:
             j += 1
         if words and j == i:  # no whitespace: punctuation or end follows
             break
+        m = _INITIALS_RE.match(text, j)
+        if m and m.group().rstrip(".") not in MARKER_NOT_NAME:
+            words.append(m.group())
+            i = m.end()
+            continue
         m = _WORD_RE.match(text, j)
         if not m:
             break
@@ -131,14 +154,24 @@ def extract_loco_names(description: str | None, place_names: frozenset[str]) -> 
 
     found: dict[str, int] = {}  # name -> best level
 
-    def add(name: str | None, level: str) -> None:
-        if not name or name.lower() in place_names:
-            return
-        found[name] = max(found.get(name, 0), _LEVEL[level])
+    def add(name: str | None, level: str) -> bool:
+        """Record a candidate; True when it was dropped as a place name."""
+        if not name:
+            return False
+        if name.lower() in place_names:
+            return True
+        if not any(w in TYPE_WORDS for w in name.split()):
+            found[name] = max(found.get(name, 0), _LEVEL[level])
+        return False
 
-    for _, end in _marked_spans(text):
-        hit = _name_at(text, end)
-        add(hit, "high")
+    # A marked name dropped as a place is usually a 2nd loco named after a place
+    # ("34102 Lapford ... D826 Jupiter"), so what is left cannot be high.
+    capped = False
+    for start, end in _marked_spans(text):
+        if text[start:end].endswith("."):  # "No. 734. This was ..." -- sentence ended
+            continue
+        if add(_name_at(text, end), "high") or _plural_single(text, start, end):
+            capped = True
     for m in _WHEEL_RE.finditer(text):
         hit = _name_at(text, m.end())
         add(hit, "med")
@@ -153,6 +186,8 @@ def extract_loco_names(description: str | None, place_names: frozenset[str]) -> 
     if len(found) > 1:
         return Extraction(tuple(found), "med")
     (name, level), = found.items()
+    if capped:
+        level = min(level, _LEVEL["med"])
     return Extraction((name,), {v: k for k, v in _LEVEL.items()}[level])
 
 

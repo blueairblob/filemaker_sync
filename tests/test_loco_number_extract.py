@@ -39,3 +39,18 @@ def test_description_hash():
     empty = hashlib.sha256(b"").hexdigest()
     assert description_hash(None) == description_hash("") == empty
     assert description_hash("café") == hashlib.sha256("café".encode()).hexdigest()
+
+
+# Task 3 dry-run tuning: a plural marker with one number usually means a 2nd loco went unmarked.
+TUNING_CASES = [
+    ("Ex LNER class A4 4-6-2 numbers 60009 Union of South Africa & 60026 Miles Beevor stand in"
+     " Perth shed yard", ("60009",), "med"),
+    ("Saxon Meyer 0-4-4-0T numbers 99.1568-7 leading and 99.1606-5 head the passenger from"
+     " Wolkenstein to Johstadt", ("99.1568-7",), "med"),
+]
+
+
+@pytest.mark.parametrize("desc,values,confidence", TUNING_CASES)
+def test_extract_loco_numbers_tuning(desc, values, confidence):
+    result = extract_loco_numbers(desc)
+    assert (result.values, result.confidence) == (values, confidence)
