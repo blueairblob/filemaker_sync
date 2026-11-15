@@ -403,3 +403,20 @@ def test_ddl_idempotent(pg):
         assert cur.fetchall() == [("loco_number", "client rules v1"), ("loco_name", "")]
     after = _row(pg, "s_idem_1")
     assert after == before and after[4] == ts
+
+
+def test_stale_errcode_patch_applies(pg):
+    # The patch for existing databases (fix_review_stale_errcode.sql) must apply
+    # cleanly and leave the PT409 behaviour in place.
+    apply_sql_file(DATA_FIX_SQL.parent / "fix_review_stale_errcode.sql")
+    seed_fix_value(pg, "s_stale_patch", values=["1"])
+    uid = make_admin(pg)
+    pg.commit()
+    as_user(pg, uid)
+    with pytest.raises(psycopg2.Error) as exc:
+        with pg.cursor() as cur:
+            cur.execute("select rat.review_fix_value(%s, %s, %s, %s, %s)",
+                        ("s_stale_patch", "loco_number", ["2"], "corrected", OLD_TS))
+    assert exc.value.pgcode == "PT409"
+    pg.rollback()
+    assert _row(pg, "s_stale_patch")[:2] == (["1"], "extracted")
