@@ -191,7 +191,10 @@ BEGIN
       USING ERRCODE = 'P0002';
   END IF;
   IF v_current IS DISTINCT FROM p_expected_updated_at THEN
-    RAISE EXCEPTION 'record changed since it was loaded' USING ERRCODE = '40001';
+    -- Not 40001: PostgREST retries a transaction that fails with serialization_failure, without
+    -- limit, so a stale save would loop on the server and hold a pooled connection. PT409 makes
+    -- PostgREST answer HTTP 409 at once.
+    RAISE EXCEPTION 'record changed since it was loaded' USING ERRCODE = 'PT409';
   END IF;
 
   PERFORM pg_catalog.set_config('rat.review_context', 'on', true);

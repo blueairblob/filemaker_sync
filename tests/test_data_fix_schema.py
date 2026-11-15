@@ -95,7 +95,8 @@ def test_admin_reads_and_reviews(pg):
         assert cur.fetchall() == [("review", uid, ["9999"], "corrected")]
 
 
-def test_review_stale_raises_40001(pg):
+def test_review_stale_raises_pt409(pg):
+    # PT409, not 40001: PostgREST retries 40001 without limit (see add_data_fix_tables.sql).
     seed_fix_value(pg, "s_stale_1", values=["1"])
     uid = make_admin(pg)
     pg.commit()
@@ -104,7 +105,7 @@ def test_review_stale_raises_40001(pg):
         with pg.cursor() as cur:
             cur.execute("select rat.review_fix_value(%s, %s, %s, %s, %s)",
                         ("s_stale_1", "loco_number", ["2"], "corrected", OLD_TS))
-    assert exc.value.pgcode == "40001"
+    assert exc.value.pgcode == "PT409"
     pg.rollback()
     assert _row(pg, "s_stale_1")[:2] == (["1"], "extracted")
 
