@@ -3,7 +3,8 @@
 The `pg` fixture runs a throwaway postgres:17 container (the same major as the
 live `oci` target, read via server_version_num) and applies, in order:
 tests/sql/supabase_stubs.sql, supabase/schema/bootstrap_rat_schema.sql and
-supabase/schema/add_data_fix_tables.sql. Tests never touch the live DB
+supabase/schema/add_data_fix_tables.sql and
+supabase/schema/add_model_check_tables.sql. Tests never touch the live DB
 (Golden Rule #4).
 
 The fixture is session-scoped and shared: each test uses its own image_no
@@ -16,6 +17,7 @@ transaction only. A per-test teardown rolls back whatever the test left open.
 """
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import time
@@ -28,6 +30,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 STUBS_SQL = REPO_ROOT / "tests" / "sql" / "supabase_stubs.sql"
 BOOTSTRAP_SQL = REPO_ROOT / "supabase" / "schema" / "bootstrap_rat_schema.sql"
 DATA_FIX_SQL = REPO_ROOT / "supabase" / "schema" / "add_data_fix_tables.sql"
+MODEL_CHECK_SQL = REPO_ROOT / "supabase" / "schema" / "add_model_check_tables.sql"
 
 PG_IMAGE = "postgres:17"   # live oci: server_version_num 170006
 PG_PORT = 55432
@@ -91,7 +94,7 @@ def pg():
                     raise
                 time.sleep(1)
 
-        for path in (STUBS_SQL, BOOTSTRAP_SQL, DATA_FIX_SQL):
+        for path in (STUBS_SQL, BOOTSTRAP_SQL, DATA_FIX_SQL, MODEL_CHECK_SQL):
             apply_sql_file(path)
 
         conn = _connect()
@@ -187,3 +190,58 @@ def seed_fix_value(conn, image_no: str, fix_id: str = "loco_number", *,
              status, needs_recheck, description_hash, extractor_version),
         )
         return cur.fetchone()[0]
+
+
+_DEFAULT_TASK_ANSWERS = [
+    {"key": "1", "id": "loco", "label": "Loco", "loco": True},
+    {"key": "2", "id": "station", "label": "Station", "loco": False},
+    {"key": "0", "id": "other", "label": "Other", "loco": False},
+]
+
+
+def seed_task(conn, task_id: str = "t_x", answers=None, links=None,
+              threshold: float = 0.9) -> str:
+    """Insert (or replace) a rat.model_task row as the owner. Returns task_id."""
+    answers = _DEFAULT_TASK_ANSWERS if answers is None else answers
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            insert into rat.model_task (id, question, answers, sure_threshold, links)
+            values (%s, %s, %s::jsonb, %s, %s::jsonb)
+            on conflict (id) do update
+              set answers = excluded.answers, links = excluded.links,
+                  sure_threshold = excluded.sure_threshold
+            """,
+            (task_id, f"Question for {task_id}?", json.dumps(answers), threshold,
+             None if links is None else json.dumps(links)),
+        )
+    return task_id
+
+
+def seed_run(conn, task_id: str, version: str = "v1", predictions=None) -> int:
+    """Insert a rat.model_run (copying the task's answers) plus predictions
+    {image_no: (answer_id, p)}. `probs` has one entry per answer, p on the
+    chosen one, 0 elsewhere. Returns the run id."""
+    predictions = predictions or {}
+    with conn.cursor() as cur:
+        cur.execute("select answers from rat.model_task where id = %s", (task_id,))
+        answers = cur.fetchone()[0]
+        cur.execute(
+            """
+            insert into rat.model_run (task_id, model, version, answers, n_predictions)
+            values (%s, 'test-model', %s, %s::jsonb, %s) returning id
+            """,
+            (task_id, version, json.dumps(answers), len(predictions)),
+        )
+        run_id = cur.fetchone()[0]
+        ids = [a["id"] for a in answers]
+        for image_no, (answer, p) in predictions.items():
+            probs = [p if a == answer else 0 for a in ids]
+            cur.execute(
+                """
+                insert into rat.model_prediction (run_id, image_no, answer, p, probs)
+                values (%s, %s, %s, %s, %s::real[])
+                """,
+                (run_id, image_no, answer, p, probs),
+            )
+    return run_id
