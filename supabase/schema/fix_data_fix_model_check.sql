@@ -2,14 +2,30 @@
 --
 -- Data Fixes history may now be tagged 'model_check' (a model-check answer
 -- filling "No loco" inside review context sets rat.review_source), and
--- rat.data_fix_queue's p_text also matches image_no exactly.
+-- rat.data_fix_queue's p_text also matches image_no (case-insensitive, LIKE-escaped by the caller).
 --
 -- Already applied to add_data_fix_tables.sql and bootstrap_rat_schema.sql.
 -- This file is only for an existing database. Idempotent; grants are kept
 -- by CREATE OR REPLACE. Touches no data_fix_value row.
 
+BEGIN;
+
+-- Drop every CHECK on the history table that mentions source, whatever its
+-- name, so the new one is the only source check left.
+DO $$
+DECLARE c record;
+BEGIN
+  FOR c IN
+    SELECT conname FROM pg_constraint
+     WHERE conrelid = 'rat.data_fix_history'::regclass
+       AND contype = 'c'
+       AND pg_get_constraintdef(oid) ILIKE '%source%'
+  LOOP
+    EXECUTE format('ALTER TABLE rat.data_fix_history DROP CONSTRAINT %I', c.conname);
+  END LOOP;
+END $$;
+
 ALTER TABLE rat.data_fix_history
-  DROP CONSTRAINT IF EXISTS data_fix_history_source_check,
   ADD CONSTRAINT data_fix_history_source_check
     CHECK (source IN ('extractor', 'review', 'model_check'));
 
@@ -82,9 +98,11 @@ BEGIN
        AND (v.status = ANY (p_status) OR (p_include_recheck AND v.needs_recheck))
        AND (p_confidence IS NULL OR v.confidence = ANY (p_confidence))
        AND (p_collection IS NULL OR col.name = p_collection)
-       AND (p_text IS NULL OR c.description ILIKE '%' || p_text || '%' OR v.image_no = p_text)
+       AND (p_text IS NULL OR c.description ILIKE '%' || p_text || '%' OR v.image_no ILIKE p_text)
        AND v.image_no > coalesce(p_after, '')
      ORDER BY v.image_no
      LIMIT least(greatest(coalesce(p_limit, 25), 1), 500);
 END;
 $$;
+
+COMMIT;

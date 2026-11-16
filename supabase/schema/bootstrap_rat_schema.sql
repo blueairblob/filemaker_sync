@@ -652,7 +652,7 @@ BEGIN
        AND (v.status = ANY (p_status) OR (p_include_recheck AND v.needs_recheck))
        AND (p_confidence IS NULL OR v.confidence = ANY (p_confidence))
        AND (p_collection IS NULL OR col.name = p_collection)
-       AND (p_text IS NULL OR c.description ILIKE '%' || p_text || '%' OR v.image_no = p_text)
+       AND (p_text IS NULL OR c.description ILIKE '%' || p_text || '%' OR v.image_no ILIKE p_text)
        AND v.image_no > coalesce(p_after, '')
      ORDER BY v.image_no
      LIMIT least(greatest(coalesce(p_limit, 25), 1), 500);
