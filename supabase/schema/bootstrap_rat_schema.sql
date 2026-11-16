@@ -411,7 +411,7 @@ CREATE TABLE IF NOT EXISTS rat.data_fix_history (
   new_status text,
   changed_by uuid,
   changed_at timestamptz NOT NULL DEFAULT now(),
-  source text NOT NULL CHECK (source IN ('extractor', 'review'))
+  source text NOT NULL CHECK (source IN ('extractor', 'review', 'model_check'))
 );
 
 CREATE INDEX IF NOT EXISTS data_fix_history_image_fix_idx
@@ -461,7 +461,9 @@ BEGIN
        CASE WHEN TG_OP = 'UPDATE' THEN OLD.status END, NEW.status,
        auth.uid(),
        CASE WHEN coalesce(current_setting('rat.review_context', true), '') = 'on'
-            THEN 'review' ELSE 'extractor' END);
+            THEN CASE WHEN coalesce(current_setting('rat.review_source', true), '') = 'model_check'
+                      THEN 'model_check' ELSE 'review' END
+            ELSE 'extractor' END);
   END IF;
   RETURN NULL;
 END;
@@ -650,7 +652,7 @@ BEGIN
        AND (v.status = ANY (p_status) OR (p_include_recheck AND v.needs_recheck))
        AND (p_confidence IS NULL OR v.confidence = ANY (p_confidence))
        AND (p_collection IS NULL OR col.name = p_collection)
-       AND (p_text IS NULL OR c.description ILIKE '%' || p_text || '%')
+       AND (p_text IS NULL OR c.description ILIKE '%' || p_text || '%' OR v.image_no = p_text)
        AND v.image_no > coalesce(p_after, '')
      ORDER BY v.image_no
      LIMIT least(greatest(coalesce(p_limit, 25), 1), 500);

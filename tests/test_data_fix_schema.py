@@ -420,3 +420,64 @@ def test_stale_errcode_patch_applies(pg):
     assert exc.value.pgcode == "PT409"
     pg.rollback()
     assert _row(pg, "s_stale_patch")[:2] == (["1"], "extracted")
+
+
+def _mc_update(conn, image_no):
+    """Set no_loco inside review context tagged as a model check."""
+    with conn.cursor() as cur:
+        cur.execute("select set_config('rat.review_context', 'on', true)")
+        cur.execute("select set_config('rat.review_source', 'model_check', true)")
+        cur.execute("update rat.data_fix_value set status = 'no_loco', \"values\" = '{}' "
+                    "where image_no = %s and fix_id = 'loco_number'", (image_no,))
+
+
+def _latest_source(conn, image_no):
+    with conn.cursor() as cur:
+        cur.execute("select source from rat.data_fix_history where image_no = %s "
+                    "order by changed_at desc, id desc limit 1", (image_no,))
+        return cur.fetchone()[0]
+
+
+def test_history_source_model_check(pg):
+    seed_fix_value(pg, "s_mc_src_1", values=["1"])
+    _mc_update(pg, "s_mc_src_1")
+    assert _latest_source(pg, "s_mc_src_1") == "model_check"
+
+
+def test_history_source_review_unchanged(pg):
+    updated_at = seed_fix_value(pg, "s_mc_rev_1", values=["1"])
+    uid = make_admin(pg)
+    pg.commit()
+    as_user(pg, uid)
+    with pg.cursor() as cur:
+        cur.execute("select rat.review_fix_value(%s, %s, %s, %s, %s)",
+                    ("s_mc_rev_1", "loco_number", ["2"], "corrected", updated_at))
+    pg.commit()
+    assert _latest_source(pg, "s_mc_rev_1") == "review"
+
+
+def test_queue_text_matches_image_no(pg):
+    seed_catalog(pg, "s_mc_q_1", "a plain description")
+    seed_fix_value(pg, "s_mc_q_1", values=["1"])
+    uid = make_admin(pg)
+    pg.commit()
+    as_user(pg, uid)
+    with pg.cursor() as cur:
+        cur.execute("select image_no from rat.data_fix_queue('loco_number', "
+                    "p_status => '{extracted,verified,corrected,none_visible,no_loco}', "
+                    "p_text => 's_mc_q_1')")
+        assert cur.fetchall() == [("s_mc_q_1",)]
+
+
+def test_model_check_patch_applies(pg):
+    with pg.cursor() as cur:
+        cur.execute("alter table rat.data_fix_history drop constraint data_fix_history_source_check")
+        cur.execute("alter table rat.data_fix_history add constraint data_fix_history_source_check "
+                    "check (source in ('extractor', 'review'))")
+    pg.commit()
+    patch = DATA_FIX_SQL.parent / "fix_data_fix_model_check.sql"
+    apply_sql_file(patch)
+    apply_sql_file(patch)
+    seed_fix_value(pg, "s_mc_patch_1", values=["1"])
+    _mc_update(pg, "s_mc_patch_1")
+    assert _latest_source(pg, "s_mc_patch_1") == "model_check"
