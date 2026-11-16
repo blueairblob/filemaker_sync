@@ -50,6 +50,12 @@ def test_anon_and_non_admin_closed(pg):
     seed_task(pg, "t_closed")
     seed_run(pg, "t_closed", predictions={"mc_img_1": ("loco", 0.95)})
     uid = make_user(pg)
+    pg.commit()  # the anon checks below roll back; the seeded rows must survive
+    with pg.cursor() as cur:
+        for t in ("model_task", "model_run"):
+            cur.execute(f"select count(*) from rat.{t}")
+            assert cur.fetchone()[0] >= 1  # owner sees the seeded rows
+    pg.rollback()
     tables = ("model_task", "model_run", "model_prediction", "model_answer")
     for t in tables:
         as_anon(pg)
@@ -61,7 +67,7 @@ def test_anon_and_non_admin_closed(pg):
     with pg.cursor() as cur:
         for t in ("model_task", "model_run"):
             cur.execute(f"select count(*) from rat.{t}")
-            assert cur.fetchone()[0] == 0
+            assert cur.fetchone()[0] == 0  # rows exist (checked above); RLS hides them
         for t in ("model_prediction", "model_answer"):
             cur.execute("savepoint s")
             with pytest.raises(psycopg2.errors.InsufficientPrivilege):
