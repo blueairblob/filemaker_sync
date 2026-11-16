@@ -1,0 +1,31 @@
+{
+  "task": "subject_type",
+  "question": "What's the main subject?",
+  "client": "rat",
+  "note": "RAT-specific answer list. Answers with loco=true mean a loco is present (RAT records tram numbers, so a tram counts).",
+  "sure_threshold": 0.9,
+  "sort_order": 1,
+  "links": {"no_answer_flag": "loco", "fix_ids": ["loco_number", "loco_name"]},
+  "answers": [
+    {"key": "1", "id": "steam_loco", "label": "Steam loco", "loco": true,
+     "prompts": ["a steam locomotive", "a steam engine hauling a train", "a small industrial steam locomotive"]},
+    {"key": "2", "id": "diesel_loco", "label": "Diesel loco", "loco": true,
+     "prompts": ["a diesel locomotive", "a diesel locomotive hauling a train", "a small industrial diesel locomotive"]},
+    {"key": "3", "id": "electric_loco", "label": "Electric loco", "loco": true,
+     "prompts": ["an electric locomotive", "an electric locomotive with a pantograph"]},
+    {"key": "4", "id": "railcar_unit", "label": "Railcar / unit", "loco": true,
+     "prompts": ["a diesel multiple unit train", "an electric multiple unit train", "a railcar"]},
+    {"key": "5", "id": "tram", "label": "Tram", "loco": true,
+     "prompts": ["a tram", "a streetcar on a city street"]},
+    {"key": "6", "id": "bus_lorry", "label": "Bus / lorry", "loco": false,
+     "prompts": ["a bus", "a lorry or truck"]},
+    {"key": "7", "id": "wagons_coaches", "label": "Wagons / coaches only", "loco": false,
+     "prompts": ["a line of parked railway carriages", "parked goods wagons"]},
+    {"key": "8", "id": "ship", "label": "Ship", "loco": false,
+     "prompts": ["a ship or boat"]},
+    {"key": "9", "id": "station_building_track", "label": "Station / building / track", "loco": false,
+     "prompts": ["an empty railway station platform", "empty railway tracks", "a signal box or railway building", "an empty railway bridge or viaduct"]},
+    {"key": "0", "id": "other", "label": "Other", "loco": false,
+     "prompts": ["a group of people", "a map, document or ticket", "a building or street scene", "a car"]}
+  ]
+}
