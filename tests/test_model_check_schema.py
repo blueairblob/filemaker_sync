@@ -552,6 +552,7 @@ MODEL_CHECK_RPCS = {
     "rat.model_check_progress()": "select * from rat.model_check_progress()",
     "rat.model_check_confusion(bigint, boolean)": "select * from rat.model_check_confusion(1)",
     "rat.model_check_conflicts(text)": "select * from rat.model_check_conflicts('t')",
+    "rat.model_check_photo(text, text, bigint)": "select * from rat.model_check_photo('t', 'i')",
 }
 
 
@@ -575,3 +576,80 @@ def test_rpc_grants(pg):
                 cur.execute(sql)
         assert "permission denied for function" in str(exc.value)
         pg.rollback()
+
+
+# --------------------------------------------------------------------------
+# One photo, to answer again (a conflict's "Model check" link)
+# --------------------------------------------------------------------------
+
+PHOTO_PATCH_SQL = MODEL_CHECK_SQL.parent / "fix_model_check_photo.sql"
+
+
+def _photo(cur, task_id, image_no, run_id=None):
+    cur.execute(
+        """select image_no, model_answer, model_p, checked_answer, checked_at is not null,
+                  checked_mode, run_id, description, fix_state
+             from rat.model_check_photo(%s, %s, %s)""",
+        (task_id, image_no, run_id))
+    return cur.fetchall()
+
+
+def test_photo_returns_latest_answer_and_prediction(pg):
+    task, p = "t9_photo", "m9p_"
+    seed_task(pg, task, links=LINKS)
+    run1 = seed_run(pg, task, "v1", {f"{p}1": ("loco", 0.95), f"{p}2": ("loco", 0.5)})
+    for i in (1, 2, 3):
+        _seed_photo(pg, f"{p}{i}", f"photo {i}")
+    admin = make_admin(pg)
+    pg.commit()
+
+    as_user(pg, admin)
+    with pg.cursor() as cur:
+        _save(cur, task, f"{p}1", "loco", "sure", run1, "loco")
+        _save(cur, task, f"{p}1", "station", "sure", run1, "loco")   # latest wins
+        _save(cur, task, f"{p}2", "station", "sample")
+
+        (row,) = _photo(cur, task, f"{p}1")
+        assert row[:4] == (f"{p}1", "loco", pytest.approx(0.95), "station")
+        assert row[4:7] == (True, "sure", run1)
+        assert row[7] == "photo 1"
+        assert set(row[8]) == set(FIX_IDS)
+
+        # Last answered blind: the model's guess stays hidden.
+        (row,) = _photo(cur, task, f"{p}2", run1)
+        assert row[1:7] == (None, None, "station", True, "sample", run1)
+
+        # Never answered and no prediction.
+        (row,) = _photo(cur, task, f"{p}3")
+        assert row[1:7] == (None, None, None, False, None, run1)
+
+        assert _photo(cur, task, "m9p_not_in_catalog") == []
+    pg.commit()
+
+    # With no run named, the newest run's prediction is used.
+    run2 = seed_run(pg, task, "v2", {f"{p}1": ("other", 0.6)})
+    pg.commit()
+    as_user(pg, admin)
+    with pg.cursor() as cur:
+        assert _photo(cur, task, f"{p}1")[0][1:3] == ("other", pytest.approx(0.6))
+        assert _photo(cur, task, f"{p}1")[0][6] == run2
+        assert _photo(cur, task, f"{p}1", run1)[0][1] == "loco"
+    pg.rollback()
+
+    other = seed_task(pg, "t9_other")
+    other_run = seed_run(pg, other, "v1", {})
+    user = make_user(pg)
+    pg.commit()
+    assert _pgcode(pg, admin, lambda cur: _photo(cur, task, f"{p}1", other_run)) == "22023"
+    assert _pgcode(pg, admin, lambda cur: _photo(cur, "t9_missing", f"{p}1")) == "P0002"
+    assert _pgcode(pg, user, lambda cur: _photo(cur, task, f"{p}1")) == "42501"
+
+
+def test_photo_patch_matches_and_is_idempotent(pg):
+    patch = PHOTO_PATCH_SQL.read_text(encoding="utf-8")
+    fn = patch[patch.index("CREATE OR REPLACE FUNCTION rat.model_check_photo"):]
+    fn = fn[:fn.index("$$;") + 3]
+    assert fn in MODEL_CHECK_SQL.read_text(encoding="utf-8")
+    pg.commit()
+    apply_sql_file(PHOTO_PATCH_SQL)
+    apply_sql_file(PHOTO_PATCH_SQL)
