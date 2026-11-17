@@ -22,7 +22,7 @@ from sklearn.metrics import log_loss
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 
-C_GRID = (0.1, 1.0, 10.0, 100.0)
+C_GRID = (0.003, 0.01, 0.03, 0.1, 1.0, 10.0, 100.0)
 TFIDF_SIZES = (2000, None)          # max_features; None keeps the whole vocabulary
 INNER_FOLDS = 3
 WEIGHT_GRID = tuple(i / 10 for i in range(11))   # yardstick blend
@@ -111,7 +111,7 @@ def _inner_search(codes: np.ndarray, n_classes: int, seed: int, sizes, design):
     rows share them."""
     n_splits = _inner_splits(codes)
     if n_splits < 2:
-        return C_GRID[len(C_GRID) // 2], sizes[0], None
+        return 10.0, sizes[0], None   # too small to search: the old grid midpoint
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
     splits = list(skf.split(np.zeros((len(codes), 1)), codes))
     labels = np.arange(n_classes)

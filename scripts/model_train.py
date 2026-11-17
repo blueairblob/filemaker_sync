@@ -7,12 +7,19 @@ Labelled photos get out-of-fold predictions only; see scripts/model_fit.py.
         --embeddings exports/ai_pilot/emb_siglip_so400m --zeroshot exports/ai_pilot/subject_scores.csv \\
         --version v2 --target-profile oci
 
-Then load either variant (dry run first; add --apply to write):
+Then load photo only first (dry run first; add --apply to write):
 
     venv/bin/python scripts/load_model_run.py --task scripts/model_tasks/rat_subject_type.json \\
-        --scores exports/ai_models/v2-photo.csv --model siglip-trained-photo --version v2-photo --target-profile oci
+        --scores exports/ai_models/v2-photo.csv --model "logreg(siglip-so400m)" --version v2-photo --target-profile oci
+
+Load photo + description only if the report shows a non-zero final text weight (at weight 0 its
+scores for unchecked photos equal photo only, so loading it adds no new suggestions):
+
     venv/bin/python scripts/load_model_run.py --task scripts/model_tasks/rat_subject_type.json \\
-        --scores exports/ai_models/v2-photo-desc.csv --model siglip-trained-photo-desc --version v2-photo-desc --target-profile oci
+        --scores exports/ai_models/v2-photo-desc.csv --model "logreg(siglip-so400m+tfidf)" --version v2-photo-desc --target-profile oci
+
+The .joblib files pickle the module `model_fit`: loading one needs scripts/ on sys.path and
+scikit-learn 1.9.x.
 """
 from __future__ import annotations
 
@@ -35,7 +42,9 @@ NEAR_DUPLICATE_NOTE = (
 
 
 def _read_image_nos(path: Path) -> list[str]:
-    # split on "\n" only: image_no values may contain other whitespace and are never trimmed
+    # read_text uses universal newlines, so a raw \r inside an image_no would split it into two
+    # names and fail the count check against the embedding rows (a loud exit 2); other
+    # whitespace is kept as is, names are never trimmed
     names = path.read_text(encoding="utf-8").split("\n")
     if names and names[-1] == "":
         names.pop()
@@ -49,7 +58,16 @@ def load_inputs(emb_prefix: Path, zeroshot_csv: Path, answer_ids: list[str]):
     names = _read_image_nos(Path(str(emb_prefix) + ".image_nos.txt"))
     if len(names) != len(emb):
         raise ValueError(f"{len(names)} image_nos for {len(emb)} embedding rows")
-    zs = {no: probs for no, _a, _p, probs in read_scores(Path(zeroshot_csv), answer_ids)}
+    seen_names: set[str] = set()
+    for no in names:
+        if no in seen_names:
+            raise ValueError(f"duplicate image_no in the embedding list: {no!r}")
+        seen_names.add(no)
+    zs: dict[str, list] = {}
+    for no, _a, _p, probs in read_scores(Path(zeroshot_csv), answer_ids):
+        if no in zs:
+            raise ValueError(f"duplicate image_no in the zero-shot file: {no!r}")
+        zs[no] = probs
     keep = [i for i, no in enumerate(names) if no in zs]
     image_nos = [names[i] for i in keep]
     img = np.asarray(emb[keep], dtype=np.float32)
@@ -139,26 +157,39 @@ def run(args, fetch_answers: Callable, fetch_descriptions: Callable) -> int:
             return m
         probs = model_fit.predict_all(rec, img, z, texts, lab_idx, y,
                                       folds=args.folds, seed=args.seed)
-        return probs, made[-1]
+        return probs, made[-1], made[:-1]
 
     steam = np.zeros((len(image_nos), len(ids)))
     if "steam_loco" in ids:
         steam[:, ids.index("steam_loco")] = 1.0
-    yard, _ = predict(lambda: model_fit.Yardstick(ids))
-    photo, m_photo = predict(lambda: model_fit.SubjectModel(
+    yard, _, _ = predict(lambda: model_fit.Yardstick(ids))
+    photo, m_photo, f_photo = predict(lambda: model_fit.SubjectModel(
         ids, use_text=False, min_examples=args.min_examples, seed=args.seed))
-    both, m_both = predict(lambda: model_fit.SubjectModel(
+    both, m_both, f_both = predict(lambda: model_fit.SubjectModel(
         ids, use_text=True, min_examples=args.min_examples, seed=args.seed))
 
     named = [("always steam", steam), ("zero-shot", z), ("yardstick", yard),
              ("photo only", photo), ("photo + description", both)]
-    report_rows = [(n, model_report.blind_metrics(p, image_nos, blind, answers))
+    sure = task.get("sure_threshold", 0.9)
+    report_rows = [(n, model_report.blind_metrics(p, image_nos, blind, answers, sure=sure))
                    for n, p in named]
     unseen = set(ids) - set(m_both.seen_)
     unseen_photo = set(ids) - set(m_photo.seen_)
     if unseen_photo != unseen:
         notes.append("Zero-shot fallback answers differ by variant; photo only falls back on: "
                      + ", ".join(sorted(unseen_photo)))
+    notes.append(
+        f"Final settings: photo only: C {m_photo.C_}; photo + description: photo C "
+        f"{m_both.photo_model_.C_}, text C {m_both.text_C_}, text TF-IDF size "
+        f"{m_both.text_tfidf_size_}, text weight {m_both.text_weight_}.")
+    notes.append("Per-fold settings (photo + description): per-fold text weights "
+                 + ", ".join(str(m.text_weight_) for m in f_both) + "; per-fold text C "
+                 + ", ".join(str(m.text_C_) for m in f_both) + ".")
+    if m_both.text_weight_ == 0:
+        notes.append(
+            "photo + description: the final model gives the description no weight, so its "
+            "scores for unchecked photos equal photo only; it differs only on checked photos' "
+            "test rows. Loading it adds no new suggestions.")
     report = model_report.render_report(version, report_rows, "zero-shot", unseen | unseen_photo, notes)
 
     write_scores(out / f"{version}-photo.csv", image_nos, photo, ids)
@@ -187,27 +218,21 @@ def main(argv=None) -> int:
     conn = reject_log.open_connection(reject_log.load_config(args.config), args.target_profile)
     try:
         conn.set_session(readonly=True)
-
-        def fetch_answers(task_id):
-            cur = conn.cursor()
-            try:
-                cur.execute("select image_no, answer, mode, answered_at, id "
-                            "from rat.model_answer where task_id = %s", (task_id,))
-                return cur.fetchall()
-            finally:
-                cur.close()
-
-        def fetch_descriptions():
-            cur = conn.cursor()
-            try:
-                cur.execute("select image_no, description from rat.catalog")
-                return {no: d for no, d in cur.fetchall()}
-            finally:
-                cur.close()
-
-        return run(args, fetch_answers, fetch_descriptions)
+        # fetch everything up front, then release the connection: training takes minutes and
+        # must not leave a transaction idle on the live database
+        task_id = json.loads(Path(args.task).read_text(encoding="utf-8")).get("task")
+        cur = conn.cursor()
+        try:
+            cur.execute("select image_no, answer, mode, answered_at, id "
+                        "from rat.model_answer where task_id = %s", (task_id,))
+            answer_rows = cur.fetchall()
+            cur.execute("select image_no, description from rat.catalog")
+            descriptions = {no: d for no, d in cur.fetchall()}
+        finally:
+            cur.close()
     finally:
         conn.close()
+    return run(args, lambda _t: answer_rows, lambda: descriptions)
 
 
 if __name__ == "__main__":

@@ -73,6 +73,11 @@ def render_report(version, rows, zero_shot_key, unseen, notes):
         wrong = len(zs["correct_set"] - m["correct_set"])
         out.append(f"- {name}: right where zero-shot was wrong: {right} · "
                    f"wrong where zero-shot was right: {wrong}")
+    if "photo only" in by_name and "photo + description" in by_name:
+        po, pd_ = by_name["photo only"], by_name["photo + description"]
+        out.append(f"- photo + description vs photo only: right where photo only was wrong: "
+                   f"{len(pd_['correct_set'] - po['correct_set'])} · "
+                   f"wrong where photo only was right: {len(po['correct_set'] - pd_['correct_set'])}")
     out += ["", "## Recall per answer", ""]
     names = [n for n, _ in rows]
     out += ["| Answer | " + " | ".join(names) + " |",

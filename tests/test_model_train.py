@@ -153,15 +153,17 @@ class FakeConn:
     def __init__(self):
         self.log = []
         self.readonly = None
+        self.closed = False
 
     def set_session(self, readonly=None, **kw):
         self.readonly = readonly
+        self.log.append("select -- set_session")
 
     def cursor(self):
         return FakeCursor(self.log)
 
     def close(self):
-        pass
+        self.closed = True
 
 
 def test_never_writes_db(tmp_path, monkeypatch):
@@ -177,6 +179,92 @@ def test_never_writes_db(tmp_path, monkeypatch):
     assert rc == 0
     assert conn.readonly is True
     assert conn.log and all(s.lstrip().lower().startswith("select") for s in conn.log)
+    assert conn.log[0] == "select -- set_session"   # readonly before the first query
+
+
+def test_connection_closed_before_training(tmp_path, monkeypatch):
+    import reject_log
+    prefix, nos, _ = make_inputs(tmp_path)
+    conn = FakeConn()
+    monkeypatch.setattr(reject_log, "open_connection", lambda cfg, prof: conn)
+    monkeypatch.setattr(reject_log, "load_config", lambda p: {})
+    real = model_train.model_fit.predict_all
+    seen = []
+
+    def spy(*a, **kw):
+        seen.append(conn.closed)
+        return real(*a, **kw)
+    monkeypatch.setattr(model_train.model_fit, "predict_all", spy)
+    a = make_args(tmp_path, prefix)
+    assert model_train.main(["--task", a.task, "--embeddings", str(prefix),
+                             "--zeroshot", a.zeroshot, "--version", "v1",
+                             "--out-dir", a.out_dir, "--folds", "3", "--min-examples", "2"]) == 0
+    assert seen and all(seen)
+
+
+def test_duplicate_embedding_image_no_rejected(tmp_path):
+    prefix, nos, _ = make_inputs(tmp_path)
+    (tmp_path / "emb.image_nos.txt").write_text(
+        "\n".join([nos[0]] + nos[1:-1] + [nos[0]]) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match=nos[0]):
+        model_train.load_inputs(prefix, tmp_path / "zs.csv", IDS)
+    args = make_args(tmp_path, prefix)
+    assert model_train.run(args, lambda t: answers_for(nos), lambda: {}) == 2
+
+
+def test_duplicate_zeroshot_image_no_rejected(tmp_path):
+    prefix, nos, zs = make_inputs(tmp_path, extra_zs=("p03",))
+    with pytest.raises(ValueError, match="p03"):
+        model_train.load_inputs(prefix, tmp_path / "zs.csv", IDS)
+    args = make_args(tmp_path, prefix)
+    assert model_train.run(args, lambda t: answers_for(nos), lambda: {}) == 2
+
+
+def test_blind_metrics_uses_task_sure_threshold(tmp_path, monkeypatch):
+    prefix, nos, _ = make_inputs(tmp_path)
+    args = make_args(tmp_path, prefix)
+    task = dict(TASK, sure_threshold=0.65)
+    Path(args.task).write_text(json.dumps(task), encoding="utf-8")
+    real = model_train.model_report.blind_metrics
+    sures = []
+
+    def spy(*a, **kw):
+        sures.append(kw.get("sure"))
+        return real(*a, **kw)
+    monkeypatch.setattr(model_train.model_report, "blind_metrics", spy)
+    assert model_train.run(args, lambda t: answers_for(nos), lambda: {}) == 0
+    assert sures and all(s == 0.65 for s in sures)
+
+
+def test_report_lists_final_settings_and_zero_text_weight(tmp_path):
+    prefix, nos, _ = make_inputs(tmp_path)
+    args = make_args(tmp_path, prefix)
+    # no descriptions at all: the text part cannot learn, so the final weight is 0
+    assert model_train.run(args, lambda t: answers_for(nos), lambda: {}) == 0
+    report = (Path(args.out_dir) / "v1-report.md").read_text()
+    assert "Final settings" in report
+    assert "text weight" in report and "per-fold text weights" in report
+    assert ("the final model gives the description no weight, so its scores for unchecked "
+            "photos equal photo only") in report
+    assert "photo + description vs photo only" in report
+
+
+def test_report_omits_zero_weight_warning_when_text_used(tmp_path, monkeypatch):
+    prefix, nos, _ = make_inputs(tmp_path)
+    args = make_args(tmp_path, prefix)
+    real = model_train.model_fit.SubjectModel.fit
+
+    def fit(self, *a, **kw):
+        r = real(self, *a, **kw)
+        if self.use_text:
+            self.text_weight_ = 0.5
+        return r
+    monkeypatch.setattr(model_train.model_fit.SubjectModel, "fit", fit)
+    desc = {no: f"steam loco {no}" for no in nos}
+    assert model_train.run(args, lambda t: answers_for(nos), lambda: desc) == 0
+    report = (Path(args.out_dir) / "v1-report.md").read_text()
+    assert "gives the description no weight" not in report
+    assert "text weight 0.5" in report
 
 
 def test_outputs_independent_of_answer_row_order(tmp_path):
