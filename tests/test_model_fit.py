@@ -250,3 +250,57 @@ def test_predict_all_uses_oof_for_labelled():
     # the last model made is the final all-labels model (Task 3 reads its seen_)
     assert len(made) == 6
     assert made[-1].seen_ == final.seen_
+
+
+def _photo_X(img, z):
+    return np.hstack([np.asarray(img, dtype=np.float64), np.log(np.asarray(z) + 1e-6)])
+
+
+@pytest.mark.parametrize("make", [photo_model, text_model], ids=["photo", "text"])
+def test_scaler_fitted_inside_training_part(make, monkeypatch):
+    """Photo features are standardised by a scaler fitted only on the rows each
+    classifier trains on (outer training part, and each inner split of the search)."""
+    img, z, texts, y = make_set()
+    z = np.random.default_rng(2).dirichlet(np.ones(10), size=len(y))
+    X = _photo_X(img, z)
+    fits = []                               # (fold, rows each scaler was fitted on)
+    fold = [-1]
+
+    class Recording(mf.StandardScaler):
+        def fit(self, A, *args, **kwargs):
+            fits.append((fold[0], np.asarray(A).copy()))
+            return super().fit(A, *args, **kwargs)
+
+    monkeypatch.setattr(mf, "StandardScaler", Recording)
+    made = []
+
+    def rec():
+        fold[0] += 1
+        m = make()
+        made.append(m)
+        return m
+
+    mf.out_of_fold(rec, img, z, texts, y)
+    folds = list(mf.outer_folds(y, 5, 0))
+    assert fits and {k for k, _ in fits} == set(range(5))
+    for k, A in fits:
+        train_rows = {r.tobytes() for r in X[folds[k][0]]}
+        assert all(r.tobytes() in train_rows for r in A), f"fold {k} scaler saw held-out rows"
+    yarr = np.array(y)
+    for m, (tr, _) in zip(made, folds):
+        parts = [m] + ([m.photo_model_] if m.use_text else [])
+        for part in parts:
+            trained = tr[np.isin(yarr[tr], part.seen_)]   # rows the classifier fits on
+            np.testing.assert_allclose(part.scaler_.mean_, X[trained].mean(axis=0))
+
+
+def test_fit_converges_with_scale_imbalance():
+    """Unit-norm embedding components (~0.06) beside zero-shot logs (down to -13.8):
+    unscaled, lbfgs needs hundreds of iterations; standardised, a handful."""
+    rng = np.random.default_rng(0)
+    centers = _unit(rng.normal(size=(6, 256)))
+    img = np.vstack([_unit(c + 0.25 * rng.normal(size=(40, 256))) for c in centers])
+    y = [ANSWERS[i] for i in np.repeat([0, 1, 2, 4, 6, 9], 40)]
+    z = rng.dirichlet(np.full(10, 0.3), size=len(y))
+    m = photo_model().fit(img.astype(np.float16), z, None, y)
+    assert m.clf_.n_iter_.max() < 50

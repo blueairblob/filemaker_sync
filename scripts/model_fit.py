@@ -20,6 +20,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import log_loss
 from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import StandardScaler
 
 C_GRID = (0.1, 1.0, 10.0, 100.0)
 TFIDF_SIZES = (2000, None)          # max_features; None keeps the whole vocabulary
@@ -91,10 +92,15 @@ def _vectorizer(size) -> TfidfVectorizer:
                            sublinear_tf=True, max_features=size)
 
 
-def _design(X_photo: np.ndarray, vec: TfidfVectorizer | None, texts: list[str] | None):
+def _design(X_photo: np.ndarray, scaler: StandardScaler, vec: TfidfVectorizer | None,
+            texts: list[str] | None):
+    """Standardised photo columns (scaler fitted on the classifier's own training rows:
+    unit-norm embedding components are ~0.03 while zero-shot logs reach -13.8, which
+    slows lbfgs by ~50x and skews the L2 penalty), plus the TF-IDF block if any."""
+    X = scaler.transform(X_photo)
     if vec is None:
-        return X_photo
-    return sparse.hstack([sparse.csr_matrix(X_photo), vec.transform(texts)]).tocsr()
+        return X
+    return sparse.hstack([sparse.csr_matrix(X), vec.transform(texts)]).tocsr()
 
 
 def _logreg(C: float, seed: int) -> LogisticRegression:
@@ -156,20 +162,21 @@ class SubjectModel:
                                              min_examples=self.min_examples,
                                              seed=self.seed).fit(img, z, None, y)
         self.C_, self.tfidf_size_ = None, None
-        self.vectorizer_, self.clf_ = None, None
+        self.scaler_, self.vectorizer_, self.clf_ = None, None, None
         if len(self.seen_) < 2:
             return self                       # 0 or 1 seen answers: nothing to learn
         sizes = TFIDF_SIZES if self.use_text else (None,)
         self.C_, self.tfidf_size_ = self._search(X_photo, kept_texts, codes, sizes)
+        self.scaler_ = StandardScaler().fit(X_photo)
         if self.use_text:
             self.vectorizer_ = _vectorizer(self.tfidf_size_).fit(kept_texts)
         self.clf_ = _logreg(self.C_, self.seed).fit(
-            _design(X_photo, self.vectorizer_, kept_texts), codes)
+            _design(X_photo, self.scaler_, self.vectorizer_, kept_texts), codes)
         return self
 
     def _search(self, X_photo, texts, codes, sizes):
         """Pick (C, TF-IDF size) by mean log loss over inner folds of the training part.
-        The vectorizer is refitted on each inner training part."""
+        The scaler and the vectorizer are refitted on each inner training part."""
         n_splits = _inner_splits(codes)
         if n_splits < 2:
             return C_GRID[len(C_GRID) // 2], sizes[0]
@@ -180,12 +187,13 @@ class SubjectModel:
         for size in sizes:
             designs = []
             for tr, te in splits:
+                scaler = StandardScaler().fit(X_photo[tr])
+                vec, t_tr, t_te = None, None, None
                 if self.use_text:
-                    vec = _vectorizer(size).fit([texts[i] for i in tr])
-                    designs.append((_design(X_photo[tr], vec, [texts[i] for i in tr]),
-                                    _design(X_photo[te], vec, [texts[i] for i in te])))
-                else:
-                    designs.append((X_photo[tr], X_photo[te]))
+                    t_tr, t_te = [texts[i] for i in tr], [texts[i] for i in te]
+                    vec = _vectorizer(size).fit(t_tr)
+                designs.append((_design(X_photo[tr], scaler, vec, t_tr),
+                                _design(X_photo[te], scaler, vec, t_te)))
             for C in C_GRID:
                 loss = 0.0
                 for (tr, te), (Xtr, Xte) in zip(splits, designs):
@@ -199,7 +207,7 @@ class SubjectModel:
         n = X_photo.shape[0]
         if self.clf_ is None:
             return np.ones((n, len(self.seen_)))
-        return self.clf_.predict_proba(_design(X_photo, self.vectorizer_, texts))
+        return self.clf_.predict_proba(_design(X_photo, self.scaler_, self.vectorizer_, texts))
 
     def predict_proba(self, img, z, texts) -> np.ndarray:
         n = len(img)
