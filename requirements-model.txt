@@ -1,0 +1,3 @@
+scikit-learn>=1.9
+# keep numpy 1.x: the venv's pandas 2.1.4 is built against it (pip would otherwise pull numpy 2)
+numpy<2
