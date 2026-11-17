@@ -614,6 +614,7 @@ python.exe scripts/fm_metadata_probe.py --selftest
 | Data Fixes schema: tables, guard trigger, review RPCs, RLS, the 37-column `mobile_catalog_view` (applied live 2026-11-14, also folded into bootstrap) | `supabase/schema/add_data_fix_tables.sql` |
 | Read-only checksum of every reviewed Data Fixes value (run before and after any reload; must not change) | `scripts/data_fix_preservation_check.py` |
 | Model check schema (tables, queue/save/progress RPCs; applied via `fix_data_fix_model_check.sql` for the history tag) and the model-run loader | `supabase/schema/add_model_check_tables.sql`, `scripts/load_model_run.py` |
+| Trained subject-type model: CLI (read-only DB; writes scores CSVs + honest blind-sample report + joblib), fitting code, report code, deps | `scripts/model_train.py`, `scripts/model_fit.py`, `scripts/model_report.py`, `requirements-model.txt` |
 | Tests (pytest; schema tests run on a throwaway Docker `postgres:17`, never the live DB) | `tests/`, `pytest.ini` |
 | Parked work (builder-filter view change) | `TODO.md` |
 
