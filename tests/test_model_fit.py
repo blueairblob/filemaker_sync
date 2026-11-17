@@ -145,18 +145,22 @@ def test_text_helps_when_photo_ambiguous():
 
 
 def test_blank_text_uses_photo_part():
-    img, z, texts, y = make_set()
+    # a set where the description matters, so the fitted blend weight is above 0 and a
+    # row with text visibly differs from photo only (on make_set, w = 0 is chosen)
+    img, z, texts, y = mixed_set()
     tm = text_model().fit(img, z, texts, y)
     pm = photo_model().fit(img, z, None, y)
-    q_texts = ["", None, "   ", texts[0]]
-    p_text = tm.predict_proba(img[:4], z[:4], q_texts)
-    p_photo = pm.predict_proba(img[:4], z[:4], None)
+    assert tm.text_weight_ > 0
+    q = np.arange(60, 64)                   # tram photos
+    q_texts = ["", None, "   ", texts[63]]
+    p_text = tm.predict_proba(img[q], z[q], q_texts)
+    p_photo = pm.predict_proba(img[q], z[q], None)
     # exactly the text model's own photo-only part on those rows ...
-    np.testing.assert_array_equal(p_text[:3], tm.photo_model_.predict_proba(img[:3], z[:3], None))
+    np.testing.assert_array_equal(p_text[:3], tm.photo_model_.predict_proba(img[q[:3]], z[q[:3]], None))
     # ... which is the same model as a separately fitted photo-only one (BLAS batch
     # size can move the last bit, hence allclose)
     np.testing.assert_allclose(p_text[:3], p_photo[:3], rtol=1e-12, atol=1e-15)
-    assert not np.array_equal(p_text[3], p_photo[3])
+    assert not np.allclose(p_text[3], p_photo[3])
 
 
 def test_rare_answer_inside_fold():
@@ -288,7 +292,8 @@ def test_scaler_fitted_inside_training_part(make, monkeypatch):
         assert all(r.tobytes() in train_rows for r in A), f"fold {k} scaler saw held-out rows"
     yarr = np.array(y)
     for m, (tr, _) in zip(made, folds):
-        parts = [m] + ([m.photo_model_] if m.use_text else [])
+        # the text model's only photo classifier is its photo part (late fusion)
+        parts = [m.photo_model_] if m.use_text else [m]
         for part in parts:
             trained = tr[np.isin(yarr[tr], part.seen_)]   # rows the classifier fits on
             np.testing.assert_allclose(part.scaler_.mean_, X[trained].mean(axis=0))
@@ -304,3 +309,59 @@ def test_fit_converges_with_scale_imbalance():
     z = rng.dirichlet(np.full(10, 0.3), size=len(y))
     m = photo_model().fit(img.astype(np.float16), z, None, y)
     assert m.clf_.n_iter_.max() < 50
+
+
+def mixed_set(seed: int = 0, n: int = 30, d: int = 256, noise: float = 0.25):
+    """Photo separates steam from diesel from (tram or electric) over many strong
+    dimensions; tram and electric share one photo cluster and differ only by a word."""
+    rng = np.random.default_rng(seed)
+    centers = _unit(rng.normal(size=(3, d)))
+    spec = [("steam_loco", 0, "photo"), ("diesel_loco", 1, "photo"),
+            ("tram", 2, "streetcar"), ("electric_loco", 2, "pantograph")]
+    img, y, texts = [], [], []
+    for a, ci, word in spec:
+        img.append(_unit(centers[ci] + noise * rng.normal(size=(n, d))))
+        y += [a] * n
+        texts += [_text(rng, word) for _ in range(n)]
+    return np.vstack(img).astype(np.float16), np.full((len(y), 10), 0.1), texts, y
+
+
+def test_text_adds_to_informative_photo():
+    img, z, texts, y = mixed_set()
+    photo_only = accuracy(mf.out_of_fold(photo_model, img, z, None, y), y)
+    with_text = accuracy(mf.out_of_fold(text_model, img, z, texts, y), y)
+    assert photo_only <= 0.75                # tram vs electric is a coin toss by photo
+    assert with_text >= photo_only + 0.15
+    assert text_model().fit(img, z, texts, y).text_weight_ > 0
+
+
+def test_text_weight_chosen_inside_training_part(monkeypatch):
+    img, z, texts, y = mixed_set()
+    texts = [f"{t} row{i}" for i, t in enumerate(texts)]   # every text unique
+    fits = []                               # (fold, texts each vectorizer was fitted on)
+    fold = [-1]
+
+    class Recording(mf.TfidfVectorizer):
+        def fit(self, raw, *args, **kwargs):
+            fits.append((fold[0], list(raw)))
+            return super().fit(raw, *args, **kwargs)
+
+    monkeypatch.setattr(mf, "TfidfVectorizer", Recording)
+    made = []
+
+    def rec():
+        fold[0] += 1
+        m = text_model()
+        made.append(m)
+        return m
+
+    mf.out_of_fold(rec, img, z, texts, y)
+    folds = list(mf.outer_folds(y, 5, 0))
+    assert {k for k, _ in fits} == set(range(5))
+    for k, raw in fits:
+        assert set(raw) <= {texts[i] for i in folds[k][0]}, f"fold {k} saw held-out text"
+    for m, (tr, _) in zip(made, folds):
+        alone = text_model().fit(img[tr], z[tr], [texts[i] for i in tr], [y[i] for i in tr])
+        assert (m.text_weight_, m.text_C_, m.text_tfidf_size_) == \
+            (alone.text_weight_, alone.text_C_, alone.text_tfidf_size_)
+        assert m.text_weight_ in mf.TEXT_WEIGHTS

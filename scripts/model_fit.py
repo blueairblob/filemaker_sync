@@ -2,8 +2,9 @@
 
 Honesty is the point: a labelled photo's output always comes from a model that was
 not trained on its label (out-of-fold), and every setting (regularisation, TF-IDF
-size, the yardstick's blend weight) and the TF-IDF vocabulary are chosen inside the
-training part only. The final all-labels model scores only unlabelled photos.
+size, the photo + description blend weight, the yardstick's blend weight) and the
+TF-IDF vocabulary are chosen inside the training part only. The final all-labels
+model scores only unlabelled photos.
 
 Answers with fewer than `min_examples` labels in a training part are "unseen": they
 keep the zero-shot probability, and the classifier's probabilities over the seen
@@ -15,7 +16,6 @@ from collections import Counter
 from typing import Callable, Iterator
 
 import numpy as np
-from scipy import sparse
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import log_loss
@@ -25,7 +25,8 @@ from sklearn.preprocessing import StandardScaler
 C_GRID = (0.1, 1.0, 10.0, 100.0)
 TFIDF_SIZES = (2000, None)          # max_features; None keeps the whole vocabulary
 INNER_FOLDS = 3
-WEIGHT_GRID = tuple(i / 10 for i in range(11))
+WEIGHT_GRID = tuple(i / 10 for i in range(11))   # yardstick blend
+TEXT_WEIGHTS = (0.0, 0.25, 0.5, 0.75)            # photo + description blend
 ZS_FLOOR = 1e-6
 CHUNK = 8192                        # rows per predict batch (bounds memory on ~141k photos)
 TOKEN_PATTERN = r"(?u)\b\w[\w-]*\b"  # keeps "4-6-0" and "47279" as tokens
@@ -92,23 +93,64 @@ def _vectorizer(size) -> TfidfVectorizer:
                            sublinear_tf=True, max_features=size)
 
 
-def _design(X_photo: np.ndarray, scaler: StandardScaler, vec: TfidfVectorizer | None,
-            texts: list[str] | None):
-    """Standardised photo columns (scaler fitted on the classifier's own training rows:
-    unit-norm embedding components are ~0.03 while zero-shot logs reach -13.8, which
-    slows lbfgs by ~50x and skews the L2 penalty), plus the TF-IDF block if any."""
-    X = scaler.transform(X_photo)
-    if vec is None:
-        return X
-    return sparse.hstack([sparse.csr_matrix(X), vec.transform(texts)]).tocsr()
-
-
 def _logreg(C: float, seed: int) -> LogisticRegression:
     return LogisticRegression(C=C, max_iter=10000, random_state=seed)
 
 
 def _inner_splits(y_codes: np.ndarray) -> int:
     return min(INNER_FOLDS, int(np.bincount(y_codes).min()))
+
+
+def _inner_search(codes: np.ndarray, n_classes: int, seed: int, sizes, design):
+    """Pick (C, size) for a LogisticRegression by mean log loss over inner stratified
+    folds of the training part. design(size, tr, te) -> (X_tr, X_te) must fit any
+    scaler or vectorizer on the inner training rows `tr` only. Returns
+    (C, size, inner_oof): inner_oof is the winner's inner out-of-fold probabilities
+    (n, n_classes), or None when the training part is too small to split. The folds
+    depend only on (codes, seed), so a photo search and a text search over the same
+    rows share them."""
+    n_splits = _inner_splits(codes)
+    if n_splits < 2:
+        return C_GRID[len(C_GRID) // 2], sizes[0], None
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    splits = list(skf.split(np.zeros((len(codes), 1)), codes))
+    labels = np.arange(n_classes)
+    best, best_loss = None, np.inf
+    for size in sizes:
+        designs = [design(size, tr, te) for tr, te in splits]
+        for C in C_GRID:
+            loss, oof = 0.0, np.empty((len(codes), n_classes))
+            for (tr, te), (Xtr, Xte) in zip(splits, designs):
+                p = _logreg(C, seed).fit(Xtr, codes[tr]).predict_proba(Xte)
+                loss += log_loss(codes[te], p, labels=labels)
+                oof[te] = p
+            if loss < best_loss - 1e-12:
+                best, best_loss = (C, size, oof), loss
+    return best
+
+
+def _blend(c_photo: np.ndarray, c_text: np.ndarray, w: float) -> np.ndarray:
+    """log p = (1 - w) log p_photo + w log p_text over the seen answers, renormalised."""
+    if w == 0:
+        return c_photo
+    logp = ((1 - w) * np.log(np.clip(c_photo, 1e-15, None))
+            + w * np.log(np.clip(c_text, 1e-15, None)))
+    logp -= logp.max(axis=1, keepdims=True)
+    p = np.exp(logp)
+    return p / p.sum(axis=1, keepdims=True)
+
+
+def _choose_text_weight(c_photo: np.ndarray, c_text: np.ndarray, codes: np.ndarray,
+                        blank: np.ndarray) -> float:
+    """w from TEXT_WEIGHTS by accuracy on inner out-of-fold probabilities (blank-text
+    rows use w = 0, as at predict time); ties go to the smaller w."""
+    best, best_acc = 0.0, -1.0
+    for w in TEXT_WEIGHTS:
+        p = np.where(blank[:, None], c_photo, _blend(c_photo, c_text, w))
+        acc = float(np.mean(p.argmax(axis=1) == codes))
+        if acc > best_acc + 1e-12:
+            best, best_acc = w, acc
+    return best
 
 
 def outer_folds(y: list[str], folds: int = 5, seed: int = 0) -> Iterator[tuple[np.ndarray, np.ndarray]]:
@@ -130,9 +172,13 @@ def outer_folds(y: list[str], folds: int = 5, seed: int = 0) -> Iterator[tuple[n
 
 
 class SubjectModel:
-    """Logistic regression on photo features (embedding + zero-shot log-probabilities),
-    optionally plus TF-IDF of the description. With `use_text`, rows whose text is
-    blank are predicted by the model's own photo-only part (`photo_model_`).
+    """Logistic regression on standardised photo features (embedding + zero-shot
+    log-probabilities). With `use_text`, late fusion: the photo-only model
+    (`photo_model_`) and a text-only LogisticRegression on TF-IDF of the description
+    (`text_clf_` over `vectorizer_`) are blended over the seen answers,
+    log p = (1 - w) log p_photo + w log p_text, with w = `text_weight_`. Rows whose
+    text is blank use `photo_model_` alone. Every setting (photo C, text C and TF-IDF
+    size `text_C_`/`text_tfidf_size_`, w) is chosen by inner CV on the training part.
 
     After fit: `seen_` = the answers the classifier trained on (>= min_examples labels),
     in answer_ids order; every other answer falls back to zero-shot."""
@@ -149,65 +195,60 @@ class SubjectModel:
         unknown = sorted(set(y) - set(self.answer_ids))
         if unknown:
             raise ValueError(f"answers not in the task: {unknown}")
+        if self.use_text:
+            return self._fit_text(img, z, texts, y)
         counts = Counter(y)
         self.seen_ = [a for a in self.answer_ids if counts[a] >= self.min_examples]
         keep = np.array([a in self.seen_ for a in y], dtype=bool)
-        X_photo = _photo_features(np.asarray(img)[keep], np.asarray(z)[keep])
-        codes = np.array([self.seen_.index(a) for a, k in zip(y, keep) if k], dtype=int)
-        kept_texts = None
-        if self.use_text:
-            all_texts = _clean_texts(texts, len(y))
-            kept_texts = [t for t, k in zip(all_texts, keep) if k]
-            self.photo_model_ = SubjectModel(self.answer_ids, use_text=False,
-                                             min_examples=self.min_examples,
-                                             seed=self.seed).fit(img, z, None, y)
-        self.C_, self.tfidf_size_ = None, None
-        self.scaler_, self.vectorizer_, self.clf_ = None, None, None
+        X = _photo_features(np.asarray(img)[keep], np.asarray(z)[keep])
+        codes = np.array([self.seen_.index(a) for a in y if a in self.seen_], dtype=int)
+        self.C_, self.scaler_, self.clf_, self._inner_oof = None, None, None, None
         if len(self.seen_) < 2:
             return self                       # 0 or 1 seen answers: nothing to learn
-        sizes = TFIDF_SIZES if self.use_text else (None,)
-        self.C_, self.tfidf_size_ = self._search(X_photo, kept_texts, codes, sizes)
-        self.scaler_ = StandardScaler().fit(X_photo)
-        if self.use_text:
-            self.vectorizer_ = _vectorizer(self.tfidf_size_).fit(kept_texts)
-        self.clf_ = _logreg(self.C_, self.seed).fit(
-            _design(X_photo, self.scaler_, self.vectorizer_, kept_texts), codes)
+
+        def design(_size, tr, te):
+            scaler = StandardScaler().fit(X[tr])
+            return scaler.transform(X[tr]), scaler.transform(X[te])
+
+        self.C_, _, self._inner_oof = _inner_search(codes, len(self.seen_), self.seed,
+                                                     (None,), design)
+        self.scaler_ = StandardScaler().fit(X)
+        self.clf_ = _logreg(self.C_, self.seed).fit(self.scaler_.transform(X), codes)
         return self
 
-    def _search(self, X_photo, texts, codes, sizes):
-        """Pick (C, TF-IDF size) by mean log loss over inner folds of the training part.
-        The scaler and the vectorizer are refitted on each inner training part."""
-        n_splits = _inner_splits(codes)
-        if n_splits < 2:
-            return C_GRID[len(C_GRID) // 2], sizes[0]
-        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=self.seed)
-        splits = list(skf.split(X_photo, codes))
-        labels = np.arange(len(self.seen_))
-        best, best_loss = None, np.inf
-        for size in sizes:
-            designs = []
-            for tr, te in splits:
-                scaler = StandardScaler().fit(X_photo[tr])
-                vec, t_tr, t_te = None, None, None
-                if self.use_text:
-                    t_tr, t_te = [texts[i] for i in tr], [texts[i] for i in te]
-                    vec = _vectorizer(size).fit(t_tr)
-                designs.append((_design(X_photo[tr], scaler, vec, t_tr),
-                                _design(X_photo[te], scaler, vec, t_te)))
-            for C in C_GRID:
-                loss = 0.0
-                for (tr, te), (Xtr, Xte) in zip(splits, designs):
-                    clf = _logreg(C, self.seed).fit(Xtr, codes[tr])
-                    loss += log_loss(codes[te], clf.predict_proba(Xte), labels=labels)
-                if loss < best_loss - 1e-12:
-                    best, best_loss = (C, size), loss
-        return best
+    def _fit_text(self, img, z, texts, y) -> "SubjectModel":
+        self.photo_model_ = SubjectModel(self.answer_ids, use_text=False,
+                                         min_examples=self.min_examples,
+                                         seed=self.seed).fit(img, z, None, y)
+        self.seen_ = self.photo_model_.seen_
+        self.text_C_, self.text_tfidf_size_, self.text_weight_ = None, None, 0.0
+        self.vectorizer_, self.text_clf_ = None, None
+        kept = [t for t, a in zip(_clean_texts(texts, len(y)), y) if a in self.seen_]
+        if len(self.seen_) < 2 or _blank(kept).all():
+            return self                       # nothing to learn from the text
+        codes = np.array([self.seen_.index(a) for a in y if a in self.seen_], dtype=int)
 
-    def _classify(self, X_photo: np.ndarray, texts: list[str] | None) -> np.ndarray:
-        n = X_photo.shape[0]
+        def design(size, tr, te):
+            vec = _vectorizer(size).fit([kept[i] for i in tr])
+            return (vec.transform([kept[i] for i in tr]),
+                    vec.transform([kept[i] for i in te]))
+
+        # Trained on every kept row (a blank text is an all-zero row), so the text
+        # classifier always covers all seen answers; blank rows never use it.
+        self.text_C_, self.text_tfidf_size_, text_oof = _inner_search(
+            codes, len(self.seen_), self.seed, TFIDF_SIZES, design)
+        photo_oof = self.photo_model_._inner_oof   # same inner folds: same codes + seed
+        if photo_oof is not None and text_oof is not None:
+            self.text_weight_ = _choose_text_weight(photo_oof, text_oof, codes, _blank(kept))
+        self.vectorizer_ = _vectorizer(self.text_tfidf_size_).fit(kept)
+        self.text_clf_ = _logreg(self.text_C_, self.seed).fit(
+            self.vectorizer_.transform(kept), codes)
+        return self
+
+    def _classify(self, X_photo: np.ndarray) -> np.ndarray:
         if self.clf_ is None:
-            return np.ones((n, len(self.seen_)))
-        return self.clf_.predict_proba(_design(X_photo, self.scaler_, self.vectorizer_, texts))
+            return np.ones((X_photo.shape[0], len(self.seen_)))
+        return self.clf_.predict_proba(self.scaler_.transform(X_photo))
 
     def predict_proba(self, img, z, texts) -> np.ndarray:
         n = len(img)
@@ -215,20 +256,21 @@ class SubjectModel:
         all_texts = _clean_texts(texts, n) if self.use_text else None
         for s in range(0, n, CHUNK):
             sl = slice(s, s + CHUNK)
-            zc = np.asarray(z[sl])
+            ic, zc = np.asarray(img[sl]), np.asarray(z[sl])
             if not self.use_text:
-                c = self._classify(_photo_features(img[sl], zc), None)
+                c = self._classify(_photo_features(ic, zc))
                 out[sl] = combine_unseen(c, self.seen_, zc, self.answer_ids)
                 continue
             tc = all_texts[sl]
-            blank = _blank(tc)
+            blank = _blank(tc) | (self.text_clf_ is None)
             part = np.empty((len(tc), len(self.answer_ids)))
             if blank.any():
-                part[blank] = self.photo_model_.predict_proba(
-                    np.asarray(img[sl])[blank], zc[blank], None)
+                part[blank] = self.photo_model_.predict_proba(ic[blank], zc[blank], None)
             if (~blank).any():
-                full = [t for t, b in zip(tc, blank) if not b]
-                c = self._classify(_photo_features(np.asarray(img[sl])[~blank], zc[~blank]), full)
+                c_photo = self.photo_model_._classify(_photo_features(ic[~blank], zc[~blank]))
+                c_text = self.text_clf_.predict_proba(
+                    self.vectorizer_.transform([t for t, b in zip(tc, blank) if not b]))
+                c = _blend(c_photo, c_text, self.text_weight_)
                 part[~blank] = combine_unseen(c, self.seen_, zc[~blank], self.answer_ids)
             out[sl] = part
         return out
