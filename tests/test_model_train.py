@@ -177,3 +177,16 @@ def test_never_writes_db(tmp_path, monkeypatch):
     assert rc == 0
     assert conn.readonly is True
     assert conn.log and all(s.lstrip().lower().startswith("select") for s in conn.log)
+
+
+def test_outputs_independent_of_answer_row_order(tmp_path):
+    prefix, nos, _ = make_inputs(tmp_path)
+    desc = {no: f"steam loco {no}" for no in nos[:20]}
+    rows = answers_for(nos)
+    outs = []
+    for name, order in (("a", rows), ("b", rows[::-1])):
+        args = make_args(tmp_path, prefix, out_dir=str(tmp_path / name))
+        assert model_train.run(args, lambda t, o=order: list(o), lambda: desc) == 0
+        outs.append(Path(args.out_dir))
+    for f in ["v1-photo.csv", "v1-photo-desc.csv", "v1-report.md"]:
+        assert (outs[0] / f).read_text() == (outs[1] / f).read_text(), f

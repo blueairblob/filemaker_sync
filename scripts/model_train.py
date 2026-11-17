@@ -93,7 +93,9 @@ def run(args, fetch_answers: Callable, fetch_descriptions: Callable) -> int:
     notes = [NEAR_DUPLICATE_NOTE]
     skipped_nolabel, skipped_bad = [], []
     lab_idx, y = [], []
-    for no, ans in labels.items():
+    # fixed order (by embedding-file index, unknown photos last by name) so folds never
+    # depend on the order the database returned rows
+    for no, ans in sorted(labels.items(), key=lambda kv: (index.get(kv[0], len(index)), kv[0])):
         if no not in index:
             skipped_nolabel.append(no)
         elif ans not in ids:
