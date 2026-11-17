@@ -23,7 +23,8 @@
      "prompts": ["a line of parked railway carriages", "parked goods wagons"]},
     {"key": "8", "id": "ship", "label": "Ship", "loco": false,
      "prompts": ["a ship or boat"]},
-    {"key": "9", "id": "station_building_track", "label": "Station / building / track", "loco": false,
+    {"key": "9", "id": "station_building_track", "label": "Station / bridge / building / track",
+      "hint": "Includes bridges, viaducts and tunnels. A train on a viaduct: pick the loco if it is clearly visible, this answer if the train is small in the scene.", "loco": false,
      "prompts": ["an empty railway station platform", "empty railway tracks", "a signal box or railway building", "an empty railway bridge or viaduct"]},
     {"key": "0", "id": "other", "label": "Other", "loco": false,
      "prompts": ["a group of people", "a map, document or ticket", "a building or street scene", "a car"]}
