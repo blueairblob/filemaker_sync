@@ -166,3 +166,18 @@ photo only; output CSV is accepted by `load_model_run.read_scores`; label = late
 
 Regularisation grid, TF-IDF settings, the yardstick's blend weight, how the label/description
 query is written, file layout inside the script, and the report's exact wording.
+
+## Build notes (2026-11-17)
+
+- **Photo features are standardised** inside each training part (unscaled, one fit took 40–90 s on
+  the real data; scaled, 1–5 s).
+- **Photo + description is a blend, not one combined fit** (decided at build): a text-only classifier
+  on the description words, blended with the photo model as `(1 − w)·log p_photo + w·log p_text`,
+  `w` from (0, .25, .5, .75) chosen inside each training part. In one combined fit the photo columns
+  swamped the words, so the description had no effect.
+- **First real result (547 answers):** photo only 86.9% on the blind sample (zero-shot 78.8%,
+  always-steam 78.3%). The final photo + description model chose `w = 0` — on today's answers the
+  description adds nothing, and the report says so. Load photo only; revisit the description when
+  there are more checked answers for the rarer subjects.
+- The C grid was extended down to 0.003 after the first runs chose its lowest value (0.1); the final
+  photo model chose 0.01.
