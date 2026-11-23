@@ -3,6 +3,7 @@
 Run against the throwaway Docker postgres only (Golden Rule #4). The fixture DB
 is shared, so each test makes its own users and never asserts table-wide counts.
 """
+import datetime
 import json
 import uuid
 
@@ -1388,3 +1389,270 @@ def test_preservation_checksum_untouched_by_migration(pg):
     with pg.cursor() as cur:
         cur.execute(CHECKSUM_SQL)
         assert cur.fetchone() == before
+
+
+# --------------------------------------------------------------------------
+# Task 6: change list for the admin audit page
+# --------------------------------------------------------------------------
+
+CHANGES = ("select * from rat.change_list(p_user => %s::uuid, p_from => %s::timestamptz, "
+           "p_to => %s::timestamptz, p_kinds => %s::text[], p_after => %s, p_limit => %s)")
+CURSOR_RE = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}\|[a-z_]+\|\d+$"
+
+
+def _changes(pg, admin, user=None, frm=None, to=None, kinds=None, after=None, limit=100,
+             tz=None):
+    """change_list as admin (optionally in session time zone tz); a list of
+    dicts (column name -> value)."""
+    pg.commit()
+    as_user(pg, admin)
+    with pg.cursor() as cur:
+        if tz:
+            cur.execute("select set_config('timezone', %s, true)", (tz,))
+        cur.execute(CHANGES, (user, frm, to, kinds, after, limit))
+        names = [d[0] for d in cur.description]
+        rows = [dict(zip(names, r)) for r in cur.fetchall()]
+    pg.commit()
+    for r in rows:
+        for k in ("by_user", "approved_by"):
+            r[k] = None if r[k] is None else str(r[k])
+    return rows
+
+
+def test_change_list_kinds_and_people(pg):
+    import re
+    task = seed_task(pg, "t6_kinds", links=LINKS)
+    plain = seed_task(pg, "t6_kinds_plain")
+    img_f = "v6k_fill"
+    _linked_photo(pg, img_f)
+    seed_catalog(pg, "v6k_ans", "a scene")
+    seed_catalog(pg, "v6k_wd", "a scene")
+    seed_catalog(pg, "v6k_held", "a scene")
+    seed_fix_value(pg, "v6k_r", values=["1"])
+    seed_fix_value(pg, "v6k_u", values=["1"])
+    ts1 = seed_fix_value(pg, "v6k_h1", values=["1"])
+    ts2 = seed_fix_value(pg, "v6k_h2", values=["1"])
+    v, t, admin = make_volunteer(pg, in_training=False), make_volunteer(pg), make_admin(pg)
+    pg.commit()
+    extractor = _owner_history(pg, "v6k_r", ["1"], ["9"], "extracted", "extracted", v,
+                               source="extractor")
+
+    hr = _review(pg, v, "v6k_r", ["2"])                               # fix_review
+    hu0 = _review(pg, v, "v6k_u", ["3"])
+    _one(pg, admin, UNDO, ([hu0],))                                    # fix_undo
+    hu = _last_hist(pg, "v6k_u")[0]
+    aid_f = _filled_answer(pg, v, task, img_f)                         # answer + fix_model_check
+    aid = _answer(pg, v, plain, "v6k_ans", "loco")                     # answer
+    aid_w = _answer(pg, v, plain, "v6k_wd", "station")
+    _one(pg, admin, WITHDRAW, ([aid_w], "misread"))                    # answer_withdrawn
+    p1 = _one(pg, t, SUBMIT_FIX, ("v6k_h1", ["5"], "corrected", ts1))  # held_submitted x3
+    p2 = _one(pg, t, SUBMIT_FIX, ("v6k_h2", ["6"], "corrected", ts2))
+    pa = _one(pg, t, SUBMIT_ANSWER, (plain, "v6k_held", "loco", None, None, "sample"))
+    _one(pg, admin, "select rat.approve_fix_review(%s)", ([p1],))     # held_approved
+    _one(pg, admin, "select rat.reject_held('fix', %s, 'wrong number')", ([p2],))  # held_rejected
+    happ = _last_hist(pg, "v6k_h1")[0]
+
+    def key(r):
+        return (r["kind"], r["ref_table"], r["ref_id"])
+
+    by_v = _changes(pg, admin, v)
+    with pg.cursor() as cur:
+        cur.execute("select id from rat.data_fix_history where model_answer_id = %s order by id",
+                    (aid_f,))
+        fills = [r[0] for r in cur.fetchall()]
+    assert len(fills) == 2
+    assert sorted(map(key, by_v)) == sorted(
+        [("fix_review", "data_fix_history", hr), ("fix_review", "data_fix_history", hu0),
+         ("answer", "model_answer", aid_f), ("answer", "model_answer", aid),
+         ("answer", "model_answer", aid_w)]
+        + [("fix_model_check", "data_fix_history", h) for h in fills])
+    assert extractor not in [r["ref_id"] for r in by_v]   # extractor rows never listed
+    assert all(r["by_user"] == v for r in by_v)
+    for r in by_v:
+        assert re.match(CURSOR_RE, r["cursor"]), r["cursor"]
+        assert r["cursor"] == (r["at"].astimezone(datetime.timezone.utc)
+                               .strftime("%Y-%m-%dT%H:%M:%S.%f")
+                               + f"|{r['ref_table']}|{r['ref_id']}")
+
+    rev = next(r for r in by_v if r["ref_id"] == hr)
+    assert (rev["image_no"], rev["subject"], rev["before"], rev["after"], rev["approved_by"],
+            rev["undone"]) == ("v6k_r", "Loco number", {"values": ["1"], "status": "extracted"},
+                               {"values": ["2"], "status": "corrected"}, None, False)
+    ans = next(r for r in by_v if r["kind"] == "answer" and r["ref_id"] == aid)
+    assert (ans["image_no"], ans["subject"], ans["before"], ans["after"], ans["undone"]) == (
+        "v6k_ans", f"Question for {plain}?", {"shown_answer": None},
+        {"answer": "loco", "mode": "sample"}, False)
+
+    by_admin = _changes(pg, admin, admin)
+    assert sorted(map(key, by_admin)) == sorted([
+        ("fix_undo", "data_fix_history", hu),
+        ("answer_withdrawn", "model_answer_withdrawal", aid_w),
+        ("held_approved", "pending_fix_review", p1),
+        ("held_rejected", "pending_fix_review", p2)])
+    und = next(r for r in by_admin if r["ref_id"] == hu and r["kind"] == "fix_undo")
+    assert (und["before"], und["after"], und["undone"]) == (
+        {"values": ["3"], "status": "corrected"}, {"values": ["1"], "status": "extracted"}, False)
+    wd = next(r for r in by_admin if r["kind"] == "answer_withdrawn")
+    assert (wd["image_no"], wd["subject"], wd["after"], wd["approved_by"], wd["undone"]) == (
+        "v6k_wd", f"Question for {plain}?", {"note": "misread"}, None, False)
+    rej = next(r for r in by_admin if r["kind"] == "held_rejected")
+    assert (rej["image_no"], rej["subject"], rej["before"], rej["after"], rej["approved_by"]) == (
+        "v6k_h2", "Loco number", {"values": ["1"], "status": "extracted"},
+        {"values": ["6"], "status": "corrected", "note": "wrong number"}, None)
+    appr = next(r for r in by_admin if r["kind"] == "held_approved")
+    assert (appr["after"], appr["approved_by"], appr["undone"]) == (
+        {"values": ["5"], "status": "corrected"}, None, False)
+
+    by_t = _changes(pg, admin, t)
+    assert sorted(map(key, by_t)) == sorted([
+        ("held_submitted", "pending_fix_review", p1),
+        ("held_submitted", "pending_fix_review", p2),
+        ("held_submitted", "pending_model_answer", pa),
+        ("fix_review", "data_fix_history", happ)])
+    sub = next(r for r in by_t if r["ref_table"] == "pending_model_answer")
+    assert (sub["image_no"], sub["before"], sub["after"], sub["approved_by"]) == (
+        "v6k_held", {"shown_answer": None}, {"answer": "loco", "mode": "sample"}, None)
+    approved = next(r for r in by_t if r["kind"] == "fix_review")
+    assert approved["approved_by"] == admin
+
+    only = _changes(pg, admin, admin, kinds=["fix_undo", "held_rejected"])
+    assert {r["kind"] for r in only} == {"fix_undo", "held_rejected"}
+    assert _changes(pg, admin, admin, kinds=[]) == []
+    pg.commit()
+    as_user(pg, admin)
+    with pg.cursor() as cur:
+        with pytest.raises(psycopg2.Error) as ei:
+            cur.execute(CHANGES, (None, None, None, ["extractor"], None, 10))
+        assert ei.value.pgcode == "22023"
+    pg.rollback()
+
+
+def test_change_list_paging(pg):
+    for i in range(3):
+        seed_fix_value(pg, f"v6p_{i}", values=["1"])
+    v, admin = make_volunteer(pg, in_training=False), make_admin(pg)
+    pg.commit()
+    ids = [_review(pg, v, f"v6p_{i}", [str(i + 2)]) for i in range(3)]
+    same = datetime.datetime(2020, 5, 5, 12, 0, 0, 123456, tzinfo=datetime.timezone.utc)
+    ids += [_owner_history(pg, "v6p_x", ["1"], ["2"], "extracted", "corrected", v, at=same)
+            for _ in range(2)]   # two events at the same instant: tie broken by ref_id DESC
+
+    full = _changes(pg, admin, v, limit=500)
+    assert len(full) == 5 and sorted(r["ref_id"] for r in full) == sorted(ids)
+    assert [r["ref_id"] for r in full] == [ids[2], ids[1], ids[0], ids[4], ids[3]]
+    pages, after = [], None
+    while True:
+        page = _changes(pg, admin, v, after=after, limit=2)
+        if not page:
+            break
+        assert len(page) <= 2
+        pages.append(page)
+        after = page[-1]["cursor"]
+    assert [len(p) for p in pages] == [2, 2, 1]
+    assert [r["cursor"] for p in pages for r in p] == [r["cursor"] for r in full]
+    # The cursor is in UTC whatever the session time zone, so it pages the same.
+    pages, after = [], None
+    while True:
+        page = _changes(pg, admin, v, after=after, limit=2, tz="America/New_York")
+        if not page:
+            break
+        pages += page
+        after = page[-1]["cursor"]
+    assert [r["cursor"] for r in pages] == [r["cursor"] for r in full]
+
+    assert len(_changes(pg, admin, v, limit=0)) == 1      # clamped to 1..500
+    assert len(_changes(pg, admin, v, limit=-5)) == 1
+    assert len(_changes(pg, admin, v, limit=None)) == 5
+    for bad in ("nope", "2020-05-05T12:00:00.123456|data_fix_history", "x|y|z",
+                "2020-13-05T12:00:00.123456|data_fix_history|1"):
+        pg.commit()
+        as_user(pg, admin)
+        with pg.cursor() as cur:
+            with pytest.raises(psycopg2.Error) as ei:
+                cur.execute(CHANGES, (v, None, None, None, bad, 10))
+            assert ei.value.pgcode == "22023", bad
+        pg.rollback()
+
+
+def test_change_list_dates(pg):
+    v, admin = make_volunteer(pg, in_training=False), make_admin(pg)
+    pg.commit()
+    utc = datetime.timezone.utc
+    t1, t2, t3 = (datetime.datetime(2020, 1, 1, tzinfo=utc),
+                  datetime.datetime(2020, 6, 1, tzinfo=utc),
+                  datetime.datetime(2021, 1, 1, tzinfo=utc))
+    h1, h2, h3 = (_owner_history(pg, "v6d", ["1"], ["2"], "extracted", "corrected", v, at=at)
+                  for at in (t1, t2, t3))
+
+    def ids(**kw):
+        return [r["ref_id"] for r in _changes(pg, admin, v, **kw)]
+
+    assert ids() == [h3, h2, h1]
+    assert ids(frm=datetime.datetime(2020, 3, 1, tzinfo=utc)) == [h3, h2]
+    assert ids(to=datetime.datetime(2020, 12, 31, tzinfo=utc)) == [h2, h1]
+    assert ids(frm=datetime.datetime(2020, 3, 1, tzinfo=utc),
+               to=datetime.datetime(2020, 12, 31, tzinfo=utc)) == [h2]
+    assert ids(frm=t2, to=t3) == [h2]     # from inclusive, to exclusive
+
+
+def test_change_list_undone_flags(pg):
+    task, plain = seed_task(pg, "t6_und", links=LINKS), seed_task(pg, "t6_und_plain")
+    img_f = "v6u_fill"
+    _linked_photo(pg, img_f)
+    seed_catalog(pg, "v6u_a", "a scene")
+    seed_catalog(pg, "v6u_b", "a scene")
+    seed_fix_value(pg, "v6u_r", values=["1"])
+    seed_fix_value(pg, "v6u_k", values=["1"])
+    v, admin = make_volunteer(pg, in_training=False), make_admin(pg)
+    pg.commit()
+
+    def undone(user=None):
+        return {(r["kind"], r["ref_id"]): r["undone"]
+                for r in _changes(pg, admin, user or v, limit=500)}
+
+    h1 = _review(pg, v, "v6u_r", ["2"])
+    hk = _review(pg, v, "v6u_k", ["7"])           # kept: never undone
+    _one(pg, admin, UNDO, ([h1],))
+    u1 = _last_hist(pg, "v6u_r")[0]
+    assert undone()[("fix_review", h1)] is True
+    assert undone()[("fix_review", hk)] is False
+    assert undone(admin)[("fix_undo", u1)] is False
+    _one(pg, admin, UNDO, ([u1],))                # undoing the undo: h1 counts again
+    u2 = _last_hist(pg, "v6u_r")[0]
+    assert undone()[("fix_review", h1)] is False
+    flags = undone(admin)
+    assert (flags[("fix_undo", u1)], flags[("fix_undo", u2)]) == (True, False)
+    _one(pg, admin, UNDO, ([u2],))                # and once more: h1 undone again
+    u3 = _last_hist(pg, "v6u_r")[0]
+    flags = undone(admin)
+    assert (flags[("fix_undo", u1)], flags[("fix_undo", u2)], flags[("fix_undo", u3)]) == (
+        False, True, False)
+    assert undone()[("fix_review", h1)] is True
+
+    aid_f = _filled_answer(pg, v, task, img_f)
+    aid_a = _answer(pg, v, plain, "v6u_a", "loco")
+    aid_b = _answer(pg, v, plain, "v6u_b", "loco")
+    _one(pg, admin, WITHDRAW, ([aid_f, aid_a], None))
+    flags = undone()
+    assert (flags[("answer", aid_f)], flags[("answer", aid_a)], flags[("answer", aid_b)]) == (
+        True, True, False)
+    fills = [k for k in flags if k[0] == "fix_model_check"]
+    assert len(fills) == 2 and all(flags[k] for k in fills)
+    assert not any(r["undone"] for r in _changes(pg, admin, admin,
+                                                 kinds=["answer_withdrawn"], limit=500))
+
+
+def test_change_list_admin_only(pg):
+    users = {who: _make(pg, who) for who in ("volunteer", "trainee", "removed", "stranger")}
+    pg.commit()
+    for who, uid in users.items():
+        _, err = _as(pg, uid, "select * from rat.change_list()")
+        assert err is not None and err.pgcode == "42501", who
+    fn = "rat.change_list(uuid, timestamptz, timestamptz, text[], text, integer)"
+    with pg.cursor() as cur:
+        cur.execute("select has_function_privilege('anon', %s, 'EXECUTE'), "
+                    "has_function_privilege('authenticated', %s, 'EXECUTE'), "
+                    "has_function_privilege('public', %s, 'EXECUTE'), "
+                    "p.prosecdef, p.proconfig "
+                    "from pg_proc p where p.oid = %s::regprocedure", (fn, fn, fn, fn))
+        assert cur.fetchone() == (False, True, False, True, ['search_path=""'])

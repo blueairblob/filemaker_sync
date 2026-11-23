@@ -1558,6 +1558,10 @@ COMMIT;
 -- withdraw_model_answers withdraws answers and undoes their fills by the same
 -- rule. Both admin-only; an undo is written to history with source 'undo'.
 --
+-- Change list (sixth section): change_list, admin-only, one row per event
+-- (fix changes, answers, withdrawals, held submissions and decisions), newest
+-- first with keyset paging, each flagged undone when it has been reversed.
+--
 -- Apply to live AFTER add_model_check_tables.sql (the user applies it; agents
 -- never run DDL on live oci). Requires rat.is_admin() / rat.admin_user and
 -- auth.users / auth.uid().
@@ -3469,6 +3473,195 @@ REVOKE EXECUTE ON FUNCTION
 GRANT EXECUTE ON FUNCTION
   rat.undo_fix_change(bigint[]),
   rat.withdraw_model_answers(bigint[], text)
+  TO authenticated;
+
+-- ===========================================================================
+-- Change list (sixth section): the admin audit page. One row per event,
+-- newest first, read from the append-only records only; extractor history
+-- rows are never listed. Kinds:
+--   fix_review / fix_model_check / fix_undo   data_fix_history (by changed_by)
+--   answer            model_answer (by answered_by; undone when withdrawn)
+--   answer_withdrawn  model_answer_withdrawal (by withdrawn_by)
+--   held_submitted    pending_* (at submitted_at, by submitted_by)
+--   held_approved / held_rejected
+--                     pending_* (at decided_at, by decided_by); a 'withdrawn'
+--                     decision (a trainee's re-submit) is not an event.
+-- A history row h is undone when an undo row u for the same key (image_no,
+-- fix_id) has u.undoes_from <= h.id <= u.undoes and u is not itself undone
+-- (the same rule, so undoing an undo makes its run count again).
+-- Filters: p_user (who made the change), p_from <= at < p_to, p_kinds (NULL =
+-- all; an unknown kind is 22023). Keyset paging in the order
+-- at DESC, ref_table, ref_id DESC: cursor =
+-- 'YYYY-MM-DD"T"HH24:MI:SS.US' (at, in UTC) | ref_table | ref_id, and p_after
+-- returns the rows strictly after it (a malformed cursor is 22023).
+-- p_limit is clamped to 1..500 (NULL = 100).
+-- ===========================================================================
+
+CREATE INDEX IF NOT EXISTS data_fix_history_undo_idx
+  ON rat.data_fix_history (image_no, fix_id, id) WHERE source = 'undo';
+
+CREATE OR REPLACE FUNCTION rat.change_list(
+  p_user uuid DEFAULT NULL,
+  p_from timestamptz DEFAULT NULL,
+  p_to timestamptz DEFAULT NULL,
+  p_kinds text[] DEFAULT NULL,
+  p_after text DEFAULT NULL,
+  p_limit integer DEFAULT 100
+)
+RETURNS TABLE (
+  cursor text,
+  kind text,
+  at timestamptz,
+  by_user uuid,
+  approved_by uuid,
+  image_no text,
+  subject text,
+  before jsonb,
+  after jsonb,
+  ref_table text,
+  ref_id bigint,
+  undone boolean
+)
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  v_kinds constant text[] := ARRAY['fix_review', 'fix_model_check', 'fix_undo', 'answer',
+                                   'answer_withdrawn', 'held_submitted', 'held_approved',
+                                   'held_rejected'];
+  v_limit integer := greatest(1, least(500, coalesce(p_limit, 100)));
+  v_at timestamptz;
+  v_table text;
+  v_id bigint;
+  v_dead bigint[] := '{}';   -- undo rows that are themselves undone
+  u record;
+BEGIN
+  IF NOT rat.is_admin() THEN
+    RAISE EXCEPTION 'not a data fixes admin' USING ERRCODE = '42501';
+  END IF;
+  IF EXISTS (SELECT 1 FROM unnest(p_kinds) AS k WHERE k IS NULL OR NOT (k = ANY (v_kinds))) THEN
+    RAISE EXCEPTION 'unknown change kind' USING ERRCODE = '22023';
+  END IF;
+  IF p_after IS NOT NULL THEN
+    BEGIN
+      IF p_after !~ '^[^|]+\|[a-z_]+\|[0-9]+$' THEN
+        RAISE EXCEPTION 'bad cursor';
+      END IF;
+      v_at := split_part(p_after, '|', 1)::timestamp AT TIME ZONE 'UTC';
+      v_table := split_part(p_after, '|', 2);
+      v_id := split_part(p_after, '|', 3)::bigint;
+    EXCEPTION
+      WHEN OTHERS THEN
+        RAISE EXCEPTION 'bad cursor: %', p_after USING ERRCODE = '22023';
+    END;
+  END IF;
+
+  -- Newest undo first: only a later undo can cover an undo row, so by the
+  -- time a row is reached its own state is settled. A live undo marks the
+  -- undo rows it covers as dead.
+  FOR u IN SELECT d.id, d.image_no AS img, d.fix_id AS fid,
+                  coalesce(d.undoes_from, d.undoes) AS lo, d.undoes AS hi
+             FROM rat.data_fix_history d
+            WHERE d.source = 'undo' AND d.undoes IS NOT NULL
+            ORDER BY d.id DESC
+  LOOP
+    IF NOT (u.id = ANY (v_dead)) THEN
+      v_dead := v_dead || ARRAY(SELECT d.id FROM rat.data_fix_history d
+                                 WHERE d.source = 'undo' AND d.image_no = u.img
+                                   AND d.fix_id = u.fid AND d.id BETWEEN u.lo AND u.hi);
+    END IF;
+  END LOOP;
+
+  RETURN QUERY
+    SELECT to_char(e.e_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US')
+             || '|' || e.e_table || '|' || e.e_id,
+           e.e_kind, e.e_at, e.e_by, e.e_appr, e.e_img, e.e_subj, e.e_bef, e.e_aft,
+           e.e_table, e.e_id, e.e_undone
+      FROM (
+        SELECT CASE h.source WHEN 'review' THEN 'fix_review'
+                             WHEN 'model_check' THEN 'fix_model_check'
+                             ELSE 'fix_undo' END AS e_kind,
+               h.changed_at AS e_at, h.changed_by AS e_by, h.approved_by AS e_appr,
+               h.image_no AS e_img, d.title AS e_subj,
+               jsonb_build_object('values', to_jsonb(h.old_values), 'status', h.old_status) AS e_bef,
+               jsonb_build_object('values', to_jsonb(h.new_values), 'status', h.new_status) AS e_aft,
+               'data_fix_history'::text AS e_table, h.id AS e_id,
+               EXISTS (SELECT 1 FROM rat.data_fix_history x
+                        WHERE x.source = 'undo' AND x.image_no = h.image_no
+                          AND x.fix_id = h.fix_id
+                          AND coalesce(x.undoes_from, x.undoes) <= h.id AND h.id <= x.undoes
+                          AND NOT (x.id = ANY (v_dead))) AS e_undone
+          FROM rat.data_fix_history h
+          LEFT JOIN rat.data_fix d ON d.id = h.fix_id
+         WHERE h.source IN ('review', 'model_check', 'undo')
+        UNION ALL
+        SELECT 'answer', a.answered_at, a.answered_by, a.approved_by, a.image_no, t.question,
+               jsonb_build_object('shown_answer', a.shown_answer),
+               jsonb_build_object('answer', a.answer, 'mode', a.mode),
+               'model_answer', a.id,
+               EXISTS (SELECT 1 FROM rat.model_answer_withdrawal w WHERE w.answer_id = a.id)
+          FROM rat.model_answer a
+          LEFT JOIN rat.model_task t ON t.id = a.task_id
+        UNION ALL
+        SELECT 'answer_withdrawn', w.withdrawn_at, w.withdrawn_by, NULL::uuid, a.image_no,
+               t.question, NULL::jsonb, jsonb_build_object('note', w.note),
+               'model_answer_withdrawal', w.answer_id, false
+          FROM rat.model_answer_withdrawal w
+          JOIN rat.model_answer a ON a.id = w.answer_id
+          LEFT JOIN rat.model_task t ON t.id = a.task_id
+        UNION ALL
+        SELECT ev.k, ev.ea, ev.eb, NULL::uuid, f.image_no, d.title,
+               jsonb_build_object('values', to_jsonb(f.base_values), 'status', f.base_status),
+               jsonb_build_object('values', to_jsonb(f."values"), 'status', f.status)
+                 || CASE WHEN ev.k = 'held_rejected' THEN jsonb_build_object('note', f.note)
+                         ELSE '{}'::jsonb END,
+               'pending_fix_review', f.id, false
+          FROM rat.pending_fix_review f
+          CROSS JOIN LATERAL (
+            VALUES ('held_submitted', f.submitted_at, f.submitted_by),
+                   (CASE f.decision WHEN 'approved' THEN 'held_approved'
+                                    WHEN 'rejected' THEN 'held_rejected' END,
+                    f.decided_at, f.decided_by)
+          ) AS ev(k, ea, eb)
+          LEFT JOIN rat.data_fix d ON d.id = f.fix_id
+         WHERE ev.k IS NOT NULL
+        UNION ALL
+        SELECT ev.k, ev.ea, ev.eb, NULL::uuid, m.image_no, t.question,
+               jsonb_build_object('shown_answer', m.shown_answer),
+               jsonb_build_object('answer', m.answer, 'mode', m.mode)
+                 || CASE WHEN ev.k = 'held_rejected' THEN jsonb_build_object('note', m.note)
+                         ELSE '{}'::jsonb END,
+               'pending_model_answer', m.id, false
+          FROM rat.pending_model_answer m
+          CROSS JOIN LATERAL (
+            VALUES ('held_submitted', m.submitted_at, m.submitted_by),
+                   (CASE m.decision WHEN 'approved' THEN 'held_approved'
+                                    WHEN 'rejected' THEN 'held_rejected' END,
+                    m.decided_at, m.decided_by)
+          ) AS ev(k, ea, eb)
+          LEFT JOIN rat.model_task t ON t.id = m.task_id
+         WHERE ev.k IS NOT NULL
+      ) e
+     WHERE (p_kinds IS NULL OR e.e_kind = ANY (p_kinds))
+       AND (p_user IS NULL OR e.e_by = p_user)
+       AND (p_from IS NULL OR e.e_at >= p_from)
+       AND (p_to IS NULL OR e.e_at < p_to)
+       AND (p_after IS NULL
+            OR e.e_at < v_at
+            OR (e.e_at = v_at AND (e.e_table > v_table
+                                   OR (e.e_table = v_table AND e.e_id < v_id))))
+     ORDER BY e.e_at DESC, e.e_table, e.e_id DESC
+     LIMIT v_limit;
+END;
+$$;
+
+REVOKE EXECUTE ON FUNCTION
+  rat.change_list(uuid, timestamptz, timestamptz, text[], text, integer)
+  FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION
+  rat.change_list(uuid, timestamptz, timestamptz, text[], text, integer)
   TO authenticated;
 
 COMMIT;
