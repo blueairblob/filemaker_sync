@@ -1553,6 +1553,11 @@ COMMIT;
 -- with reject_held; held_list and my_held list them. A trainee's own pending
 -- keys drop out of their own queues.
 --
+-- Undo and withdraw (fifth section): undo_fix_change reverses Data Fixes
+-- changes per key (image_no, fix_id) through the internal rat._undo_fix_keys;
+-- withdraw_model_answers withdraws answers and undoes their fills by the same
+-- rule. Both admin-only; an undo is written to history with source 'undo'.
+--
 -- Apply to live AFTER add_model_check_tables.sql (the user applies it; agents
 -- never run DDL on live oci). Requires rat.is_admin() / rat.admin_user and
 -- auth.users / auth.uid().
@@ -3216,6 +3221,240 @@ GRANT EXECUTE ON FUNCTION
   rat.reject_held(text, bigint[], text),
   rat.held_list(uuid),
   rat.my_held()
+  TO authenticated;
+
+-- ===========================================================================
+-- Undo and withdraw (fifth section). An undo is one more change: it never
+-- edits or deletes history, and the history trigger writes it with source
+-- 'undo' (undoes = newest row it reverses, undoes_from = earliest). A
+-- withdrawal is a row in rat.model_answer_withdrawal; the answer itself is
+-- never touched.
+-- ===========================================================================
+
+-- The per-key undo rule, shared by undo_fix_change and withdraw_model_answers.
+-- Order is history id. Rows that are not human changes (source 'extractor',
+-- or no old_status: an INSERT) are skipped. The rest are grouped by key
+-- (image_no, fix_id); each key runs in its own subtransaction, with its
+-- data_fix_value row locked. A key is undone only when every history row for
+-- it after its earliest given row is also given, and its value still equals
+-- the newest given row's new_values/new_status; otherwise all its given ids
+-- are 'changed_since'. It is then set back to the earliest given row's old
+-- values/status in one review-context UPDATE:
+--   needs_recheck    old_needs_recheck, or (history from before this
+--                    migration) true unless the restored status is 'extracted';
+--   description_hash old_description_hash, else the current one;
+--   reviewed_by/at   NULL for 'extracted', else changed_by/changed_at of the
+--                    newest history row before the earliest given one.
+-- 'undone' counts keys. Internal: no EXECUTE for authenticated.
+CREATE OR REPLACE FUNCTION rat._undo_fix_keys(p_history_ids bigint[])
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  v_id bigint;
+  h rat.data_fix_history;
+  k record;
+  e rat.data_fix_history;      -- earliest given row of the key
+  n rat.data_fix_history;      -- newest given row of the key
+  v_prev rat.data_fix_history; -- the row before e, for reviewed_by/at
+  v_cur rat.data_fix_value;
+  v_ok bigint[] := '{}';
+  v_undone integer := 0;
+  v_changed jsonb := '[]'::jsonb;
+  v_skipped jsonb := '[]'::jsonb;
+BEGIN
+  FOR v_id IN SELECT DISTINCT x FROM unnest(coalesce(p_history_ids, '{}'::bigint[])) AS x
+               WHERE x IS NOT NULL ORDER BY x
+  LOOP
+    SELECT d.* INTO h FROM rat.data_fix_history d WHERE d.id = v_id;
+    IF NOT FOUND THEN
+      v_skipped := v_skipped || jsonb_build_object('id', v_id, 'reason', 'no such change');
+    ELSIF h.source NOT IN ('review', 'model_check', 'undo') OR h.old_status IS NULL THEN
+      v_skipped := v_skipped || jsonb_build_object('id', v_id, 'reason', 'not a human change');
+    ELSE
+      v_ok := v_ok || v_id;
+    END IF;
+  END LOOP;
+
+  FOR k IN SELECT d.image_no, d.fix_id, min(d.id) AS first_id, max(d.id) AS last_id,
+                  array_agg(d.id ORDER BY d.id) AS ids
+             FROM rat.data_fix_history d
+            WHERE d.id = ANY (v_ok)
+            GROUP BY d.image_no, d.fix_id
+            ORDER BY min(d.id)
+  LOOP
+    BEGIN
+      SELECT v.* INTO v_cur FROM rat.data_fix_value v
+       WHERE v.image_no = k.image_no AND v.fix_id = k.fix_id
+         FOR UPDATE;
+      IF NOT FOUND THEN
+        v_skipped := v_skipped || (SELECT jsonb_agg(jsonb_build_object(
+                                     'id', x, 'reason', 'no data_fix_value') ORDER BY x)
+                                     FROM unnest(k.ids) AS x);
+      ELSE
+        SELECT d.* INTO e FROM rat.data_fix_history d WHERE d.id = k.first_id;
+        SELECT d.* INTO n FROM rat.data_fix_history d WHERE d.id = k.last_id;
+        IF EXISTS (SELECT 1 FROM rat.data_fix_history d
+                    WHERE d.image_no = k.image_no AND d.fix_id = k.fix_id
+                      AND d.id > k.first_id AND NOT (d.id = ANY (k.ids)))
+           OR v_cur."values" IS DISTINCT FROM n.new_values
+           OR v_cur.status IS DISTINCT FROM n.new_status THEN
+          v_changed := v_changed || to_jsonb(k.ids);
+        ELSE
+          v_prev := NULL;
+          IF e.old_status <> 'extracted' THEN
+            SELECT d.* INTO v_prev FROM rat.data_fix_history d
+             WHERE d.image_no = k.image_no AND d.fix_id = k.fix_id AND d.id < k.first_id
+             ORDER BY d.id DESC
+             LIMIT 1;
+          END IF;
+
+          PERFORM pg_catalog.set_config('rat.review_context', 'on', true);
+          PERFORM pg_catalog.set_config('rat.review_source', 'undo', true);
+          PERFORM pg_catalog.set_config('rat.undoes', k.last_id::text, true);
+          PERFORM pg_catalog.set_config('rat.undoes_from', k.first_id::text, true);
+          PERFORM pg_catalog.set_config('rat.acting_for', '', true);
+          PERFORM pg_catalog.set_config('rat.approved_by', '', true);
+          PERFORM pg_catalog.set_config('rat.model_answer_id', '', true);
+          UPDATE rat.data_fix_value v
+             SET "values" = e.old_values,
+                 status = e.old_status,
+                 needs_recheck = coalesce(e.old_needs_recheck, e.old_status <> 'extracted'),
+                 description_hash = coalesce(e.old_description_hash, v.description_hash),
+                 reviewed_by = v_prev.changed_by,
+                 reviewed_at = v_prev.changed_at
+           WHERE v.image_no = k.image_no AND v.fix_id = k.fix_id;
+          -- Close the window again: only this UPDATE runs in review context.
+          PERFORM pg_catalog.set_config('rat.review_context', '', true);
+          PERFORM pg_catalog.set_config('rat.review_source', '', true);
+          PERFORM pg_catalog.set_config('rat.undoes', '', true);
+          PERFORM pg_catalog.set_config('rat.undoes_from', '', true);
+          v_undone := v_undone + 1;
+        END IF;
+      END IF;
+    EXCEPTION
+      WHEN OTHERS THEN
+        v_skipped := v_skipped || (SELECT jsonb_agg(jsonb_build_object(
+                                     'id', x, 'reason', SQLERRM) ORDER BY x)
+                                     FROM unnest(k.ids) AS x);
+    END;
+  END LOOP;
+
+  RETURN jsonb_build_object('undone', v_undone, 'changed_since', v_changed,
+                            'skipped', v_skipped);
+END;
+$$;
+
+-- Admin only. Accepts history rows whose source is review, model_check or
+-- undo; undoing an undo re-applies the change (same rule, no special case).
+CREATE OR REPLACE FUNCTION rat.undo_fix_change(p_history_ids bigint[])
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+BEGIN
+  IF NOT rat.is_admin() THEN
+    RAISE EXCEPTION 'not a data fixes admin' USING ERRCODE = '42501';
+  END IF;
+  RETURN rat._undo_fix_keys(p_history_ids);
+END;
+$$;
+
+-- Admin only. Each answer is handled on its own, in id order, inside its own
+-- subtransaction. Its Data Fixes fills are found by model_answer_id, or, for
+-- an answer saved before this migration, by matching image_no, source
+-- 'model_check', changed_by = answered_by and changed_at = answered_at (both
+-- now() of one transaction). They are undone by the per-key rule; a fill
+-- changed since stays in place and is listed in fills_left. The withdrawal
+-- stands either way. There is no un-withdraw: to restore an answer, answer
+-- again.
+CREATE OR REPLACE FUNCTION rat.withdraw_model_answers(p_answer_ids bigint[], p_note text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  v_id bigint;
+  a rat.model_answer;
+  v_fills bigint[];
+  v_res jsonb;
+  v_withdrawn integer := 0;
+  v_skipped jsonb := '[]'::jsonb;
+  v_left jsonb := '[]'::jsonb;
+BEGIN
+  IF NOT rat.is_admin() THEN
+    RAISE EXCEPTION 'not a data fixes admin' USING ERRCODE = '42501';
+  END IF;
+  FOR v_id IN SELECT DISTINCT x FROM unnest(coalesce(p_answer_ids, '{}'::bigint[])) AS x
+               WHERE x IS NOT NULL ORDER BY x
+  LOOP
+    BEGIN
+      SELECT m.* INTO a FROM rat.model_answer m WHERE m.id = v_id;
+      IF NOT FOUND THEN
+        v_skipped := v_skipped || jsonb_build_object('id', v_id, 'reason', 'no such answer');
+      ELSIF EXISTS (SELECT 1 FROM rat.model_answer_withdrawal w WHERE w.answer_id = v_id) THEN
+        v_skipped := v_skipped || jsonb_build_object('id', v_id, 'reason', 'already withdrawn');
+      ELSE
+        INSERT INTO rat.model_answer_withdrawal (answer_id, withdrawn_by, note)
+        VALUES (v_id, auth.uid(), p_note);
+
+        v_fills := ARRAY(SELECT d.id FROM rat.data_fix_history d
+                          WHERE d.model_answer_id = v_id ORDER BY d.id);
+        IF cardinality(v_fills) = 0 THEN
+          v_fills := ARRAY(SELECT d.id FROM rat.data_fix_history d
+                            WHERE d.model_answer_id IS NULL
+                              AND d.source = 'model_check'
+                              AND d.image_no = a.image_no
+                              AND d.changed_by = a.answered_by
+                              AND d.changed_at = a.answered_at
+                            ORDER BY d.id);
+        END IF;
+
+        IF cardinality(v_fills) > 0 THEN
+          v_res := rat._undo_fix_keys(v_fills);
+          v_left := v_left || coalesce(
+            (SELECT jsonb_agg(jsonb_build_object('image_no', l.image_no, 'fix_id', l.fix_id)
+                              ORDER BY l.image_no, l.fix_id)
+               FROM (SELECT DISTINCT d.image_no, d.fix_id
+                       FROM rat.data_fix_history d
+                      WHERE d.id IN (SELECT c::bigint
+                                       FROM jsonb_array_elements_text(v_res -> 'changed_since') AS c
+                                     UNION
+                                     SELECT (s ->> 'id')::bigint
+                                       FROM jsonb_array_elements(v_res -> 'skipped') AS s)) l),
+            '[]'::jsonb);
+        END IF;
+        v_withdrawn := v_withdrawn + 1;
+      END IF;
+    EXCEPTION
+      WHEN OTHERS THEN
+        v_skipped := v_skipped || jsonb_build_object('id', v_id, 'reason', SQLERRM);
+    END;
+  END LOOP;
+  RETURN jsonb_build_object('withdrawn', v_withdrawn, 'skipped', v_skipped,
+                            'fills_left', v_left);
+END;
+$$;
+
+REVOKE ALL ON FUNCTION rat._undo_fix_keys(bigint[]) FROM PUBLIC, anon, authenticated;
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'picaloco_agent') THEN
+    REVOKE ALL ON FUNCTION rat._undo_fix_keys(bigint[]) FROM picaloco_agent;
+  END IF;
+END $$;
+
+REVOKE EXECUTE ON FUNCTION
+  rat.undo_fix_change(bigint[]),
+  rat.withdraw_model_answers(bigint[], text)
+  FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION
+  rat.undo_fix_change(bigint[]),
+  rat.withdraw_model_answers(bigint[], text)
   TO authenticated;
 
 COMMIT;

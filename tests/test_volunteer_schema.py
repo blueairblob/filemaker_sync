@@ -997,3 +997,346 @@ def test_held_admin_rpcs_and_tables_closed(pg):
                     "has_function_privilege('authenticated', %s, 'EXECUTE'), "
                     "has_function_privilege('public', %s, 'EXECUTE')", (fn, fn, fn))
         assert cur.fetchone() == (False, False, False)
+
+
+# --------------------------------------------------------------------------
+# Task 5: undo data fix changes and withdraw model answers
+# --------------------------------------------------------------------------
+
+UNDO = "select rat.undo_fix_change(%s::bigint[])"
+WITHDRAW = "select rat.withdraw_model_answers(%s::bigint[], %s)"
+REVIEW = "select rat.review_fix_value(%s, %s, %s, %s, %s)"
+
+
+def _review(pg, uid, image_no, values, status="corrected", fix_id="loco_number"):
+    """Review through the RPC as uid; return the history id it wrote."""
+    _one(pg, uid, REVIEW, (image_no, fix_id, values, status, _live(pg, image_no, fix_id)[3]))
+    return _last_hist(pg, image_no, fix_id)[0]
+
+
+def _last_hist(pg, image_no, fix_id="loco_number"):
+    with pg.cursor() as cur:
+        cur.execute("select id, source, undoes, undoes_from, changed_by::text, old_status, "
+                    "new_status from rat.data_fix_history where image_no = %s and fix_id = %s "
+                    "order by id desc limit 1", (image_no, fix_id))
+        return cur.fetchone()
+
+
+def _n_hist(pg, image_no, source=None):
+    with pg.cursor() as cur:
+        cur.execute("select count(*) from rat.data_fix_history where image_no = %s "
+                    "and (%s::text is null or source = %s)", (image_no, source, source))
+        return cur.fetchone()[0]
+
+
+def _flags(pg, image_no, fix_id="loco_number"):
+    with pg.cursor() as cur:
+        cur.execute("select needs_recheck, description_hash, reviewed_by::text, reviewed_at "
+                    "from rat.data_fix_value where image_no = %s and fix_id = %s",
+                    (image_no, fix_id))
+        return cur.fetchone()
+
+
+def _owner_history(pg, image_no, old_values, new_values, old_status, new_status, by,
+                   source="review", at=None, fix_id="loco_number"):
+    """Insert a history row directly as the owner (history written before the
+    migration, or an extractor row); returns its id."""
+    with pg.cursor() as cur:
+        cur.execute("insert into rat.data_fix_history (image_no, fix_id, old_values, new_values, "
+                    "old_status, new_status, changed_by, changed_at, source) "
+                    "values (%s, %s, %s::text[], %s::text[], %s, %s, %s, coalesce(%s, now()), %s) "
+                    "returning id",
+                    (image_no, fix_id, old_values, new_values, old_status, new_status, by, at,
+                     source))
+        hid = cur.fetchone()[0]
+    pg.commit()
+    return hid
+
+
+def test_undo_single_review(pg):
+    seed_fix_value(pg, "v5_one", values=["1"])
+    v, admin = make_volunteer(pg, in_training=False), make_admin(pg)
+    pg.commit()
+    hid = _review(pg, v, "v5_one", ["2"])
+    res = _one(pg, admin, UNDO, ([hid],))
+    assert res == {"undone": 1, "changed_since": [], "skipped": []}
+    assert _live(pg, "v5_one")[:2] == (["1"], "extracted")
+    uid, source, undoes, undoes_from, by, old_status, new_status = _last_hist(pg, "v5_one")
+    assert (source, undoes, undoes_from, by, old_status, new_status) == (
+        "undo", hid, hid, admin, "corrected", "extracted")
+    assert uid > hid
+    with pg.cursor() as cur:   # every setting is closed again
+        cur.execute("select " + ", ".join(
+            f"current_setting('rat.{s}', true)" for s in
+            ("review_context", "review_source", "undoes", "undoes_from", "acting_for")))
+        assert set(cur.fetchone()) <= {"", None}
+
+
+def test_undo_back_to_extracted_clears_reviewer(pg):
+    seed_fix_value(pg, "v5_clr", values=["1"])
+    admin = make_admin(pg)
+    pg.commit()
+    hid = _review(pg, admin, "v5_clr", ["1"], "verified")
+    assert _flags(pg, "v5_clr")[2] == admin
+    _one(pg, admin, UNDO, ([hid],))
+    _, _, reviewed_by, reviewed_at = _flags(pg, "v5_clr")
+    assert (reviewed_by, reviewed_at) == (None, None)
+    assert _live(pg, "v5_clr")[:2] == (["1"], "extracted")
+
+
+def test_undo_restores_recheck_flags(pg):
+    # extracted + needs_recheck: the old flag comes back (the fallback would say false)
+    seed_fix_value(pg, "v5_rf_e", values=["1"], needs_recheck=True, description_hash="h_e")
+    # verified, no recheck: the old flag comes back (the fallback would say true)
+    seed_fix_value(pg, "v5_rf_v", values=["1"], status="verified", description_hash="h_v")
+    v, admin = make_volunteer(pg, in_training=False), make_admin(pg)
+    pg.commit()
+    h_e = _review(pg, v, "v5_rf_e", ["2"])
+    h_v = _review(pg, v, "v5_rf_v", ["3"])
+    assert _flags(pg, "v5_rf_e")[:2] != (True, "h_e")
+    res = _one(pg, admin, UNDO, ([h_e, h_v],))
+    assert res == {"undone": 2, "changed_since": [], "skipped": []}
+    assert _flags(pg, "v5_rf_e")[:2] == (True, "h_e")
+    assert _flags(pg, "v5_rf_v")[:2] == (False, "h_v")
+    assert _live(pg, "v5_rf_v")[:2] == (["1"], "verified")
+
+
+def test_undo_old_history_sets_recheck(pg):
+    seed_fix_value(pg, "v5_old", values=["2"], status="corrected", description_hash="h_now")
+    w, u, admin = make_user(pg), make_user(pg), make_admin(pg)
+    pg.commit()
+    # Written before this migration: no old_* flags.
+    _owner_history(pg, "v5_old", [], ["1"], "extracted", "verified", w,
+                   at="2026-01-01T00:00:00Z")
+    hid = _owner_history(pg, "v5_old", ["1"], ["2"], "verified", "corrected", u)
+    res = _one(pg, admin, UNDO, ([hid],))
+    assert res == {"undone": 1, "changed_since": [], "skipped": []}
+    assert _live(pg, "v5_old")[:2] == (["1"], "verified")
+    needs_recheck, description_hash, reviewed_by, reviewed_at = _flags(pg, "v5_old")
+    assert (needs_recheck, description_hash, reviewed_by) == (True, "h_now", w)
+    assert reviewed_at.isoformat().startswith("2026-01-01T00:00:00")
+
+
+def test_batch_undo_unwinds_run_per_key(pg):
+    seed_fix_value(pg, "v5_run", values=["1"], needs_recheck=True, description_hash="h_r")
+    seed_fix_value(pg, "v5_run2", values=["5"])
+    t, admin = make_volunteer(pg, in_training=False), make_admin(pg)
+    pg.commit()
+    h1 = _review(pg, t, "v5_run", ["2"])
+    h2 = _review(pg, t, "v5_run", ["3"])
+    h3 = _review(pg, t, "v5_run2", ["6"])
+    n_undo = _n_hist(pg, "v5_run", "undo")
+    res = _one(pg, admin, UNDO, ([h2, h3, h1, h1],))
+    assert res == {"undone": 2, "changed_since": [], "skipped": []}
+    assert _live(pg, "v5_run")[:2] == (["1"], "extracted")
+    assert _flags(pg, "v5_run")[:3] == (True, "h_r", None)
+    assert _live(pg, "v5_run2")[:2] == (["5"], "extracted")
+    assert _n_hist(pg, "v5_run", "undo") == n_undo + 1
+    assert _last_hist(pg, "v5_run")[1:4] == ("undo", h2, h1)
+    assert _last_hist(pg, "v5_run2")[1:4] == ("undo", h3, h3)
+
+
+def test_undo_partial_set_is_changed_since(pg):
+    seed_fix_value(pg, "v5_part", values=["1"])
+    v, admin = make_volunteer(pg, in_training=False), make_admin(pg)
+    pg.commit()
+    h1 = _review(pg, v, "v5_part", ["2"])
+    _review(pg, v, "v5_part", ["3"])
+    n = _n_hist(pg, "v5_part")
+    res = _one(pg, admin, UNDO, ([h1],))
+    assert res == {"undone": 0, "changed_since": [h1], "skipped": []}
+    assert _live(pg, "v5_part")[:2] == (["3"], "corrected")
+    assert _n_hist(pg, "v5_part") == n
+
+
+def test_undo_blocked_by_later_extractor_row(pg):
+    seed_fix_value(pg, "v5_ext", values=["1"])
+    v, admin = make_volunteer(pg, in_training=False), make_admin(pg)
+    pg.commit()
+    with pg.cursor() as cur:
+        cur.execute("select id from rat.data_fix_history where image_no = 'v5_ext' "
+                    "and source = 'extractor'")
+        h_insert = cur.fetchone()[0]
+    hid = _review(pg, v, "v5_ext", ["2"])
+    h_x = _owner_history(pg, "v5_ext", ["2"], ["2"], "corrected", "corrected", None,
+                         source="extractor")
+    res = _one(pg, admin, UNDO, ([hid],))
+    assert res == {"undone": 0, "changed_since": [hid], "skipped": []}
+    res = _one(pg, admin, UNDO, ([h_x, hid, h_insert, 999999999],))
+    assert res["undone"] == 0 and res["changed_since"] == [hid]
+    assert sorted(res["skipped"], key=lambda s: s["id"]) == [
+        {"id": h_insert, "reason": "not a human change"},
+        {"id": h_x, "reason": "not a human change"},
+        {"id": 999999999, "reason": "no such change"},
+    ]
+    assert _live(pg, "v5_ext")[:2] == (["2"], "corrected")
+
+
+def test_undo_value_mismatch_and_missing_row(pg):
+    seed_fix_value(pg, "v5_mm", values=["2"], status="corrected")
+    seed_fix_value(pg, "v5_gone", values=["1"])
+    v, admin = make_volunteer(pg, in_training=False), make_admin(pg)
+    pg.commit()
+    # History says the value became 9, but it is 2 now: belt-and-braces check.
+    h_mm = _owner_history(pg, "v5_mm", ["1"], ["9"], "verified", "corrected", v)
+    h_gone = _review(pg, v, "v5_gone", ["2"])
+    with pg.cursor() as cur:
+        cur.execute("delete from rat.data_fix_value where image_no = 'v5_gone'")
+    pg.commit()
+    res = _one(pg, admin, UNDO, ([h_gone, h_mm],))
+    assert res == {"undone": 0, "changed_since": [h_mm],
+                   "skipped": [{"id": h_gone, "reason": "no data_fix_value"}]}
+    assert _live(pg, "v5_mm")[:2] == (["2"], "corrected")
+
+
+def test_undo_of_undo_reapplies(pg):
+    seed_fix_value(pg, "v5_uu", values=["1"])
+    v, admin = make_volunteer(pg, in_training=False), make_admin(pg)
+    pg.commit()
+    h1 = _review(pg, v, "v5_uu", ["2"])
+    _one(pg, admin, UNDO, ([h1],))
+    h2 = _last_hist(pg, "v5_uu")[0]
+    res = _one(pg, admin, UNDO, ([h2],))
+    assert res == {"undone": 1, "changed_since": [], "skipped": []}
+    assert _live(pg, "v5_uu")[:3] == (["2"], "corrected", v)
+    assert _flags(pg, "v5_uu")[0] is False
+    h3, source, undoes, undoes_from = _last_hist(pg, "v5_uu")[:4]
+    assert (source, undoes, undoes_from) == ("undo", h2, h2)
+    # The first review is now followed by two undos: undoing it alone is blocked.
+    res = _one(pg, admin, UNDO, ([h1],))
+    assert res == {"undone": 0, "changed_since": [h1], "skipped": []}
+
+
+def _filled_answer(pg, uid, task, img, run=None):
+    rows, err = _as(pg, uid, "select rat.save_model_answer(%s, %s, 'station', null, null, 'sample')",
+                    (task, img))
+    assert err is None, err
+    res = rows[0][0]
+    assert res["filled"] == LINKS["fix_ids"]
+    return res["answer_id"]
+
+
+def test_withdraw_answer_undoes_fill(pg):
+    task, img = seed_task(pg, "t5_wd", links=LINKS), "v5_wd"
+    _linked_photo(pg, img)
+    run = seed_run(pg, task, predictions={img: ("station", 0.95)})
+    v, admin = make_volunteer(pg, in_training=False), make_admin(pg)
+    pg.commit()
+    aid = _filled_answer(pg, v, task, img)
+    prog = "select n_blind from rat.model_check_progress() where run_id = %s"
+    assert _call(pg, admin, prog, (run,)) == [(1,)]
+    with pg.cursor() as cur:
+        cur.execute("select id from rat.data_fix_history where model_answer_id = %s order by id",
+                    (aid,))
+        fills = [r[0] for r in cur.fetchall()]
+    res = _one(pg, admin, WITHDRAW, ([aid], "misread the photo"))
+    assert res == {"withdrawn": 1, "skipped": [], "fills_left": []}
+    for fix_id in LINKS["fix_ids"]:
+        assert _live(pg, img, fix_id)[:3] == ([], "extracted", None)
+        assert _last_hist(pg, img, fix_id)[1] == "undo"
+        assert _last_hist(pg, img, fix_id)[2] in fills
+    with pg.cursor() as cur:
+        cur.execute("select withdrawn_by::text, note from rat.model_answer_withdrawal "
+                    "where answer_id = %s", (aid,))
+        assert cur.fetchone() == (admin, "misread the photo")
+        cur.execute("select count(*) from rat.model_answer where id = %s", (aid,))
+        assert cur.fetchone()[0] == 1   # the answer itself is never touched
+    assert _call(pg, admin, prog, (run,)) == [(0,)]
+
+
+def test_withdraw_legacy_fill_by_match(pg):
+    """An answer saved before this migration: its fill has no model_answer_id
+    and is found by image_no / model_check / changed_by / changed_at."""
+    task, img = seed_task(pg, "t5_leg", links=LINKS), "v5_leg"
+    _linked_photo(pg, img)
+    u, admin = make_user(pg), make_admin(pg)
+    pg.commit()
+    with pg.cursor() as cur:
+        cur.execute("insert into rat.model_answer (task_id, image_no, answer, mode, answered_by) "
+                    "values (%s, %s, 'station', 'sample', %s) returning id", (task, img, u))
+        aid = cur.fetchone()[0]
+        for k, val in (("review_context", "on"), ("review_source", "model_check"),
+                       ("acting_for", u)):
+            cur.execute("select set_config(%s, %s, true)", (f"rat.{k}", val))
+        cur.execute("""update rat.data_fix_value set "values" = '{}', status = 'no_loco' """
+                    "where image_no = %s", (img,))
+    pg.commit()
+    res = _one(pg, admin, WITHDRAW, ([aid], None))
+    assert res == {"withdrawn": 1, "skipped": [], "fills_left": []}
+    for fix_id in LINKS["fix_ids"]:
+        assert _live(pg, img, fix_id)[:2] == ([], "extracted")
+
+
+def test_withdraw_fill_changed_since_left(pg):
+    task, img = seed_task(pg, "t5_wl", links=LINKS), "v5_wl"
+    _linked_photo(pg, img)
+    v, admin = make_volunteer(pg, in_training=False), make_admin(pg)
+    pg.commit()
+    aid = _filled_answer(pg, v, task, img)
+    _review(pg, v, img, ["7"], "corrected", fix_id="loco_number")
+    res = _one(pg, admin, WITHDRAW, ([aid], None))
+    assert res == {"withdrawn": 1, "skipped": [],
+                   "fills_left": [{"image_no": img, "fix_id": "loco_number"}]}
+    assert _live(pg, img, "loco_number")[:2] == (["7"], "corrected")
+    assert _live(pg, img, "loco_name")[:2] == ([], "extracted")
+    with pg.cursor() as cur:
+        cur.execute("select count(*) from rat.model_answer_withdrawal where answer_id = %s", (aid,))
+        assert cur.fetchone()[0] == 1
+
+
+def test_withdraw_twice_skips(pg):
+    task, img = seed_task(pg, "t5_w2", links=LINKS), "v5_w2"
+    _linked_photo(pg, img)
+    admin = make_admin(pg)
+    pg.commit()
+    aid = _filled_answer(pg, admin, task, img)
+    assert _one(pg, admin, WITHDRAW, ([aid], None))["withdrawn"] == 1
+    n = _n_hist(pg, img)
+    res = _one(pg, admin, WITHDRAW, ([aid, 999999999], "again"))
+    assert res == {"withdrawn": 0, "fills_left": [],
+                   "skipped": [{"id": aid, "reason": "already withdrawn"},
+                               {"id": 999999999, "reason": "no such answer"}]}
+    assert _n_hist(pg, img) == n
+    with pg.cursor() as cur:
+        cur.execute("select note from rat.model_answer_withdrawal where answer_id = %s", (aid,))
+        assert cur.fetchone() == (None,)
+
+
+def test_undo_withdraw_admin_only(pg):
+    seed_fix_value(pg, "v5_ao", values=["1"])
+    users = {who: _make(pg, who) for who in ("volunteer", "trainee", "removed", "stranger")}
+    pg.commit()
+    hid = _review(pg, users["volunteer"], "v5_ao", ["2"])
+    for who, uid in users.items():
+        for sql, args in ((UNDO, ([hid],)), (WITHDRAW, ([1], None))):
+            _, err = _as(pg, uid, sql, args)
+            assert err is not None and err.pgcode == "42501", (who, sql)
+    assert _live(pg, "v5_ao")[:2] == (["2"], "corrected")
+    with pg.cursor() as cur:
+        for fn in ("rat.undo_fix_change(bigint[])", "rat.withdraw_model_answers(bigint[], text)"):
+            cur.execute("select has_function_privilege('anon', %s, 'EXECUTE'), "
+                        "has_function_privilege('authenticated', %s, 'EXECUTE'), "
+                        "p.prosecdef, p.proconfig "
+                        "from pg_proc p where p.oid = %s::regprocedure", (fn, fn, fn))
+            assert cur.fetchone() == (False, True, True, ['search_path=""']), fn
+        fn = "rat._undo_fix_keys(bigint[])"
+        cur.execute("select has_function_privilege('anon', %s, 'EXECUTE'), "
+                    "has_function_privilege('authenticated', %s, 'EXECUTE'), "
+                    "has_function_privilege('public', %s, 'EXECUTE'), "
+                    "has_function_privilege('picaloco_agent', %s, 'EXECUTE')", (fn, fn, fn, fn))
+        assert cur.fetchone() == (False, False, False, False)
+
+
+def test_preservation_checksum_untouched_by_migration(pg):
+    from data_fix_preservation_check import CHECKSUM_SQL
+    seed_fix_value(pg, "v5_pc", values=["4"], status="verified")
+    pg.commit()
+    with pg.cursor() as cur:
+        cur.execute(CHECKSUM_SQL)
+        before = cur.fetchone()
+    pg.commit()
+    assert before[0] >= 1
+    apply_sql_file(VOLUNTEER_SQL)
+    with pg.cursor() as cur:
+        cur.execute(CHECKSUM_SQL)
+        assert cur.fetchone() == before
