@@ -201,6 +201,11 @@ def run(args, fetch_answers: Callable, fetch_descriptions: Callable) -> int:
     return 0
 
 
+# Withdrawn answers (rat.model_answer_withdrawal) never train the model.
+ANSWERS_SQL = ("select image_no, answer, mode, answered_at, id "
+               "from rat.model_answer_live where task_id = %s")
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--task", required=True)
@@ -223,8 +228,7 @@ def main(argv=None) -> int:
         task_id = json.loads(Path(args.task).read_text(encoding="utf-8")).get("task")
         cur = conn.cursor()
         try:
-            cur.execute("select image_no, answer, mode, answered_at, id "
-                        "from rat.model_answer where task_id = %s", (task_id,))
+            cur.execute(ANSWERS_SQL, (task_id,))
             answer_rows = cur.fetchall()
             cur.execute("select image_no, description from rat.catalog")
             descriptions = {no: d for no, d in cur.fetchall()}

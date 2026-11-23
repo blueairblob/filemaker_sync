@@ -278,3 +278,22 @@ def test_outputs_independent_of_answer_row_order(tmp_path):
         outs.append(Path(args.out_dir))
     for f in ["v1-photo.csv", "v1-photo-desc.csv", "v1-report.md"]:
         assert (outs[0] / f).read_text() == (outs[1] / f).read_text(), f
+
+
+def test_answers_sql_skips_withdrawn(pg):
+    from tests.conftest import seed_catalog, seed_task
+    seed_catalog(pg, "mtw_1", "d")
+    seed_catalog(pg, "mtw_2", "d")
+    seed_task(pg, "mtw_task")
+    pg.commit()
+    with pg.cursor() as cur:
+        ids = []
+        for no in ("mtw_1", "mtw_2"):
+            cur.execute("insert into rat.model_answer (task_id, image_no, answer, mode)"
+                        " values ('mtw_task', %s, 'tram', 'sample') returning id", (no,))
+            ids.append(cur.fetchone()[0])
+        cur.execute("insert into rat.model_answer_withdrawal (answer_id, withdrawn_by)"
+                    " values (%s, gen_random_uuid())", (ids[0],))
+        cur.execute(model_train.ANSWERS_SQL, ("mtw_task",))
+        rows = cur.fetchall()
+    assert [r[0] for r in rows] == ["mtw_2"]

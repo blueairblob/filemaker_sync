@@ -1,3 +1,7 @@
+-- WARNING: Re-running this file after add_volunteer_tables.sql reverts that file's changes to the
+-- functions/policies/checks it shares (e.g. volunteers lose access, the 'undo' history source breaks).
+-- Re-apply add_volunteer_tables.sql afterwards.
+--
 -- fix_model_check_photo.sql (2026-11-17)
 --
 -- Adds rat.model_check_photo: one photo with its latest model-check answer,

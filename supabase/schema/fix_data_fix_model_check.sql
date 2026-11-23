@@ -1,3 +1,7 @@
+-- WARNING: Re-running this file after add_volunteer_tables.sql reverts that file's changes to the
+-- functions/policies/checks it shares (e.g. volunteers lose access, the 'undo' history source breaks).
+-- Re-apply add_volunteer_tables.sql afterwards.
+--
 -- fix_data_fix_model_check.sql (2026-11-16)
 --
 -- Data Fixes history may now be tagged 'model_check' (a model-check answer

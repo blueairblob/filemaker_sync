@@ -1,3 +1,7 @@
+-- WARNING: Re-running this file after add_volunteer_tables.sql reverts that file's changes to the
+-- functions/policies/checks it shares (e.g. volunteers lose access, the 'undo' history source breaks).
+-- Re-apply add_volunteer_tables.sql afterwards.
+--
 -- fix_review_stale_errcode.sql (2026-11-15)
 --
 -- rat.review_fix_value raised SQLSTATE 40001 on a stale save. PostgREST

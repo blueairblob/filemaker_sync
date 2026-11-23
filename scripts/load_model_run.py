@@ -81,7 +81,7 @@ def _refusals(cur, row: dict, version: str) -> list[str]:
     errors: list[str] = []
     stored = cur.fetchone()
     if stored:
-        cur.execute("select exists (select 1 from rat.model_answer where task_id = %s)", (row["id"],))
+        cur.execute("select exists (select 1 from rat.model_answer_live where task_id = %s)", (row["id"],))
         if cur.fetchone()[0]:
             errors += answer_list_errors(stored[0], row["answers"])
     cur.execute("select 1 from rat.model_run where task_id = %s and version = %s",

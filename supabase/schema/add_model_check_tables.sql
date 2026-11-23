@@ -1,3 +1,7 @@
+-- WARNING: Re-running this file after add_volunteer_tables.sql reverts that file's changes to the
+-- functions/policies/checks it shares (e.g. volunteers lose access, the 'undo' history source breaks).
+-- Re-apply add_volunteer_tables.sql afterwards.
+--
 -- add_model_check_tables.sql
 --
 -- "Model check": volunteers check an offline AI model's per-photo answers in

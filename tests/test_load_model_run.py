@@ -174,6 +174,26 @@ def test_apply_refuses_incompatible_answers(pg, tmp_path, capsys):
     assert counts(pg, tid) == (1, 1, 1)
 
 
+def test_has_answers_ignores_withdrawn(pg, tmp_path):
+    """A task whose only answers are withdrawn counts as having none, so a
+    changed answer list is accepted."""
+    tid = "lmr_withdrawn"
+    seed_catalog(pg, "lmrw_1", "d")
+    pg.commit()
+    scores = write_scores(tmp_path, [("lmrw_1", "tram", 0.9, [0.9, 0.1])])
+    assert lmr.run(pg, make_args(write_task(tmp_path, make_task(tid)), scores)) == 0
+    with pg.cursor() as cur:
+        cur.execute("insert into rat.model_answer (task_id, image_no, answer, mode)"
+                    " values (%s, 'lmrw_1', 'tram', 'sample') returning id", (tid,))
+        aid = cur.fetchone()[0]
+        cur.execute("insert into rat.model_answer_withdrawal (answer_id, withdrawn_by)"
+                    " values (%s, gen_random_uuid())", (aid,))
+    pg.commit()
+    reduced = make_task(tid, ids=("tram",))
+    scores2 = write_scores(tmp_path, [("lmrw_1", "tram", 0.9, [0.9])], ids=("tram",))
+    assert lmr.run(pg, make_args(write_task(tmp_path, reduced), scores2, version="v2")) == 0
+
+
 def test_apply_never_touches_data_fix(pg, tmp_path):
     seed_catalog(pg, "lmrf_1", "d")
     pg.commit()
