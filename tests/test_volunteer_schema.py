@@ -3,13 +3,16 @@
 Run against the throwaway Docker postgres only (Golden Rule #4). The fixture DB
 is shared, so each test makes its own users and never asserts table-wide counts.
 """
+import json
 import uuid
 
 import psycopg2
+import psycopg2.errors
 import pytest
 
 from tests.conftest import (
-    BOOTSTRAP_SQL, VOLUNTEER_SQL, as_user, make_admin, make_user, make_volunteer,
+    BOOTSTRAP_SQL, VOLUNTEER_SQL, apply_sql_file, as_user, make_admin,
+    make_user, make_volunteer, seed_catalog, seed_fix_value, seed_run, seed_task,
 )
 
 
@@ -193,3 +196,334 @@ def test_bootstrap_carries_volunteer_copy():
     boot = BOOTSTRAP_SQL.read_text(encoding="utf-8")
     block = boot.split("-- >>> add_volunteer_tables.sql\n")[1].split("-- <<< add_volunteer_tables.sql")[0]
     assert block == VOLUNTEER_SQL.read_text(encoding="utf-8")
+
+
+# --------------------------------------------------------------------------
+# Task 2: one write path, history columns, access for direct saves and reads
+# --------------------------------------------------------------------------
+#
+# The shared DB is re-applied by other modules (test_data_fix_schema.py and
+# test_model_check_schema.py re-run add_data_fix_tables.sql and the fix_*.sql
+# patches, which restore the admin-only functions and policies). Re-apply the
+# volunteer migration once before these tests, as live will run it last.
+
+@pytest.fixture(scope="module")
+def vol_sql(pg):
+    pg.rollback()
+    apply_sql_file(VOLUNTEER_SQL)
+    apply_sql_file(VOLUNTEER_SQL)  # idempotent
+
+
+LINKS = {"no_answer_flag": "loco", "fix_ids": ["loco_number", "loco_name"]}
+
+
+def _make(pg, who):
+    return {
+        "admin": lambda: make_admin(pg),
+        "volunteer": lambda: make_volunteer(pg, in_training=False),
+        "trainee": lambda: make_volunteer(pg),
+        "removed": lambda: make_volunteer(pg, removed=True),
+        "stranger": lambda: make_user(pg),
+    }[who]()
+
+
+def _as(pg, uid, sql, args=()):
+    """Run sql as uid; return (rows, None) or (None, error). Always rolls back
+    on error; commits on success."""
+    as_user(pg, uid)
+    try:
+        with pg.cursor() as cur:
+            cur.execute(sql, args)
+            rows = cur.fetchall()
+    except psycopg2.Error as exc:
+        pg.rollback()
+        return None, exc
+    pg.commit()
+    return rows, None
+
+
+def _fix(pg, image_no, fix_id="loco_number"):
+    with pg.cursor() as cur:
+        cur.execute('select "values", status, reviewed_by::text from rat.data_fix_value '
+                    "where image_no = %s and fix_id = %s", (image_no, fix_id))
+        return cur.fetchone()
+
+
+@pytest.mark.usefixtures("vol_sql")
+@pytest.mark.parametrize("who,ok", [("admin", True), ("volunteer", True), ("trainee", False),
+                                    ("removed", False), ("stranger", False)])
+def test_direct_save_access(pg, who, ok):
+    uid = _make(pg, who)
+    p = f"v2d_{who}_"
+    ts_review = seed_fix_value(pg, f"{p}r", values=["1"])
+    ts_confirm = seed_fix_value(pg, f"{p}c", values=["7"], suggested_values=["8"])
+    task = seed_task(pg, f"t_v2d_{who}")
+    seed_catalog(pg, f"{p}a", "a scene")
+    pg.commit()
+
+    calls = {
+        "review_fix_value": ("select rat.review_fix_value(%s, 'loco_number', %s, 'corrected', %s)",
+                             (f"{p}r", ["2"], ts_review)),
+        "confirm_fix_values": ("select rat.confirm_fix_values('loco_number', %s::jsonb)",
+                               (json.dumps([{"image_no": f"{p}c",
+                                             "updated_at": ts_confirm.isoformat()}]),)),
+        "save_model_answer": ("select rat.save_model_answer(%s, %s, 'loco', null, null, 'sample')",
+                              (task, f"{p}a")),
+    }
+    for rpc, (sql, args) in calls.items():
+        rows, err = _as(pg, uid, sql, args)
+        if ok:
+            assert err is None, (rpc, err)
+        else:
+            assert err is not None and err.pgcode == "42501", rpc
+            if who == "trainee":
+                assert "held for approval" in str(err), rpc
+
+    if ok:
+        assert _fix(pg, f"{p}r") == (["2"], "corrected", uid)
+        assert _fix(pg, f"{p}c") == (["8"], "verified", uid)
+        with pg.cursor() as cur:
+            cur.execute("select answered_by::text, approved_by from rat.model_answer "
+                        "where task_id = %s", (task,))
+            assert cur.fetchall() == [(uid, None)]
+    else:
+        assert _fix(pg, f"{p}r")[:2] == (["1"], "extracted")
+        assert _fix(pg, f"{p}c")[:2] == (["7"], "extracted")
+        with pg.cursor() as cur:
+            cur.execute("select count(*) from rat.model_answer where task_id = %s", (task,))
+            assert cur.fetchone()[0] == 0
+
+
+READ_RPCS = {
+    "data_fix_queue": "select * from rat.data_fix_queue('loco_number', p_limit => 1)",
+    "data_fix_progress": "select * from rat.data_fix_progress()",
+    "model_check_queue": "select * from rat.model_check_queue('t_v2_reads', 'sample', null, p_limit => 1)",
+    "model_check_progress": "select * from rat.model_check_progress()",
+}
+
+
+@pytest.mark.usefixtures("vol_sql")
+@pytest.mark.parametrize("rpc", list(READ_RPCS))
+def test_reads_open_to_volunteers(pg, rpc):
+    seed_task(pg, "t_v2_reads")
+    users = {who: _make(pg, who) for who in ("volunteer", "trainee", "removed", "stranger")}
+    pg.commit()
+    for who, uid in users.items():
+        _, err = _as(pg, uid, READ_RPCS[rpc])
+        if who in ("volunteer", "trainee"):
+            assert err is None, (who, err)
+        else:
+            assert err is not None and err.pgcode == "42501", who
+
+
+@pytest.mark.usefixtures("vol_sql")
+def test_admin_only_reads_stay(pg):
+    v, t = make_volunteer(pg, in_training=False), make_volunteer(pg)
+    pg.commit()
+    for sql in ("select * from rat.model_check_photo('t', 'i')",
+                "select * from rat.model_check_confusion(1)",
+                "select * from rat.model_check_conflicts('t')",
+                "select * from rat.data_fix_orphans()"):
+        for uid in (v, t):
+            _, err = _as(pg, uid, sql)
+            assert err is not None and err.pgcode == "42501", sql
+
+
+@pytest.mark.usefixtures("vol_sql")
+def test_volunteer_rls_tables(pg):
+    seed_fix_value(pg, "v2_rls_1", values=["1"])
+    task = seed_task(pg, "t_v2_rls")
+    run_id = seed_run(pg, task)
+    with pg.cursor() as cur:
+        cur.execute("insert into rat.model_answer (task_id, image_no, answer, mode) "
+                    "values (%s, 'v2_rls_1', 'loco', 'sample')", (task,))
+    v, t, gone = make_volunteer(pg, in_training=False), make_volunteer(pg), make_volunteer(pg, removed=True)
+    pg.commit()
+    counts = {
+        "select count(*) from rat.data_fix where id = 'loco_number'": 1,
+        "select count(*) from rat.data_fix_value where image_no = 'v2_rls_1'": 1,
+        f"select count(*) from rat.model_task where id = '{task}'": 1,
+        f"select count(*) from rat.model_run where id = {run_id}": 1,
+        "select count(*) from rat.data_fix_history where image_no = 'v2_rls_1'": 0,
+    }
+    for uid, sees in ((v, True), (t, True), (gone, False)):
+        for sql, n in counts.items():
+            rows, err = _as(pg, uid, sql)
+            assert err is None, sql
+            assert rows[0][0] == (n if sees else 0), (uid, sql)
+        _, err = _as(pg, uid, "select * from rat.model_answer limit 1")
+        assert isinstance(err, psycopg2.errors.InsufficientPrivilege)
+
+
+@pytest.mark.usefixtures("vol_sql")
+def test_history_records_old_flags(pg):
+    ts = seed_fix_value(pg, "v2_old_1", values=["1"], needs_recheck=True,
+                        description_hash="h_before")
+    v = make_volunteer(pg, in_training=False)
+    pg.commit()
+    _, err = _as(pg, v, "select rat.review_fix_value('v2_old_1', 'loco_number', %s, 'corrected', %s)",
+                 (["2"], ts))
+    assert err is None, err
+    with pg.cursor() as cur:
+        cur.execute("select old_needs_recheck, old_description_hash, changed_by::text, approved_by, "
+                    "source, model_answer_id, undoes, undoes_from "
+                    "from rat.data_fix_history where image_no = 'v2_old_1' order by id")
+        rows = cur.fetchall()
+    # The extractor's insert has no old row; the review records the old flags.
+    assert rows[0][:2] == (None, None)
+    assert rows[-1] == (True, "h_before", v, None, "review", None, None, None)
+
+
+@pytest.mark.usefixtures("vol_sql")
+def test_fill_history_links_answer(pg):
+    task, img = seed_task(pg, "t_v2_fill", links=LINKS), "v2_fill_1"
+    seed_catalog(pg, img, "A station scene")
+    for fix_id in LINKS["fix_ids"]:
+        seed_fix_value(pg, img, fix_id, confidence="none")
+    v = make_volunteer(pg, in_training=False)
+    pg.commit()
+    rows, err = _as(pg, v, "select rat.save_model_answer(%s, %s, 'station', null, null, 'sample')",
+                    (task, img))
+    assert err is None, err
+    res = rows[0][0]
+    assert res["filled"] == ["loco_number", "loco_name"]
+    with pg.cursor() as cur:
+        cur.execute("select fix_id, source, changed_by::text, model_answer_id, approved_by "
+                    "from rat.data_fix_history where image_no = %s and old_status is not null "
+                    "order by fix_id", (img,))
+        assert cur.fetchall() == [("loco_name", "model_check", v, res["answer_id"], None),
+                                  ("loco_number", "model_check", v, res["answer_id"], None)]
+
+
+@pytest.mark.usefixtures("vol_sql")
+def test_guard_still_blocks_reviewed_overwrite(pg):
+    seed_fix_value(pg, "v2_guard_1", values=["5"], status="verified")
+    pg.commit()
+    with pytest.raises(psycopg2.Error) as exc:
+        with pg.cursor() as cur:
+            cur.execute("""update rat.data_fix_value set "values" = '{6}' """
+                        "where image_no = 'v2_guard_1' and fix_id = 'loco_number'")
+    assert "reviewed value is protected" in str(exc.value)
+    pg.rollback()
+    # The migration leaves the guard itself alone.
+    assert "rat.data_fix_value_guard()" not in VOLUNTEER_SQL.read_text(encoding="utf-8")
+
+
+@pytest.mark.usefixtures("vol_sql")
+def test_apply_records_author_and_approver(pg):
+    """The internal write path, as an approval will call it: the author is
+    p_by, the approver is recorded, and every setting is closed again."""
+    trainee, admin = make_volunteer(pg), make_admin(pg)
+    ts = seed_fix_value(pg, "v2_apply_1", values=["1"])
+    task, img = seed_task(pg, "t_v2_apply", links=LINKS), "v2_apply_2"
+    seed_catalog(pg, img, "A scene")
+    for fix_id in LINKS["fix_ids"]:
+        seed_fix_value(pg, img, fix_id, confidence="none")
+    pg.commit()
+    # Not callable by a signed-in user, not even an admin.
+    for sql in ("select rat._apply_fix_review('v2_apply_1', 'loco_number', '{9}', 'corrected', "
+                "now(), null, null)",
+                "select rat._apply_model_answer('t', 'i', 'a', null, null, 'sample', null, null, null)"):
+        _, err = _as(pg, admin, sql)
+        assert isinstance(err, psycopg2.errors.InsufficientPrivilege), sql
+    # As the owner, the way the approve RPCs (SECURITY DEFINER) will run them.
+    with pg.cursor() as cur:
+        cur.execute("select (rat._apply_fix_review('v2_apply_1', 'loco_number', %s, 'corrected', "
+                    "%s, %s, %s)).reviewed_by::text", (["9"], ts, trainee, admin))
+        assert cur.fetchone()[0] == trainee
+        cur.execute("select rat._apply_model_answer(%s, %s, 'station', null, null, 'sample', "
+                    "%s, %s, '2026-01-02T03:04:05Z')", (task, img, trainee, admin))
+        res = cur.fetchone()[0]
+        assert res["filled"] == ["loco_number", "loco_name"]
+        cur.execute("select " + ", ".join(
+            f"current_setting('rat.{s}', true)" for s in
+            ("review_context", "review_source", "acting_for", "approved_by", "model_answer_id")))
+        assert set(cur.fetchone()) <= {"", None}
+    pg.commit()
+    with pg.cursor() as cur:
+        cur.execute("select changed_by::text, approved_by::text, source from rat.data_fix_history "
+                    "where image_no = 'v2_apply_1' and old_status is not null")
+        assert cur.fetchall() == [(trainee, admin, "review")]
+        cur.execute("select answered_by::text, answered_at = '2026-01-02T03:04:05Z'::timestamptz, "
+                    "approved_by::text, approved_at is not null from rat.model_answer "
+                    "where id = %s", (res["answer_id"],))
+        assert cur.fetchone() == (trainee, True, admin, True)
+        cur.execute("select changed_by::text, approved_by::text, model_answer_id "
+                    "from rat.data_fix_history where image_no = %s and old_status is not null",
+                    (img,))
+        assert set(cur.fetchall()) == {(trainee, admin, res["answer_id"])}
+
+
+@pytest.mark.usefixtures("vol_sql")
+def test_internal_and_admin_privileges(pg):
+    with pg.cursor() as cur:
+        for fn in ("rat._apply_fix_review(text, text, text[], text, timestamptz, uuid, uuid)",
+                   "rat._apply_model_answer(text, text, text, bigint, text, text, uuid, uuid, timestamptz)"):
+            cur.execute("select has_function_privilege('anon', %s, 'EXECUTE'), "
+                        "has_function_privilege('authenticated', %s, 'EXECUTE'), "
+                        "has_function_privilege('public', %s, 'EXECUTE'), "
+                        "p.prosecdef, p.proconfig "
+                        "from pg_proc p where p.oid = %s::regprocedure", (fn, fn, fn, fn))
+            assert cur.fetchone() == (False, False, False, True, ['search_path=""']), fn
+        cur.execute("select has_function_privilege('anon', 'rat.add_volunteer(uuid)', 'EXECUTE'), "
+                    "has_table_privilege('authenticated', 'rat.volunteer', 'SELECT'), "
+                    "has_table_privilege('anon', 'rat.volunteer', 'SELECT')")
+        assert cur.fetchone() == (False, False, False)
+        # The redefined RPCs keep their grants and definer rights.
+        for fn in ("rat.review_fix_value(text, text, text[], text, timestamptz)",
+                   "rat.confirm_fix_values(text, jsonb)",
+                   "rat.save_model_answer(text, text, text, bigint, text, text)",
+                   "rat.data_fix_queue(text, text[], text[], boolean, text, text, text, integer)",
+                   "rat.data_fix_progress()",
+                   "rat.model_check_queue(text, text, bigint, text, text, text, integer)",
+                   "rat.model_check_progress()"):
+            cur.execute("select has_function_privilege('anon', %s, 'EXECUTE'), "
+                        "has_function_privilege('authenticated', %s, 'EXECUTE'), "
+                        "p.prosecdef, p.proconfig "
+                        "from pg_proc p where p.oid = %s::regprocedure", (fn, fn, fn))
+            assert cur.fetchone() == (False, True, True, ['search_path=""']), fn
+
+
+@pytest.mark.usefixtures("vol_sql")
+def test_history_source_check_and_undo_tag(pg):
+    with pg.cursor() as cur:
+        cur.execute("select conname, pg_get_constraintdef(oid) from pg_constraint "
+                    "where conrelid = 'rat.data_fix_history'::regclass and contype = 'c' "
+                    "and pg_get_constraintdef(oid) ilike '%source%'")
+        ((name, definition),) = cur.fetchall()
+        assert name == "data_fix_history_source_check"
+        for src in ("extractor", "review", "model_check", "undo"):
+            assert f"'{src}'" in definition
+    seed_fix_value(pg, "v2_undo_1", values=["1"], status="verified")
+    with pg.cursor() as cur:
+        for k, v in (("review_context", "on"), ("review_source", "undo"),
+                     ("undoes", "41"), ("undoes_from", "40")):
+            cur.execute("select set_config(%s, %s, true)", (f"rat.{k}", v))
+        cur.execute("""update rat.data_fix_value set "values" = '{}', status = 'extracted' """
+                    "where image_no = 'v2_undo_1' and fix_id = 'loco_number'")
+        cur.execute("select source, undoes, undoes_from, old_status, old_needs_recheck "
+                    "from rat.data_fix_history where image_no = 'v2_undo_1' "
+                    "order by id desc limit 1")
+        assert cur.fetchone() == ("undo", 41, 40, "verified", False)
+    pg.rollback()
+
+
+@pytest.mark.usefixtures("vol_sql")
+def test_new_columns_nullable(pg):
+    expect = {
+        ("data_fix_history", "approved_by"): "uuid",
+        ("data_fix_history", "undoes"): "bigint",
+        ("data_fix_history", "undoes_from"): "bigint",
+        ("data_fix_history", "model_answer_id"): "bigint",
+        ("data_fix_history", "old_needs_recheck"): "boolean",
+        ("data_fix_history", "old_description_hash"): "text",
+        ("model_answer", "approved_by"): "uuid",
+        ("model_answer", "approved_at"): "timestamp with time zone",
+    }
+    with pg.cursor() as cur:
+        for (table, col), typ in expect.items():
+            cur.execute("select data_type, is_nullable, column_default "
+                        "from information_schema.columns "
+                        "where table_schema = 'rat' and table_name = %s and column_name = %s",
+                        (table, col))
+            assert cur.fetchone() == (typ, "YES", None), (table, col)
