@@ -40,12 +40,24 @@ def test_answers_append_only(pg):
                 cur.execute(stmt, (aid,))
             assert "append-only" in str(ei.value)
             cur.execute("rollback to savepoint s")
+        # Plain truncate: Postgres refuses on the withdrawal FK before any trigger runs.
+        cur.execute("savepoint s")
         with pytest.raises(psycopg2.Error) as ei:
             cur.execute("truncate rat.model_answer")
-        # Once model_answer_withdrawal references it, Postgres refuses the truncate
-        # on the foreign key before the trigger runs; either way it is blocked.
-        assert ("append-only" in str(ei.value)
-                or "referenced in a foreign key" in str(ei.value))
+        assert "referenced in a foreign key" in str(ei.value)
+        cur.execute("rollback to savepoint s")
+
+
+def test_truncate_cascade_hits_append_only_trigger(pg):
+    # CASCADE gets past the FK check, so the trigger is what must stop it.
+    with pg.cursor() as cur:
+        for stmt in ("truncate rat.model_answer cascade",
+                     "truncate rat.model_answer_withdrawal"):
+            cur.execute("savepoint s")
+            with pytest.raises(psycopg2.Error) as ei:
+                cur.execute(stmt)
+            assert "append-only" in str(ei.value), stmt
+            cur.execute("rollback to savepoint s")
 
 
 def test_sample_answer_must_be_blind(pg):
