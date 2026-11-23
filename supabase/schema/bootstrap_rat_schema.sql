@@ -3326,6 +3326,20 @@ BEGIN
                  reviewed_by = v_prev.changed_by,
                  reviewed_at = v_prev.changed_at
            WHERE v.image_no = k.image_no AND v.fix_id = k.fix_id;
+          -- A run that ends where it started (A -> B -> A, or a change given
+          -- with its own undo) leaves values/status as they are, so the
+          -- trigger writes nothing. Record the undo row here instead: exactly
+          -- one undo row per key either way, so the run shows as undone.
+          IF e.old_values IS NOT DISTINCT FROM v_cur."values"
+             AND e.old_status IS NOT DISTINCT FROM v_cur.status THEN
+            INSERT INTO rat.data_fix_history
+              (image_no, fix_id, old_values, new_values, old_status, new_status, changed_by,
+               source, undoes, undoes_from, old_needs_recheck, old_description_hash)
+            VALUES
+              (k.image_no, k.fix_id, v_cur."values", v_cur."values", v_cur.status, v_cur.status,
+               auth.uid(), 'undo', k.last_id, k.first_id, v_cur.needs_recheck,
+               v_cur.description_hash);
+          END IF;
           -- Close the window again: only this UPDATE runs in review context.
           PERFORM pg_catalog.set_config('rat.review_context', '', true);
           PERFORM pg_catalog.set_config('rat.review_source', '', true);

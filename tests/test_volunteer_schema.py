@@ -1189,6 +1189,54 @@ def test_undo_value_mismatch_and_missing_row(pg):
     assert _live(pg, "v5_mm")[:2] == (["2"], "corrected")
 
 
+def _hist_rows(pg, image_no, after_id, fix_id="loco_number"):
+    with pg.cursor() as cur:
+        cur.execute('select source, undoes, undoes_from, old_values, new_values, old_status, '
+                    'new_status, changed_by::text, old_needs_recheck, old_description_hash, '
+                    'approved_by, model_answer_id from rat.data_fix_history '
+                    'where image_no = %s and fix_id = %s and id > %s order by id',
+                    (image_no, fix_id, after_id))
+        return cur.fetchall()
+
+
+def test_noop_undo_run_still_records_undo_row(pg):
+    # A -> B -> A, both ids given: the value ends where it is now, yet the undo
+    # must still leave exactly one undo row so the run counts as undone.
+    seed_fix_value(pg, "v5_noop", values=["1"], status="verified", description_hash="h_n")
+    v, admin = make_volunteer(pg, in_training=False), make_admin(pg)
+    pg.commit()
+    h1 = _review(pg, v, "v5_noop", ["2"])
+    h2 = _review(pg, v, "v5_noop", ["1"], "verified")
+    flags = _flags(pg, "v5_noop")
+    res = _one(pg, admin, UNDO, ([h1, h2],))
+    assert res == {"undone": 1, "changed_since": [], "skipped": []}
+    assert _live(pg, "v5_noop")[:2] == (["1"], "verified")
+    assert _hist_rows(pg, "v5_noop", h2) == [
+        ("undo", h2, h1, ["1"], ["1"], "verified", "verified", admin, flags[0], flags[1],
+         None, None)]
+    assert _flags(pg, "v5_noop")[:2] == (False, "h_n")
+    # The run is now covered by that undo row: undoing h1 alone is blocked.
+    res = _one(pg, admin, UNDO, ([h1],))
+    assert res == {"undone": 0, "changed_since": [h1], "skipped": []}
+
+
+def test_undo_change_with_its_undo_records_one_row(pg):
+    # R, then its undo U; undoing {R, U} together leaves the value where it is
+    # and records one undo row covering both.
+    seed_fix_value(pg, "v5_ru", values=["1"])
+    v, admin = make_volunteer(pg, in_training=False), make_admin(pg)
+    pg.commit()
+    r = _review(pg, v, "v5_ru", ["2"])
+    _one(pg, admin, UNDO, ([r],))
+    u = _last_hist(pg, "v5_ru")[0]
+    res = _one(pg, admin, UNDO, ([u, r],))
+    assert res == {"undone": 1, "changed_since": [], "skipped": []}
+    assert _live(pg, "v5_ru")[:2] == (["1"], "extracted")
+    rows = _hist_rows(pg, "v5_ru", u)
+    assert len(rows) == 1
+    assert rows[0][:8] == ("undo", u, r, ["1"], ["1"], "extracted", "extracted", admin)
+
+
 def test_undo_of_undo_reapplies(pg):
     seed_fix_value(pg, "v5_uu", values=["1"])
     v, admin = make_volunteer(pg, in_training=False), make_admin(pg)
