@@ -4,7 +4,8 @@ The `pg` fixture runs a throwaway postgres:17 container (the same major as the
 live `oci` target, read via server_version_num) and applies, in order:
 tests/sql/supabase_stubs.sql, supabase/schema/bootstrap_rat_schema.sql and
 supabase/schema/add_data_fix_tables.sql and
-supabase/schema/add_model_check_tables.sql. Tests never touch the live DB
+supabase/schema/add_model_check_tables.sql and
+supabase/schema/add_volunteer_tables.sql. Tests never touch the live DB
 (Golden Rule #4).
 
 The fixture is session-scoped and shared: each test uses its own image_no
@@ -31,6 +32,7 @@ STUBS_SQL = REPO_ROOT / "tests" / "sql" / "supabase_stubs.sql"
 BOOTSTRAP_SQL = REPO_ROOT / "supabase" / "schema" / "bootstrap_rat_schema.sql"
 DATA_FIX_SQL = REPO_ROOT / "supabase" / "schema" / "add_data_fix_tables.sql"
 MODEL_CHECK_SQL = REPO_ROOT / "supabase" / "schema" / "add_model_check_tables.sql"
+VOLUNTEER_SQL = REPO_ROOT / "supabase" / "schema" / "add_volunteer_tables.sql"
 
 PG_IMAGE = "postgres:17"   # live oci: server_version_num 170006
 PG_PORT = 55432
@@ -94,7 +96,8 @@ def pg():
                     raise
                 time.sleep(1)
 
-        for path in (STUBS_SQL, BOOTSTRAP_SQL, DATA_FIX_SQL, MODEL_CHECK_SQL):
+        for path in (STUBS_SQL, BOOTSTRAP_SQL, DATA_FIX_SQL, MODEL_CHECK_SQL,
+                     VOLUNTEER_SQL):
             apply_sql_file(path)
 
         conn = _connect()
@@ -166,6 +169,22 @@ def make_admin(conn, uid: str | None = None) -> str:
         cur.execute(
             "insert into rat.admin_user (user_id) values (%s) on conflict (user_id) do nothing",
             (uid,),
+        )
+    return uid
+
+
+def make_volunteer(conn, uid: str | None = None, *, in_training: bool = True,
+                   removed: bool = False) -> str:
+    """Insert an auth.users row and a rat.volunteer row (optionally removed)."""
+    uid = make_user(conn, uid)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            insert into rat.volunteer (user_id, in_training, removed_at)
+            values (%s, %s, case when %s then now() end)
+            on conflict (user_id) do nothing
+            """,
+            (uid, in_training, removed),
         )
     return uid
 
