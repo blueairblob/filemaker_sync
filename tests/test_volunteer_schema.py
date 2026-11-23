@@ -202,17 +202,8 @@ def test_bootstrap_carries_volunteer_copy():
 # Task 2: one write path, history columns, access for direct saves and reads
 # --------------------------------------------------------------------------
 #
-# The shared DB is re-applied by other modules (test_data_fix_schema.py and
-# test_model_check_schema.py re-run add_data_fix_tables.sql and the fix_*.sql
-# patches, which restore the admin-only functions and policies). Re-apply the
-# volunteer migration once before these tests, as live will run it last.
-
-@pytest.fixture(scope="module")
-def vol_sql(pg):
-    pg.rollback()
-    apply_sql_file(VOLUNTEER_SQL)
-    apply_sql_file(VOLUNTEER_SQL)  # idempotent
-
+# (Other modules re-apply the volunteer migration last after re-running the
+# original SQL, so no per-module re-apply fixture is needed here.)
 
 LINKS = {"no_answer_flag": "loco", "fix_ids": ["loco_number", "loco_name"]}
 
@@ -249,7 +240,6 @@ def _fix(pg, image_no, fix_id="loco_number"):
         return cur.fetchone()
 
 
-@pytest.mark.usefixtures("vol_sql")
 @pytest.mark.parametrize("who,ok", [("admin", True), ("volunteer", True), ("trainee", False),
                                     ("removed", False), ("stranger", False)])
 def test_direct_save_access(pg, who, ok):
@@ -302,7 +292,6 @@ READ_RPCS = {
 }
 
 
-@pytest.mark.usefixtures("vol_sql")
 @pytest.mark.parametrize("rpc", list(READ_RPCS))
 def test_reads_open_to_volunteers(pg, rpc):
     seed_task(pg, "t_v2_reads")
@@ -316,7 +305,6 @@ def test_reads_open_to_volunteers(pg, rpc):
             assert err is not None and err.pgcode == "42501", who
 
 
-@pytest.mark.usefixtures("vol_sql")
 def test_admin_only_reads_stay(pg):
     v, t = make_volunteer(pg, in_training=False), make_volunteer(pg)
     pg.commit()
@@ -329,7 +317,6 @@ def test_admin_only_reads_stay(pg):
             assert err is not None and err.pgcode == "42501", sql
 
 
-@pytest.mark.usefixtures("vol_sql")
 def test_volunteer_rls_tables(pg):
     seed_fix_value(pg, "v2_rls_1", values=["1"])
     task = seed_task(pg, "t_v2_rls")
@@ -355,7 +342,6 @@ def test_volunteer_rls_tables(pg):
         assert isinstance(err, psycopg2.errors.InsufficientPrivilege)
 
 
-@pytest.mark.usefixtures("vol_sql")
 def test_history_records_old_flags(pg):
     ts = seed_fix_value(pg, "v2_old_1", values=["1"], needs_recheck=True,
                         description_hash="h_before")
@@ -374,7 +360,6 @@ def test_history_records_old_flags(pg):
     assert rows[-1] == (True, "h_before", v, None, "review", None, None, None)
 
 
-@pytest.mark.usefixtures("vol_sql")
 def test_fill_history_links_answer(pg):
     task, img = seed_task(pg, "t_v2_fill", links=LINKS), "v2_fill_1"
     seed_catalog(pg, img, "A station scene")
@@ -395,7 +380,6 @@ def test_fill_history_links_answer(pg):
                                   ("loco_number", "model_check", v, res["answer_id"], None)]
 
 
-@pytest.mark.usefixtures("vol_sql")
 def test_guard_still_blocks_reviewed_overwrite(pg):
     seed_fix_value(pg, "v2_guard_1", values=["5"], status="verified")
     pg.commit()
@@ -409,7 +393,6 @@ def test_guard_still_blocks_reviewed_overwrite(pg):
     assert "rat.data_fix_value_guard()" not in VOLUNTEER_SQL.read_text(encoding="utf-8")
 
 
-@pytest.mark.usefixtures("vol_sql")
 def test_apply_records_author_and_approver(pg):
     """The internal write path, as an approval will call it: the author is
     p_by, the approver is recorded, and every setting is closed again."""
@@ -454,7 +437,6 @@ def test_apply_records_author_and_approver(pg):
         assert set(cur.fetchall()) == {(trainee, admin, res["answer_id"])}
 
 
-@pytest.mark.usefixtures("vol_sql")
 def test_internal_and_admin_privileges(pg):
     with pg.cursor() as cur:
         for fn in ("rat._apply_fix_review(text, text, text[], text, timestamptz, uuid, uuid)",
@@ -484,7 +466,6 @@ def test_internal_and_admin_privileges(pg):
             assert cur.fetchone() == (False, True, True, ['search_path=""']), fn
 
 
-@pytest.mark.usefixtures("vol_sql")
 def test_history_source_check_and_undo_tag(pg):
     with pg.cursor() as cur:
         cur.execute("select conname, pg_get_constraintdef(oid) from pg_constraint "
@@ -508,7 +489,6 @@ def test_history_source_check_and_undo_tag(pg):
     pg.rollback()
 
 
-@pytest.mark.usefixtures("vol_sql")
 def test_new_columns_nullable(pg):
     expect = {
         ("data_fix_history", "approved_by"): "uuid",
@@ -527,3 +507,97 @@ def test_new_columns_nullable(pg):
                         "where table_schema = 'rat' and table_name = %s and column_name = %s",
                         (table, col))
             assert cur.fetchone() == (typ, "YES", None), (table, col)
+
+
+# --------------------------------------------------------------------------
+# Task 3: withdrawn answers stop counting
+# --------------------------------------------------------------------------
+
+def _answer(pg, uid, task, image_no, answer, mode="sample", run=None, shown=None):
+    """Save an answer through the RPC as uid; return the new model_answer id."""
+    _call(pg, uid, "select rat.save_model_answer(%s, %s, %s, %s, %s, %s)",
+          (task, image_no, answer, run, shown, mode))
+    with pg.cursor() as cur:
+        cur.execute("select max(id) from rat.model_answer where task_id = %s and image_no = %s",
+                    (task, image_no))
+        return cur.fetchone()[0]
+
+
+def _withdraw(pg, answer_id, by):
+    pg.commit()
+    with pg.cursor() as cur:
+        cur.execute("insert into rat.model_answer_withdrawal (answer_id, withdrawn_by) "
+                    "values (%s, %s)", (answer_id, by))
+    pg.commit()
+
+
+def test_withdrawal_append_only(pg):
+    task, img = "t3w_ao", "t3w_ao_1"
+    seed_task(pg, task)
+    seed_catalog(pg, img, "x")
+    admin = make_admin(pg)
+    pg.commit()
+    aid = _answer(pg, admin, task, img, "loco")
+    _withdraw(pg, aid, admin)
+    for sql in ("update rat.model_answer_withdrawal set note = 'x'",
+                "delete from rat.model_answer_withdrawal",
+                "truncate rat.model_answer_withdrawal"):
+        with pytest.raises(psycopg2.Error) as ei:
+            with pg.cursor() as cur:
+                cur.execute(sql)
+        assert "append-only" in str(ei.value)
+        pg.rollback()
+
+
+def test_withdrawn_answer_stops_counting(pg):
+    task, img = "t3w_cnt", "t3w_cnt_1"
+    seed_task(pg, task)
+    seed_catalog(pg, img, "x")
+    run = seed_run(pg, task, "v1", {img: ("loco", 0.95)})
+    admin = make_admin(pg)
+    pg.commit()
+    old = _answer(pg, admin, task, img, "station", "sure", run, "loco")
+    new = _answer(pg, admin, task, img, "loco", "sure", run, "loco")
+    prog = "select n_checked, n_agree from rat.model_check_progress() where run_id = %s"
+    conf = "select model_answer, checked_answer, n from rat.model_check_confusion(%s, false)"
+    assert _call(pg, admin, prog, (run,)) == [(1, 1)]
+    assert _call(pg, admin, conf, (run,)) == [("loco", "loco", 1)]
+    _withdraw(pg, new, admin)
+    assert _call(pg, admin, prog, (run,)) == [(1, 0)]
+    assert _call(pg, admin, conf, (run,)) == [("loco", "station", 1)]
+    photo = _call(pg, admin, "select checked_answer from rat.model_check_photo(%s, %s)", (task, img))
+    assert photo == [("station",)]
+    q = "select image_no from rat.model_check_queue(%s, 'sure', %s)"
+    assert _call(pg, admin, q, (task, run)) == []
+    _withdraw(pg, old, admin)
+    assert _call(pg, admin, prog, (run,)) == [(0, 0)]
+    assert _call(pg, admin, q, (task, run)) == [(img,)]
+
+
+def test_withdrawn_blind_leaves_sample(pg):
+    task, img = "t3w_bl", "t3w_bl_1"
+    seed_task(pg, task)
+    seed_catalog(pg, img, "x")
+    run = seed_run(pg, task, "v1", {img: ("loco", 0.95)})
+    admin = make_admin(pg)
+    pg.commit()
+    aid = _answer(pg, admin, task, img, "loco")
+    prog = "select n_blind from rat.model_check_progress() where run_id = %s"
+    # md5 prefix sorts just before this photo's own md5: limit 1 is then this photo
+    # when it is eligible, regardless of how many other catalog rows the shared DB holds
+    import hashlib
+    after = hashlib.md5(img.encode()).hexdigest()[:-1]
+    sample = "select image_no from rat.model_check_queue(%s, 'sample', null, null, null, %s, 1)"
+    assert _call(pg, admin, prog, (run,)) == [(1,)]
+    assert (img,) not in _call(pg, admin, sample, (task, after))
+    _withdraw(pg, aid, admin)
+    assert _call(pg, admin, prog, (run,)) == [(0,)]
+    assert (img,) in _call(pg, admin, sample, (task, after))
+
+
+def test_withdrawal_objects_closed(pg):
+    with pg.cursor() as cur:
+        cur.execute("select has_table_privilege(r, t, 'select') from "
+                    "(values ('anon'), ('authenticated')) a(r), "
+                    "(values ('rat.model_answer_live'), ('rat.model_answer_withdrawal')) b(t)")
+        assert [x[0] for x in cur.fetchall()] == [False] * 4

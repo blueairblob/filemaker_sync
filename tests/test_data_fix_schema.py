@@ -10,7 +10,7 @@ import psycopg2.errors
 import psycopg2.extras
 import pytest
 
-from tests.conftest import (DATA_FIX_SQL, apply_sql_file, as_anon, as_user,
+from tests.conftest import (DATA_FIX_SQL, VOLUNTEER_SQL, apply_sql_file, as_anon, as_user,
                       make_admin, make_user, seed_catalog, seed_fix_value)
 from loco_extract import description_hash
 
@@ -396,6 +396,7 @@ def test_ddl_idempotent(pg):
     pg.rollback()   # leave no open transaction holding locks during the re-apply
 
     apply_sql_file(DATA_FIX_SQL)
+    apply_sql_file(VOLUNTEER_SQL)  # re-apply last, as live does
 
     with pg.cursor() as cur:
         cur.execute("select id, instructions from rat.data_fix "
@@ -409,6 +410,7 @@ def test_stale_errcode_patch_applies(pg):
     # The patch for existing databases (fix_review_stale_errcode.sql) must apply
     # cleanly and leave the PT409 behaviour in place.
     apply_sql_file(DATA_FIX_SQL.parent / "fix_review_stale_errcode.sql")
+    apply_sql_file(VOLUNTEER_SQL)
     seed_fix_value(pg, "s_stale_patch", values=["1"])
     uid = make_admin(pg)
     pg.commit()
@@ -493,6 +495,7 @@ def test_model_check_patch_applies(pg):
     patch = DATA_FIX_SQL.parent / "fix_data_fix_model_check.sql"
     apply_sql_file(patch)
     apply_sql_file(patch)
+    apply_sql_file(VOLUNTEER_SQL)
     seed_fix_value(pg, "s_mc_patch_1", values=["1"])
     _mc_update(pg, "s_mc_patch_1")
     assert _latest_source(pg, "s_mc_patch_1") == "model_check"

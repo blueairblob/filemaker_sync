@@ -12,7 +12,7 @@ import pytest
 
 from loco_extract import description_hash
 from tests.conftest import (
-    BOOTSTRAP_SQL, DATA_FIX_SQL, MODEL_CHECK_SQL, _connect, apply_sql_file,
+    BOOTSTRAP_SQL, DATA_FIX_SQL, MODEL_CHECK_SQL, VOLUNTEER_SQL, _connect, apply_sql_file,
     as_anon, as_user, make_admin, make_user, seed_catalog, seed_fix_value,
     seed_run, seed_task,
 )
@@ -42,7 +42,10 @@ def test_answers_append_only(pg):
             cur.execute("rollback to savepoint s")
         with pytest.raises(psycopg2.Error) as ei:
             cur.execute("truncate rat.model_answer")
-        assert "append-only" in str(ei.value)
+        # Once model_answer_withdrawal references it, Postgres refuses the truncate
+        # on the foreign key before the trigger runs; either way it is blocked.
+        assert ("append-only" in str(ei.value)
+                or "referenced in a foreign key" in str(ei.value))
 
 
 def test_sample_answer_must_be_blind(pg):
@@ -98,6 +101,7 @@ def test_model_check_ddl_idempotent(pg):
     apply_sql_file(MODEL_CHECK_SQL)
     apply_sql_file(MODEL_CHECK_SQL)
     apply_sql_file(DATA_FIX_SQL)
+    apply_sql_file(VOLUNTEER_SQL)  # re-apply last, as live does
 
 
 def test_bootstrap_contains_model_check():
@@ -653,3 +657,4 @@ def test_photo_patch_matches_and_is_idempotent(pg):
     pg.commit()
     apply_sql_file(PHOTO_PATCH_SQL)
     apply_sql_file(PHOTO_PATCH_SQL)
+    apply_sql_file(VOLUNTEER_SQL)

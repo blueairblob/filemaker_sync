@@ -2258,6 +2258,37 @@ BEGIN
 END;
 $$;
 
+-- -----------------------------------------------------------------------------
+-- Withdrawn answers (third section). A withdrawal is a row in its own
+-- append-only table, so rat.model_answer itself is never touched. Everything
+-- that counts answers reads rat.model_answer_live: answers with no withdrawal.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS rat.model_answer_withdrawal (
+  answer_id bigint PRIMARY KEY REFERENCES rat.model_answer(id),
+  withdrawn_by uuid NOT NULL,
+  withdrawn_at timestamptz NOT NULL DEFAULT now(),
+  note text
+);
+
+DROP TRIGGER IF EXISTS model_answer_withdrawal_no_change ON rat.model_answer_withdrawal;
+CREATE TRIGGER model_answer_withdrawal_no_change
+  BEFORE UPDATE OR DELETE ON rat.model_answer_withdrawal
+  FOR EACH ROW EXECUTE FUNCTION rat.model_answer_append_only();
+
+DROP TRIGGER IF EXISTS model_answer_withdrawal_no_truncate ON rat.model_answer_withdrawal;
+CREATE TRIGGER model_answer_withdrawal_no_truncate
+  BEFORE TRUNCATE ON rat.model_answer_withdrawal
+  FOR EACH STATEMENT EXECUTE FUNCTION rat.model_answer_append_only();
+
+ALTER TABLE rat.model_answer_withdrawal ENABLE ROW LEVEL SECURITY;
+
+CREATE OR REPLACE VIEW rat.model_answer_live AS
+  SELECT a.* FROM rat.model_answer a
+   WHERE NOT EXISTS (SELECT 1 FROM rat.model_answer_withdrawal w WHERE w.answer_id = a.id);
+
+REVOKE ALL ON rat.model_answer_withdrawal, rat.model_answer_live
+  FROM PUBLIC, anon, authenticated;
+
 CREATE OR REPLACE FUNCTION rat.model_check_queue(
   p_task_id text,
   p_mode text,
@@ -2337,7 +2368,7 @@ BEGIN
         LEFT JOIN rat.catalog_metadata cm ON cm.catalog_id = c.id
         LEFT JOIN rat.collection col ON col.id = cm.collection_id
        WHERE md5(c.image_no::text) > coalesce(p_after, '')
-         AND NOT EXISTS (SELECT 1 FROM rat.model_answer a
+         AND NOT EXISTS (SELECT 1 FROM rat.model_answer_live a
                           WHERE a.task_id = p_task_id AND a.image_no = c.image_no
                             AND a.mode = 'sample')
        ORDER BY md5(c.image_no::text)
@@ -2366,7 +2397,7 @@ BEGIN
          AND (p_answer IS NULL OR pr.answer = p_answer)
          AND (p_collection IS NULL OR col.name = p_collection)
          AND pr.image_no > coalesce(p_after, '')
-         AND NOT EXISTS (SELECT 1 FROM rat.model_answer a
+         AND NOT EXISTS (SELECT 1 FROM rat.model_answer_live a
                           WHERE a.task_id = p_task_id AND a.image_no = pr.image_no)
        ORDER BY pr.image_no
        LIMIT v_limit;
@@ -2399,11 +2430,11 @@ BEGIN
   RETURN QUERY
     WITH latest AS (
       SELECT DISTINCT ON (a.task_id, a.image_no) a.task_id AS t_id, a.image_no AS img, a.answer AS ans
-        FROM rat.model_answer a
+        FROM rat.model_answer_live a
        ORDER BY a.task_id, a.image_no, a.answered_at DESC, a.id DESC
     ), latest_blind AS (
       SELECT DISTINCT ON (a.task_id, a.image_no) a.task_id AS t_id, a.image_no AS img, a.answer AS ans
-        FROM rat.model_answer a
+        FROM rat.model_answer_live a
        WHERE a.mode = 'sample'
        ORDER BY a.task_id, a.image_no, a.answered_at DESC, a.id DESC
     )
@@ -2421,6 +2452,174 @@ BEGIN
          JOIN rat.model_prediction p ON p.run_id = r.id AND p.image_no = l.img
         WHERE l.t_id = r.task_id) bl
      ORDER BY r.task_id, r.created_at DESC, r.id DESC;
+END;
+$$;
+
+-- The admin-only reads, moved onto the live view (nothing else changed).
+CREATE OR REPLACE FUNCTION rat.model_check_confusion(
+  p_run_id bigint,
+  p_blind_only boolean DEFAULT true
+)
+RETURNS TABLE (model_answer text, checked_answer text, n bigint)
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  v_task_id text;
+BEGIN
+  IF NOT rat.is_admin() THEN
+    RAISE EXCEPTION 'not a data fixes admin' USING ERRCODE = '42501';
+  END IF;
+  SELECT r.task_id INTO v_task_id FROM rat.model_run r WHERE r.id = p_run_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'no model run %', p_run_id USING ERRCODE = 'P0002';
+  END IF;
+  RETURN QUERY
+    WITH latest AS (
+      SELECT DISTINCT ON (a.image_no) a.image_no AS img, a.answer AS ans
+        FROM rat.model_answer_live a
+       WHERE a.task_id = v_task_id
+         AND (a.mode = 'sample' OR NOT coalesce(p_blind_only, true))
+       ORDER BY a.image_no, a.answered_at DESC, a.id DESC
+    )
+    SELECT p.answer, l.ans, count(*)
+      FROM latest l
+      JOIN rat.model_prediction p ON p.run_id = p_run_id AND p.image_no = l.img
+     GROUP BY p.answer, l.ans
+     ORDER BY p.answer, l.ans;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION rat.model_check_conflicts(p_task_id text)
+RETURNS TABLE (
+  image_no text,
+  answer text,
+  fix_id text,
+  status text,
+  confidence text,
+  "values" text[],
+  suggested_values text[]
+)
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  v_task rat.model_task;
+  v_fix_ids text[];
+BEGIN
+  IF NOT rat.is_admin() THEN
+    RAISE EXCEPTION 'not a data fixes admin' USING ERRCODE = '42501';
+  END IF;
+  SELECT t.* INTO v_task FROM rat.model_task t WHERE t.id = p_task_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'no model task %', p_task_id USING ERRCODE = 'P0002';
+  END IF;
+  IF v_task.links IS NULL THEN
+    RETURN;
+  END IF;
+  v_fix_ids := ARRAY(SELECT x.fix_id
+                       FROM jsonb_array_elements_text(
+                              coalesce(v_task.links -> 'fix_ids', '[]'::jsonb))
+                            WITH ORDINALITY AS x(fix_id, ord)
+                      ORDER BY x.ord);
+  RETURN QUERY
+    WITH latest AS (
+      SELECT DISTINCT ON (a.image_no) a.image_no AS img, a.answer AS ans
+        FROM rat.model_answer_live a
+       WHERE a.task_id = p_task_id
+       ORDER BY a.image_no, a.answered_at DESC, a.id DESC
+    ), flagged AS (
+      SELECT l.img, l.ans, (e ->> (v_task.links ->> 'no_answer_flag'))::boolean AS is_loco
+        FROM latest l
+        JOIN LATERAL jsonb_array_elements(v_task.answers) AS e ON e ->> 'id' = l.ans
+    )
+    SELECT f.img, f.ans, v.fix_id, v.status, v.confidence, v."values", v.suggested_values
+      FROM flagged f
+      JOIN rat.data_fix_value v ON v.image_no = f.img AND v.fix_id = ANY (v_fix_ids)
+     WHERE (f.is_loco = false AND v.status = 'extracted' AND v.confidence <> 'none')
+        OR (f.is_loco = true AND v.status = 'no_loco')
+     ORDER BY f.img, pg_catalog.array_position(v_fix_ids, v.fix_id);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION rat.model_check_photo(
+  p_task_id text,
+  p_image_no text,
+  p_run_id bigint DEFAULT NULL
+)
+RETURNS TABLE (
+  image_no text,
+  sort_key text,
+  description text,
+  collection text,
+  date_taken date,
+  cd_no character varying,
+  model_answer text,
+  model_p real,
+  checked_answer text,
+  checked_at timestamptz,
+  fix_state jsonb,
+  checked_mode text,
+  run_id bigint
+)
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  v_task rat.model_task;
+  v_fix_ids text[];
+  v_run_id bigint := p_run_id;
+  v_last rat.model_answer_live%ROWTYPE;
+BEGIN
+  IF NOT rat.is_admin() THEN
+    RAISE EXCEPTION 'not a data fixes admin' USING ERRCODE = '42501';
+  END IF;
+  SELECT t.* INTO v_task FROM rat.model_task t WHERE t.id = p_task_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'no model task %', p_task_id USING ERRCODE = 'P0002';
+  END IF;
+  IF v_run_id IS NULL THEN
+    SELECT r.id INTO v_run_id FROM rat.model_run r
+     WHERE r.task_id = p_task_id ORDER BY r.created_at DESC, r.id DESC LIMIT 1;
+  ELSIF NOT EXISTS (SELECT 1 FROM rat.model_run r
+                     WHERE r.id = v_run_id AND r.task_id = p_task_id) THEN
+    RAISE EXCEPTION 'run % is not a run of task %', v_run_id, p_task_id
+      USING ERRCODE = '22023';
+  END IF;
+  IF v_task.links IS NOT NULL THEN
+    v_fix_ids := ARRAY(SELECT jsonb_array_elements_text(
+                          coalesce(v_task.links -> 'fix_ids', '[]'::jsonb)));
+  END IF;
+  SELECT a.* INTO v_last FROM rat.model_answer_live a
+   WHERE a.task_id = p_task_id AND a.image_no = p_image_no
+   ORDER BY a.answered_at DESC, a.id DESC LIMIT 1;
+
+  RETURN QUERY
+    SELECT c.image_no::text, c.image_no::text, c.description, col.name::text,
+           c.date_taken, c.cd_no,
+           CASE WHEN v_last.mode = 'sample' THEN NULL ELSE pr.answer END,
+           CASE WHEN v_last.mode = 'sample' THEN NULL ELSE pr.p END,
+           v_last.answer, v_last.answered_at,
+           CASE WHEN v_fix_ids IS NULL THEN NULL::jsonb ELSE coalesce(
+             (SELECT jsonb_object_agg(f.fix_id, jsonb_build_object(
+                       'status', f.status, 'confidence', f.confidence,
+                       'values', to_jsonb(f."values"),
+                       'suggested_values', to_jsonb(f.suggested_values)))
+                FROM rat.data_fix_value f
+               WHERE f.image_no = c.image_no AND f.fix_id = ANY (v_fix_ids)),
+             '{}'::jsonb) END,
+           v_last.mode, v_run_id
+      FROM rat.catalog c
+      LEFT JOIN rat.catalog_metadata cm ON cm.catalog_id = c.id
+      LEFT JOIN rat.collection col ON col.id = cm.collection_id
+      LEFT JOIN rat.model_prediction pr ON pr.run_id = v_run_id AND pr.image_no = c.image_no
+     WHERE c.image_no = p_image_no;
 END;
 $$;
 
