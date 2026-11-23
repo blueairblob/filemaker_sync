@@ -3246,10 +3246,46 @@ GRANT EXECUTE ON FUNCTION
 -- values/status in one review-context UPDATE:
 --   needs_recheck    old_needs_recheck, or (history from before this
 --                    migration) true unless the restored status is 'extracted';
+--                    unless 'extracted', also true when the row is flagged now
+--                    (a description changed since is never hidden);
 --   description_hash old_description_hash, else the current one;
 --   reviewed_by/at   NULL for 'extracted', else changed_by/changed_at of the
 --                    newest history row before the earliest given one.
--- 'undone' counts keys. Internal: no EXECUTE for authenticated.
+-- 'undone' counts keys. A given id already undone (rat._fix_history_undone,
+-- by an undo row that is not itself given) is skipped as 'already undone'.
+-- Internal: no EXECUTE for authenticated.
+
+-- Whether history row p_id is undone: an undo row u for the same key
+-- (image_no, fix_id) has u.undoes_from <= p_id <= u.undoes and u is not itself
+-- undone (the rule rat.change_list's undone flag uses). An undo row listed in
+-- p_except does not count. Internal.
+CREATE OR REPLACE FUNCTION rat._fix_history_undone(p_id bigint,
+                                                   p_except bigint[] DEFAULT '{}')
+RETURNS boolean
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  u bigint;
+BEGIN
+  FOR u IN SELECT x.id
+             FROM rat.data_fix_history h
+             JOIN rat.data_fix_history x
+               ON x.source = 'undo' AND x.image_no = h.image_no AND x.fix_id = h.fix_id
+              AND coalesce(x.undoes_from, x.undoes) <= h.id AND h.id <= x.undoes
+            WHERE h.id = p_id
+              AND NOT (x.id = ANY (coalesce(p_except, '{}'::bigint[])))
+  LOOP
+    IF NOT rat._fix_history_undone(u) THEN
+      RETURN true;
+    END IF;
+  END LOOP;
+  RETURN false;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION rat._undo_fix_keys(p_history_ids bigint[])
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -3265,18 +3301,22 @@ DECLARE
   v_prev rat.data_fix_history; -- the row before e, for reviewed_by/at
   v_cur rat.data_fix_value;
   v_ok bigint[] := '{}';
+  v_given bigint[];
   v_undone integer := 0;
   v_changed jsonb := '[]'::jsonb;
   v_skipped jsonb := '[]'::jsonb;
 BEGIN
-  FOR v_id IN SELECT DISTINCT x FROM unnest(coalesce(p_history_ids, '{}'::bigint[])) AS x
-               WHERE x IS NOT NULL ORDER BY x
+  v_given := ARRAY(SELECT DISTINCT x FROM unnest(coalesce(p_history_ids, '{}'::bigint[])) AS x
+                    WHERE x IS NOT NULL ORDER BY x);
+  FOREACH v_id IN ARRAY v_given
   LOOP
     SELECT d.* INTO h FROM rat.data_fix_history d WHERE d.id = v_id;
     IF NOT FOUND THEN
       v_skipped := v_skipped || jsonb_build_object('id', v_id, 'reason', 'no such change');
     ELSIF h.source NOT IN ('review', 'model_check', 'undo') OR h.old_status IS NULL THEN
       v_skipped := v_skipped || jsonb_build_object('id', v_id, 'reason', 'not a human change');
+    ELSIF rat._fix_history_undone(v_id, v_given) THEN
+      v_skipped := v_skipped || jsonb_build_object('id', v_id, 'reason', 'already undone');
     ELSE
       v_ok := v_ok || v_id;
     END IF;
@@ -3325,7 +3365,8 @@ BEGIN
           UPDATE rat.data_fix_value v
              SET "values" = e.old_values,
                  status = e.old_status,
-                 needs_recheck = coalesce(e.old_needs_recheck, e.old_status <> 'extracted'),
+                 needs_recheck = coalesce(e.old_needs_recheck, e.old_status <> 'extracted')
+                                 OR (e.old_status <> 'extracted' AND v.needs_recheck),
                  description_hash = coalesce(e.old_description_hash, v.description_hash),
                  reviewed_by = v_prev.changed_by,
                  reviewed_at = v_prev.changed_at
@@ -3386,7 +3427,8 @@ $$;
 -- an answer saved before this migration, by matching image_no, source
 -- 'model_check', changed_by = answered_by and changed_at = answered_at (both
 -- now() of one transaction). They are undone by the per-key rule; a fill
--- changed since stays in place and is listed in fills_left. The withdrawal
+-- changed since stays in place and is listed in fills_left (a fill already
+-- undone is not). The withdrawal
 -- stands either way. There is no un-withdraw: to restore an answer, answer
 -- again.
 CREATE OR REPLACE FUNCTION rat.withdraw_model_answers(p_answer_ids bigint[], p_note text)
@@ -3443,7 +3485,8 @@ BEGIN
                                        FROM jsonb_array_elements_text(v_res -> 'changed_since') AS c
                                      UNION
                                      SELECT (s ->> 'id')::bigint
-                                       FROM jsonb_array_elements(v_res -> 'skipped') AS s)) l),
+                                       FROM jsonb_array_elements(v_res -> 'skipped') AS s
+                                      WHERE s ->> 'reason' <> 'already undone')) l),
             '[]'::jsonb);
         END IF;
         v_withdrawn := v_withdrawn + 1;
@@ -3459,10 +3502,12 @@ END;
 $$;
 
 REVOKE ALL ON FUNCTION rat._undo_fix_keys(bigint[]) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION rat._fix_history_undone(bigint, bigint[]) FROM PUBLIC, anon, authenticated;
 DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'picaloco_agent') THEN
     REVOKE ALL ON FUNCTION rat._undo_fix_keys(bigint[]) FROM picaloco_agent;
+    REVOKE ALL ON FUNCTION rat._fix_history_undone(bigint, bigint[]) FROM picaloco_agent;
   END IF;
 END $$;
 

@@ -1216,9 +1216,10 @@ def test_noop_undo_run_still_records_undo_row(pg):
         ("undo", h2, h1, ["1"], ["1"], "verified", "verified", admin, flags[0], flags[1],
          None, None)]
     assert _flags(pg, "v5_noop")[:2] == (False, "h_n")
-    # The run is now covered by that undo row: undoing h1 alone is blocked.
+    # The run is now covered by that undo row: undoing h1 again is skipped.
     res = _one(pg, admin, UNDO, ([h1],))
-    assert res == {"undone": 0, "changed_since": [h1], "skipped": []}
+    assert res == {"undone": 0, "changed_since": [],
+                   "skipped": [{"id": h1, "reason": "already undone"}]}
 
 
 def test_undo_change_with_its_undo_records_one_row(pg):
@@ -1368,12 +1369,64 @@ def test_undo_withdraw_admin_only(pg):
                         "p.prosecdef, p.proconfig "
                         "from pg_proc p where p.oid = %s::regprocedure", (fn, fn, fn))
             assert cur.fetchone() == (False, True, True, ['search_path=""']), fn
-        fn = "rat._undo_fix_keys(bigint[])"
-        cur.execute("select has_function_privilege('anon', %s, 'EXECUTE'), "
-                    "has_function_privilege('authenticated', %s, 'EXECUTE'), "
-                    "has_function_privilege('public', %s, 'EXECUTE'), "
-                    "has_function_privilege('picaloco_agent', %s, 'EXECUTE')", (fn, fn, fn, fn))
-        assert cur.fetchone() == (False, False, False, False)
+        for fn in ("rat._undo_fix_keys(bigint[])", "rat._fix_history_undone(bigint, bigint[])"):
+            cur.execute("select has_function_privilege('anon', %s, 'EXECUTE'), "
+                        "has_function_privilege('authenticated', %s, 'EXECUTE'), "
+                        "has_function_privilege('public', %s, 'EXECUTE'), "
+                        "has_function_privilege('picaloco_agent', %s, 'EXECUTE')",
+                        (fn, fn, fn, fn))
+            assert cur.fetchone() == (False, False, False, False), fn
+
+
+def test_undo_keeps_recheck_flag_set_after_change(pg):
+    # verified -> corrected (old_needs_recheck false); the description then
+    # changes and the extractor flags the row (no history row). Undo must not
+    # hide that changed description again.
+    seed_fix_value(pg, "v7_rc", values=["1"], status="verified", description_hash="h_v")
+    v, admin = make_volunteer(pg, in_training=False), make_admin(pg)
+    pg.commit()
+    hid = _review(pg, v, "v7_rc", ["2"])
+    n = _n_hist(pg, "v7_rc")
+    with pg.cursor() as cur:   # the extractor, as the owner: a non-guarded column
+        cur.execute("update rat.data_fix_value set needs_recheck = true "
+                    "where image_no = 'v7_rc' and fix_id = 'loco_number'")
+    pg.commit()
+    assert _n_hist(pg, "v7_rc") == n
+    res = _one(pg, admin, UNDO, ([hid],))
+    assert res == {"undone": 1, "changed_since": [], "skipped": []}
+    assert _live(pg, "v7_rc")[:2] == (["1"], "verified")
+    assert _flags(pg, "v7_rc")[0] is True
+
+
+def test_undo_already_undone_is_skipped(pg):
+    seed_fix_value(pg, "v7_twice", values=["1"])
+    v, admin = make_volunteer(pg, in_training=False), make_admin(pg)
+    pg.commit()
+    hid = _review(pg, v, "v7_twice", ["2"])
+    assert _one(pg, admin, UNDO, ([hid],))["undone"] == 1
+    n = _n_hist(pg, "v7_twice")
+    res = _one(pg, admin, UNDO, ([hid],))
+    assert res == {"undone": 0, "changed_since": [],
+                   "skipped": [{"id": hid, "reason": "already undone"}]}
+    assert _n_hist(pg, "v7_twice") == n
+    assert _live(pg, "v7_twice")[:2] == (["1"], "extracted")
+
+
+def test_withdraw_after_fill_undone_leaves_nothing(pg):
+    task, img = seed_task(pg, "t7_wu", links=LINKS), "v7_wu"
+    _linked_photo(pg, img)
+    v, admin = make_volunteer(pg, in_training=False), make_admin(pg)
+    pg.commit()
+    aid = _filled_answer(pg, v, task, img)
+    with pg.cursor() as cur:
+        cur.execute("select id from rat.data_fix_history where model_answer_id = %s "
+                    "and fix_id = 'loco_number'", (aid,))
+        fill = cur.fetchone()[0]
+    assert _one(pg, admin, UNDO, ([fill],))["undone"] == 1
+    res = _one(pg, admin, WITHDRAW, ([aid], None))
+    assert res == {"withdrawn": 1, "skipped": [], "fills_left": []}
+    for fix_id in LINKS["fix_ids"]:
+        assert _live(pg, img, fix_id)[:2] == ([], "extracted")
 
 
 def test_preservation_checksum_untouched_by_migration(pg):
