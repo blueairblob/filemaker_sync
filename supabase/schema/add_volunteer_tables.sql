@@ -167,10 +167,15 @@ BEGIN
   END IF;
   UPDATE rat.volunteer x
      SET in_training = COALESCE(p_in_training, x.in_training),
+         -- Removing an already-removed volunteer keeps the first removal.
          removed_by  = CASE WHEN p_active IS NULL THEN x.removed_by
-                            WHEN p_active THEN NULL ELSE auth.uid() END,
+                            WHEN p_active THEN NULL
+                            WHEN x.removed_at IS NOT NULL THEN x.removed_by
+                            ELSE auth.uid() END,
          removed_at  = CASE WHEN p_active IS NULL THEN x.removed_at
-                            WHEN p_active THEN NULL ELSE now() END
+                            WHEN p_active THEN NULL
+                            WHEN x.removed_at IS NOT NULL THEN x.removed_at
+                            ELSE now() END
    WHERE x.user_id = p_user_id
    RETURNING * INTO v;
   IF NOT FOUND THEN
@@ -213,7 +218,6 @@ LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = ''
 AS $$
 DECLARE
   v_uid uuid;
-  v_removed timestamptz;
   v_kind text;
 BEGIN
   IF NOT rat.is_admin() THEN
@@ -223,7 +227,9 @@ BEGIN
     SELECT u.id INTO v_uid FROM auth.users u WHERE u.id = p_user_id;
   ELSIF p_email IS NOT NULL THEN
     SELECT u.id INTO v_uid FROM auth.users u
-     WHERE lower(trim(u.email)) = lower(trim(p_email)) LIMIT 1;
+     WHERE lower(trim(u.email)) = lower(trim(p_email))
+     ORDER BY u.created_at, u.id
+     LIMIT 1;
   END IF;
   IF v_uid IS NULL THEN
     RETURN jsonb_build_object('user_id', NULL, 'kind', 'none');
@@ -1289,6 +1295,36 @@ REVOKE ALL ON rat.pending_fix_review, rat.pending_model_answer
 REVOKE ALL ON SEQUENCE rat.pending_fix_review_id_seq, rat.pending_model_answer_id_seq
   FROM PUBLIC, anon, authenticated;
 
+-- Held rows are irreplaceable volunteer work: decided (UPDATE), never deleted.
+CREATE OR REPLACE FUNCTION rat.pending_no_delete()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+BEGIN
+  RAISE EXCEPTION 'held work is kept: decide it, never delete it'
+    USING ERRCODE = 'restrict_violation';
+END;
+$$;
+REVOKE ALL ON FUNCTION rat.pending_no_delete() FROM PUBLIC, anon, authenticated;
+
+DROP TRIGGER IF EXISTS pending_fix_review_no_delete ON rat.pending_fix_review;
+CREATE TRIGGER pending_fix_review_no_delete
+  BEFORE DELETE ON rat.pending_fix_review
+  FOR EACH ROW EXECUTE FUNCTION rat.pending_no_delete();
+DROP TRIGGER IF EXISTS pending_fix_review_no_truncate ON rat.pending_fix_review;
+CREATE TRIGGER pending_fix_review_no_truncate
+  BEFORE TRUNCATE ON rat.pending_fix_review
+  FOR EACH STATEMENT EXECUTE FUNCTION rat.pending_no_delete();
+DROP TRIGGER IF EXISTS pending_model_answer_no_delete ON rat.pending_model_answer;
+CREATE TRIGGER pending_model_answer_no_delete
+  BEFORE DELETE ON rat.pending_model_answer
+  FOR EACH ROW EXECUTE FUNCTION rat.pending_no_delete();
+DROP TRIGGER IF EXISTS pending_model_answer_no_truncate ON rat.pending_model_answer;
+CREATE TRIGGER pending_model_answer_no_truncate
+  BEFORE TRUNCATE ON rat.pending_model_answer
+  FOR EACH STATEMENT EXECUTE FUNCTION rat.pending_no_delete();
+
 -- Submit (trainee only). Validation matches review_fix_value: status list
 -- (22023), row exists (P0002), row unchanged since loaded (PT409). A
 -- re-submit of the same key withdraws the caller's pending row first.
@@ -1423,7 +1459,18 @@ $$;
 -- Admin decisions. Each id is handled on its own, in id order, inside its own
 -- subtransaction: an error in one item becomes a 'skipped' (or 'stale') entry
 -- and never fails the call or the other items.
-CREATE OR REPLACE FUNCTION rat.approve_fix_review(p_ids bigint[], p_force boolean DEFAULT false)
+-- approve_fix_review: without p_force a fix applies only over the row the
+-- trainee loaded. "Approve anyway" (p_force) applies over the row the admin
+-- saw: p_seen_updated_at, held_list's current_updated_at, so a change made
+-- after the admin looked comes back as stale again. With p_force and no
+-- p_seen_updated_at it applies over whatever the row holds now. Replaces the
+-- two-argument version (dropped here, so the call is never ambiguous).
+DROP FUNCTION IF EXISTS rat.approve_fix_review(bigint[], boolean);
+CREATE OR REPLACE FUNCTION rat.approve_fix_review(
+  p_ids bigint[],
+  p_force boolean DEFAULT false,
+  p_seen_updated_at timestamptz DEFAULT NULL
+)
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -1449,8 +1496,11 @@ BEGIN
       IF NOT FOUND OR r.decision <> 'pending' THEN
         v_skipped := v_skipped || jsonb_build_object('id', v_id, 'reason', 'not pending');
       ELSE
-        IF coalesce(p_force, false) THEN
-          -- The admin saw the current value: approve over it.
+        IF coalesce(p_force, false) AND p_seen_updated_at IS NOT NULL THEN
+          -- Approve over the value the admin saw.
+          v_expected := p_seen_updated_at;
+        ELSIF coalesce(p_force, false) THEN
+          -- No seen value given: approve over the current value.
           SELECT v.updated_at INTO v_expected FROM rat.data_fix_value v
            WHERE v.image_no = r.image_no AND v.fix_id = r.fix_id;
         ELSE
@@ -1579,6 +1629,10 @@ $$;
 
 -- Admin: every pending row (or one user's), oldest first. A fix is stale when
 -- its live row changed (or vanished) since the trainee loaded it.
+-- current_updated_at is the live row's updated_at (NULL for an answer, or a
+-- vanished row): pass it back to approve_fix_review as p_seen_updated_at.
+-- The result type changed (a column added), so drop first.
+DROP FUNCTION IF EXISTS rat.held_list(uuid);
 CREATE OR REPLACE FUNCTION rat.held_list(p_user uuid DEFAULT NULL)
 RETURNS TABLE (
   kind text,
@@ -1591,7 +1645,8 @@ RETURNS TABLE (
   before jsonb,
   proposed jsonb,
   current jsonb,
-  stale boolean
+  stale boolean,
+  current_updated_at timestamptz
 )
 LANGUAGE plpgsql
 STABLE
@@ -1604,7 +1659,7 @@ BEGIN
   END IF;
   RETURN QUERY
     SELECT hl.k, hl.hid, hl.sb, hl.sa, hl.img, hl.descr, hl.subj, hl.bef, hl.prop,
-           hl.cur, hl.st
+           hl.cur, hl.st, hl.cua
       FROM (
         SELECT 'fix'::text AS k, f.id AS hid, f.submitted_by AS sb, f.submitted_at AS sa,
                f.image_no AS img, c.description AS descr, d.title AS subj,
@@ -1613,7 +1668,8 @@ BEGIN
                CASE WHEN v.image_no IS NULL THEN NULL::jsonb
                     ELSE jsonb_build_object('values', to_jsonb(v."values"), 'status', v.status)
                END AS cur,
-               (v.updated_at IS DISTINCT FROM f.base_updated_at) AS st
+               (v.updated_at IS DISTINCT FROM f.base_updated_at) AS st,
+               v.updated_at AS cua
           FROM rat.pending_fix_review f
           LEFT JOIN rat.data_fix_value v ON v.image_no = f.image_no AND v.fix_id = f.fix_id
           LEFT JOIN rat.catalog c ON c.image_no = f.image_no
@@ -1624,7 +1680,7 @@ BEGIN
                m.image_no, c.description, t.question,
                jsonb_build_object('shown_answer', m.shown_answer),
                jsonb_build_object('answer', m.answer, 'mode', m.mode),
-               NULL::jsonb, false
+               NULL::jsonb, false, NULL::timestamptz
           FROM rat.pending_model_answer m
           LEFT JOIN rat.catalog c ON c.image_no = m.image_no
           LEFT JOIN rat.model_task t ON t.id = m.task_id
@@ -1689,7 +1745,7 @@ REVOKE EXECUTE ON FUNCTION
   rat.submit_fix_review(text, text, text[], text, timestamptz),
   rat.submit_fix_confirm(text, jsonb),
   rat.submit_model_answer(text, text, text, bigint, text, text),
-  rat.approve_fix_review(bigint[], boolean),
+  rat.approve_fix_review(bigint[], boolean, timestamptz),
   rat.approve_model_answer(bigint[]),
   rat.reject_held(text, bigint[], text),
   rat.held_list(uuid),
@@ -1699,7 +1755,7 @@ GRANT EXECUTE ON FUNCTION
   rat.submit_fix_review(text, text, text[], text, timestamptz),
   rat.submit_fix_confirm(text, jsonb),
   rat.submit_model_answer(text, text, text, bigint, text, text),
-  rat.approve_fix_review(bigint[], boolean),
+  rat.approve_fix_review(bigint[], boolean, timestamptz),
   rat.approve_model_answer(bigint[]),
   rat.reject_held(text, bigint[], text),
   rat.held_list(uuid),
@@ -1729,7 +1785,10 @@ GRANT EXECUTE ON FUNCTION
 --                    (a description changed since is never hidden);
 --   description_hash old_description_hash, else the current one;
 --   reviewed_by/at   NULL for 'extracted', else changed_by/changed_at of the
---                    newest history row before the earliest given one.
+--                    newest history row before the earliest given one that is
+--                    not an undo row and not itself undone (rows given in
+--                    this call do not count as undoing), i.e. the change whose
+--                    value is restored, never the admin who ran an earlier undo.
 -- 'undone' counts keys. A given id already undone (rat._fix_history_undone,
 -- by an undo row that is not itself given) is skipped as 'already undone'.
 -- Internal: no EXECUTE for authenticated.
@@ -1830,6 +1889,8 @@ BEGIN
           IF e.old_status <> 'extracted' THEN
             SELECT d.* INTO v_prev FROM rat.data_fix_history d
              WHERE d.image_no = k.image_no AND d.fix_id = k.fix_id AND d.id < k.first_id
+               AND d.source <> 'undo'
+               AND NOT rat._fix_history_undone(d.id, v_given)
              ORDER BY d.id DESC
              LIMIT 1;
           END IF;
@@ -1971,6 +2032,9 @@ BEGIN
         v_withdrawn := v_withdrawn + 1;
       END IF;
     EXCEPTION
+      WHEN unique_violation THEN
+        -- A concurrent withdrawal of the same answer committed first.
+        v_skipped := v_skipped || jsonb_build_object('id', v_id, 'reason', 'already withdrawn');
       WHEN OTHERS THEN
         v_skipped := v_skipped || jsonb_build_object('id', v_id, 'reason', SQLERRM);
     END;

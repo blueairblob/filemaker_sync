@@ -12,7 +12,7 @@ import psycopg2.errors
 import pytest
 
 from tests.conftest import (
-    BOOTSTRAP_SQL, VOLUNTEER_SQL, apply_sql_file, as_user, make_admin,
+    BOOTSTRAP_SQL, VOLUNTEER_SQL, _connect, apply_sql_file, as_user, make_admin,
     make_user, make_volunteer, seed_catalog, seed_fix_value, seed_run, seed_task,
 )
 
@@ -66,7 +66,7 @@ def test_my_role_per_kind(pg):
 
 
 def test_add_volunteer_rules(pg):
-    admin, adm2, target = make_admin(pg), make_admin(pg), make_user(pg)
+    admin, adm2, adm3, target = make_admin(pg), make_admin(pg), make_admin(pg), make_user(pg)
     pg.commit()
     as_user(pg, admin)
     with pg.cursor() as cur:
@@ -84,10 +84,16 @@ def test_add_volunteer_rules(pg):
         assert ei.value.pgcode == "22023" and "already a volunteer" in str(ei.value)
         cur.execute("rollback to savepoint s")
         cur.execute("select rat.set_volunteer(%s, false, false)", (target,))
+    pg.commit()
+    assert str(_row(pg, target)[4]) == admin
+    # Re-adding a removed volunteer: added_by becomes the re-adding admin.
+    as_user(pg, adm3)
+    with pg.cursor() as cur:
         cur.execute("select (rat.add_volunteer(%s)).user_id", (target,))
     pg.commit()
-    in_training, must_change, removed_by, removed_at, _ = _row(pg, target)
+    in_training, must_change, removed_by, removed_at, added_by = _row(pg, target)
     assert (in_training, must_change, removed_by, removed_at) == (True, True, None, None)
+    assert str(added_by) == adm3
 
 
 def test_add_volunteer_admin_only(pg):
@@ -983,7 +989,7 @@ def test_held_admin_rpcs_and_tables_closed(pg):
         for fn in ("rat.submit_fix_review(text, text, text[], text, timestamptz)",
                    "rat.submit_fix_confirm(text, jsonb)",
                    "rat.submit_model_answer(text, text, text, bigint, text, text)",
-                   "rat.approve_fix_review(bigint[], boolean)",
+                   "rat.approve_fix_review(bigint[], boolean, timestamptz)",
                    "rat.approve_model_answer(bigint[])",
                    "rat.reject_held(text, bigint[], text)",
                    "rat.held_list(uuid)",
@@ -993,6 +999,9 @@ def test_held_admin_rpcs_and_tables_closed(pg):
                         "p.prosecdef, p.proconfig "
                         "from pg_proc p where p.oid = %s::regprocedure", (fn, fn, fn))
             assert cur.fetchone() == (False, True, True, ['search_path=""']), fn
+        # The old two-argument approve_fix_review is gone (no ambiguous overload).
+        cur.execute("select to_regprocedure('rat.approve_fix_review(bigint[], boolean)')")
+        assert cur.fetchone() == (None,)
         fn = "rat._validate_model_answer(text, text, text, bigint, text, text)"
         cur.execute("select has_function_privilege('anon', %s, 'EXECUTE'), "
                     "has_function_privilege('authenticated', %s, 'EXECUTE'), "
@@ -1709,3 +1718,302 @@ def test_change_list_admin_only(pg):
                     "p.prosecdef, p.proconfig "
                     "from pg_proc p where p.oid = %s::regprocedure", (fn, fn, fn, fn))
         assert cur.fetchone() == (False, True, False, True, ['search_path=""'])
+
+
+# --------------------------------------------------------------------------
+# Wave A: ledger minors
+# --------------------------------------------------------------------------
+
+def test_account_status_email_lookup_is_deterministic(pg):
+    admin = make_admin(pg)
+    tag = uuid.uuid4().hex[:8]
+    newer, older = str(uuid.uuid4()), str(uuid.uuid4())
+    lo, hi = f"00000000-0000-4000-8000-{tag}0000", f"ffffffff-0000-4000-8000-{tag}0000"
+    with pg.cursor() as cur:
+        # Inserted newest first, so a plain scan meets the wrong one first.
+        cur.execute("insert into auth.users (id, email, created_at) values "
+                    "(%s, %s, '2026-06-01T00:00:00Z'), (%s, %s, '2026-01-01T00:00:00Z')",
+                    (newer, f"Dup_{tag}@example.test", older, f" dup_{tag}@example.test"))
+        # Same created_at: the lower id wins.
+        cur.execute("insert into auth.users (id, email, created_at) values "
+                    "(%s, %s, '2026-01-01T00:00:00Z'), (%s, %s, '2026-01-01T00:00:00Z')",
+                    (hi, f"Tie_{tag}@example.test", lo, f"tie_{tag}@example.test"))
+    pg.commit()
+    r = _call(pg, admin, "select rat.account_status(%s)", (f"dup_{tag}@example.test",))[0][0]
+    assert r == {"user_id": older, "kind": "other"}
+    r = _call(pg, admin, "select rat.account_status(%s)", (f"tie_{tag}@example.test",))[0][0]
+    assert r == {"user_id": lo, "kind": "other"}
+
+
+def test_set_volunteer_remove_again_keeps_first_removal(pg):
+    a1, a2, v = make_admin(pg), make_admin(pg), make_volunteer(pg)
+    _call(pg, a1, "select rat.set_volunteer(%s, null, false)", (v,))
+    _, _, by1, at1, _ = _row(pg, v)
+    assert str(by1) == a1 and at1 is not None
+    _call(pg, a2, "select rat.set_volunteer(%s, p_active => false)", (v,))
+    _, _, by2, at2, _ = _row(pg, v)
+    assert (str(by2), at2) == (a1, at1)
+
+
+def test_withdraw_race_reports_already_withdrawn(pg):
+    """Two withdrawals of one answer at once: the second one's pre-check cannot
+    see the first (not yet committed), so its insert hits the primary key. That
+    must read as 'already withdrawn', not the raw constraint message."""
+    import threading
+    import time
+    task, img = seed_task(pg, "wa_race", links=LINKS), "wa_race"
+    _linked_photo(pg, img)
+    admin = make_admin(pg)
+    pg.commit()
+    aid = _filled_answer(pg, admin, task, img)
+    first, caller, watch = _connect(), _connect(), _connect(autocommit=True)
+    out = {}
+
+    def withdraw():
+        try:
+            as_user(caller, admin)
+            with caller.cursor() as cur:
+                cur.execute(WITHDRAW, ([aid], "second"))
+                out["res"] = cur.fetchone()[0]
+            caller.commit()
+        except Exception as exc:  # reported below
+            out["err"] = exc
+
+    try:
+        with first.cursor() as cur:
+            cur.execute("insert into rat.model_answer_withdrawal (answer_id, withdrawn_by, note) "
+                        "values (%s, %s, 'first')", (aid, admin))
+        th = threading.Thread(target=withdraw)
+        th.start()
+        deadline = time.monotonic() + 20
+        while True:   # wait until the caller is blocked on the first insert
+            with watch.cursor() as cur:
+                cur.execute("select wait_event_type from pg_stat_activity where pid = %s",
+                            (caller.get_backend_pid(),))
+                if cur.fetchone()[0] == "Lock":
+                    break
+            assert time.monotonic() < deadline, "caller never blocked"
+            time.sleep(0.05)
+        first.commit()
+        th.join(20)
+        assert "err" not in out, out.get("err")
+        assert out["res"] == {"withdrawn": 0, "fills_left": [],
+                              "skipped": [{"id": aid, "reason": "already withdrawn"}]}
+    finally:
+        for conn in (first, caller, watch):
+            conn.close()
+    with pg.cursor() as cur:
+        cur.execute("select note from rat.model_answer_withdrawal where answer_id = %s", (aid,))
+        assert cur.fetchone() == ("first",)
+
+
+def _held_row(pg, admin, uid, pid):
+    rows = _one(pg, admin, "select json_agg(h) from rat.held_list(%s) h", (uid,))
+    return next(r for r in rows if r["id"] == pid)
+
+
+def test_held_list_current_updated_at(pg):
+    task, img = seed_task(pg, "wa_hcu"), "wa_hcu_a"
+    seed_catalog(pg, img, "a scene")
+    ts = seed_fix_value(pg, "wa_hcu_r", values=["1"])
+    t, admin = make_volunteer(pg), make_admin(pg)
+    pg.commit()
+    fid = _one(pg, t, SUBMIT_FIX, ("wa_hcu_r", ["2"], "corrected", ts))
+    aid = _one(pg, t, SUBMIT_ANSWER, (task, img, "loco", None, None, "sample"))
+    rows, err = _as(pg, admin, "select kind, id, current_updated_at from rat.held_list(%s)", (t,))
+    assert err is None, err
+    assert rows == [("fix", fid, ts), ("answer", aid, None)]
+
+
+def _stale_held(pg, image_no):
+    """A trainee's held fix that a volunteer then changed: (trainee, volunteer,
+    admin, held id)."""
+    ts = seed_fix_value(pg, image_no, values=["1"])
+    t, v, admin = make_volunteer(pg), make_volunteer(pg, in_training=False), make_admin(pg)
+    pg.commit()
+    pid = _one(pg, t, SUBMIT_FIX, (image_no, ["2"], "corrected", ts))
+    _review(pg, v, image_no, ["5"])
+    return t, v, admin, pid
+
+
+APPROVE_SEEN = ("select rat.approve_fix_review(%s, p_force => true, "
+                "p_seen_updated_at => %s::timestamptz)")
+
+
+def test_approve_anyway_against_seen_value(pg):
+    t, v, admin, pid = _stale_held(pg, "wa_seen")
+    seen = _held_row(pg, admin, t, pid)
+    assert seen["stale"] is True and seen["current"] == {"values": ["5"], "status": "corrected"}
+    res = _one(pg, admin, APPROVE_SEEN, ([pid], seen["current_updated_at"]))
+    assert res == {"approved": 1, "stale": [], "skipped": []}
+    assert _live(pg, "wa_seen")[:3] == (["2"], "corrected", t)
+
+
+def test_approve_anyway_changed_after_seen_is_stale(pg):
+    t, v, admin, pid = _stale_held(pg, "wa_seen2")
+    seen = _held_row(pg, admin, t, pid)["current_updated_at"]
+    _review(pg, v, "wa_seen2", ["6"])      # changed after the admin looked
+    res = _one(pg, admin, APPROVE_SEEN, ([pid], seen))
+    assert res == {"approved": 0, "skipped": [],
+                   "stale": [{"id": pid, "current_values": ["6"], "current_status": "corrected"}]}
+    assert _pending(pg, "pending_fix_review", pid)[0] == "pending"
+    assert _live(pg, "wa_seen2")[:3] == (["6"], "corrected", v)
+    # Without a seen value, force keeps today's behaviour: approve over the live row.
+    res = _one(pg, admin, APPROVE_SEEN, ([pid], None))
+    assert res == {"approved": 1, "stale": [], "skipped": []}
+    assert _live(pg, "wa_seen2")[:3] == (["2"], "corrected", t)
+
+
+def test_held_rows_cannot_be_deleted(pg):
+    task, img = seed_task(pg, "wa_nodel"), "wa_nodel_a"
+    seed_catalog(pg, img, "a scene")
+    ts = seed_fix_value(pg, "wa_nodel_r", values=["1"])
+    t, admin = make_volunteer(pg), make_admin(pg)
+    pg.commit()
+    fid = _one(pg, t, SUBMIT_FIX, ("wa_nodel_r", ["2"], "corrected", ts))
+    aid = _one(pg, t, SUBMIT_ANSWER, (task, img, "loco", None, None, "sample"))
+    for table, pid in (("pending_fix_review", fid), ("pending_model_answer", aid)):
+        for sql in (f"delete from rat.{table} where id = {pid}", f"truncate rat.{table}"):
+            with pg.cursor() as cur:
+                cur.execute("savepoint s")
+                try:
+                    with pytest.raises(psycopg2.Error) as ei:
+                        cur.execute(sql)
+                    assert ei.value.pgcode == "23001", sql
+                    assert "held work is kept: decide it, never delete it" in str(ei.value)
+                finally:
+                    cur.execute("rollback to savepoint s")
+    pg.commit()
+    # Decisions (UPDATEs) still work.
+    res = _one(pg, admin, "select rat.approve_fix_review(%s)", ([fid],))
+    assert res == {"approved": 1, "stale": [], "skipped": []}
+    res = _one(pg, admin, "select rat.reject_held('answer', %s, 'no')", ([aid],))
+    assert res == {"rejected": 1, "skipped": []}
+    assert _pending(pg, "pending_fix_review", fid)[0] == "approved"
+    assert _pending(pg, "pending_model_answer", aid) == ("rejected", admin, "no")
+
+
+def test_approve_answer_missing_photo_skipped(pg):
+    task, gone, kept = seed_task(pg, "wa_ansk"), "wa_ansk_gone", "wa_ansk_kept"
+    seed_catalog(pg, gone, "a scene")
+    seed_catalog(pg, kept, "a scene")
+    t, admin = make_volunteer(pg), make_admin(pg)
+    pg.commit()
+    p_gone = _one(pg, t, SUBMIT_ANSWER, (task, gone, "loco", None, None, "sample"))
+    p_kept = _one(pg, t, SUBMIT_ANSWER, (task, kept, "loco", None, None, "sample"))
+    with pg.cursor() as cur:
+        cur.execute("delete from rat.catalog where image_no = %s", (gone,))
+    pg.commit()
+    res = _one(pg, admin, "select rat.approve_model_answer(%s)", ([p_kept, p_gone],))
+    assert res == {"approved": 1,
+                   "skipped": [{"id": p_gone, "reason": f"no catalog photo {gone}"}]}
+    assert _pending(pg, "pending_model_answer", p_gone)[0] == "pending"
+    assert _pending(pg, "pending_model_answer", p_kept)[:2] == ("approved", admin)
+    with pg.cursor() as cur:
+        cur.execute("select image_no from rat.model_answer where task_id = %s", (task,))
+        assert cur.fetchall() == [(kept,)]
+
+
+def test_approve_fix_unexpected_error_skipped(pg):
+    """approve_fix_review's WHEN OTHERS: any other error in one item becomes a
+    'skipped' entry with the message. No schema path raises one today, so a
+    test-only trigger on data_fix_value raises for one image_no."""
+    ts1 = seed_fix_value(pg, "wa_boom", values=["1"])
+    ts2 = seed_fix_value(pg, "wa_fine", values=["1"])
+    t, admin = make_volunteer(pg), make_admin(pg)
+    pg.commit()
+    p1 = _one(pg, t, SUBMIT_FIX, ("wa_boom", ["2"], "corrected", ts1))
+    p2 = _one(pg, t, SUBMIT_FIX, ("wa_fine", ["3"], "corrected", ts2))
+    with pg.cursor() as cur:
+        cur.execute("create function public.wa_boom() returns trigger language plpgsql as $$ "
+                    "begin if new.image_no = 'wa_boom' then raise exception 'boom'; end if; "
+                    "return new; end $$")
+        cur.execute("create trigger wa_boom before update on rat.data_fix_value "
+                    "for each row execute function public.wa_boom()")
+    pg.commit()
+    try:
+        res = _one(pg, admin, "select rat.approve_fix_review(%s)", ([p1, p2],))
+    finally:
+        with pg.cursor() as cur:
+            cur.execute("drop trigger wa_boom on rat.data_fix_value")
+            cur.execute("drop function public.wa_boom()")
+        pg.commit()
+    assert res == {"approved": 1, "stale": [], "skipped": [{"id": p1, "reason": "boom"}]}
+    assert _pending(pg, "pending_fix_review", p1)[0] == "pending"
+    assert _live(pg, "wa_boom")[:2] == (["1"], "extracted")
+    assert _live(pg, "wa_fine")[:3] == (["3"], "corrected", t)
+
+
+def test_withdraw_legacy_match_ignores_fill_of_another_answer(pg):
+    """The legacy match only takes fills with no model_answer_id: a fill that
+    matches by image_no / changed_by / changed_at but belongs to another
+    answer is left alone."""
+    task, img = seed_task(pg, "wa_leg", links=LINKS), "wa_leg"
+    _linked_photo(pg, img)
+    u, admin = make_user(pg), make_admin(pg)
+    pg.commit()
+    with pg.cursor() as cur:
+        cur.execute("insert into rat.model_answer (task_id, image_no, answer, mode, answered_by) "
+                    "values (%s, %s, 'station', 'sample', %s) returning id", (task, img, u))
+        legacy = cur.fetchone()[0]
+        cur.execute("insert into rat.model_answer (task_id, image_no, answer, mode, answered_by) "
+                    "values (%s, %s, 'station', 'sample', %s) returning id", (task, img, u))
+        other = cur.fetchone()[0]
+        for k, val in (("review_context", "on"), ("review_source", "model_check"),
+                       ("acting_for", u), ("model_answer_id", str(other))):
+            cur.execute("select set_config(%s, %s, true)", (f"rat.{k}", val))
+        cur.execute("""update rat.data_fix_value set "values" = '{}', status = 'no_loco' """
+                    "where image_no = %s", (img,))
+        cur.execute("select count(*) from rat.data_fix_history where image_no = %s "
+                    "and model_answer_id = %s", (img, other))
+        assert cur.fetchone()[0] == 2
+    pg.commit()
+    res = _one(pg, admin, WITHDRAW, ([legacy], None))
+    assert res == {"withdrawn": 1, "skipped": [], "fills_left": []}
+    for fix_id in LINKS["fix_ids"]:
+        assert _live(pg, img, fix_id)[:2] == ([], "no_loco")
+        assert _last_hist(pg, img, fix_id)[1] == "model_check"
+
+
+def _hist_at(pg, hid):
+    with pg.cursor() as cur:
+        cur.execute("select changed_at from rat.data_fix_history where id = %s", (hid,))
+        return cur.fetchone()[0]
+
+
+def test_undo_restored_reviewer_skips_undo_and_undone_rows(pg):
+    # alice R1, bob R2, admin undoes R2, carol R3, undo R3: alice's value is
+    # back, so alice (not the admin who undid R2, nor bob) is the reviewer.
+    seed_fix_value(pg, "wa_rev", values=["1"])
+    alice, bob, carol = (make_volunteer(pg, in_training=False) for _ in range(3))
+    admin = make_admin(pg)
+    pg.commit()
+    r1 = _review(pg, alice, "wa_rev", ["2"])
+    r2 = _review(pg, bob, "wa_rev", ["3"])
+    assert _one(pg, admin, UNDO, ([r2],))["undone"] == 1
+    assert _flags(pg, "wa_rev")[2] == alice
+    r3 = _review(pg, carol, "wa_rev", ["4"])
+    res = _one(pg, admin, UNDO, ([r3],))
+    assert res == {"undone": 1, "changed_since": [], "skipped": []}
+    assert _live(pg, "wa_rev")[:2] == (["2"], "corrected")
+    _, _, reviewed_by, reviewed_at = _flags(pg, "wa_rev")
+    assert (reviewed_by, reviewed_at) == (alice, _hist_at(pg, r1))
+
+
+def test_undo_restored_reviewer_after_reapply(pg):
+    # alice R1, bob R2, undo R2 (U1), undo U1 (re-applies R2), carol R3, undo
+    # R3: bob's value is back, so bob is the reviewer.
+    seed_fix_value(pg, "wa_rev2", values=["1"])
+    alice, bob, carol = (make_volunteer(pg, in_training=False) for _ in range(3))
+    admin = make_admin(pg)
+    pg.commit()
+    _review(pg, alice, "wa_rev2", ["2"])
+    r2 = _review(pg, bob, "wa_rev2", ["3"])
+    _one(pg, admin, UNDO, ([r2],))
+    u1 = _last_hist(pg, "wa_rev2")[0]
+    _one(pg, admin, UNDO, ([u1],))
+    r3 = _review(pg, carol, "wa_rev2", ["4"])
+    assert _one(pg, admin, UNDO, ([r3],))["undone"] == 1
+    assert _live(pg, "wa_rev2")[:2] == (["3"], "corrected")
+    _, _, reviewed_by, reviewed_at = _flags(pg, "wa_rev2")
+    assert (reviewed_by, reviewed_at) == (bob, _hist_at(pg, r2))
