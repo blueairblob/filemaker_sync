@@ -1545,6 +1545,14 @@ COMMIT;
 -- (approver, undo links, answer link, old flags) and the history source
 -- CHECK gains 'undo'.
 --
+-- Held work (fourth section): a trainee's reviews and answers go into
+-- rat.pending_fix_review / rat.pending_model_answer (RLS on, no policy, no
+-- table grants) through submit_fix_review / submit_fix_confirm /
+-- submit_model_answer. An admin applies them through the same internal write
+-- path with approve_fix_review / approve_model_answer, or turns them down
+-- with reject_held; held_list and my_held list them. A trainee's own pending
+-- keys drop out of their own queues.
+--
 -- Apply to live AFTER add_model_check_tables.sql (the user applies it; agents
 -- never run DDL on live oci). Requires rat.is_admin() / rat.admin_user and
 -- auth.users / auth.uid().
@@ -1745,7 +1753,9 @@ BEGIN
 END;
 $$;
 
--- held_count is a placeholder (0) until a later task redefines people().
+-- held_count: the user's pending rows in rat.pending_fix_review and
+-- rat.pending_model_answer (both created in the held-work section below;
+-- plpgsql resolves them when it runs).
 CREATE OR REPLACE FUNCTION rat.people()
 RETURNS TABLE (user_id uuid, email text, role text, in_training boolean,
                added_at timestamptz, removed_at timestamptz, held_count bigint)
@@ -1756,15 +1766,26 @@ BEGIN
     RAISE EXCEPTION 'not a data fixes admin' USING ERRCODE = '42501';
   END IF;
   RETURN QUERY
+    WITH held AS (
+      SELECT f.submitted_by AS uid, count(*) AS n
+        FROM rat.pending_fix_review f WHERE f.decision = 'pending' GROUP BY f.submitted_by
+      UNION ALL
+      SELECT m.submitted_by, count(*)
+        FROM rat.pending_model_answer m WHERE m.decision = 'pending' GROUP BY m.submitted_by
+    ), held_by AS (
+      SELECT h.uid, sum(h.n)::bigint AS n FROM held h GROUP BY h.uid
+    )
     SELECT a.user_id, u.email::text, 'admin'::text, NULL::boolean,
-           NULL::timestamptz, NULL::timestamptz, 0::bigint
+           NULL::timestamptz, NULL::timestamptz, coalesce(hb.n, 0)::bigint
       FROM rat.admin_user a
       LEFT JOIN auth.users u ON u.id = a.user_id
+      LEFT JOIN held_by hb ON hb.uid = a.user_id
     UNION ALL
     SELECT v.user_id, u.email::text, 'volunteer'::text, v.in_training,
-           v.added_at, v.removed_at, 0::bigint
+           v.added_at, v.removed_at, coalesce(hb.n, 0)::bigint
       FROM rat.volunteer v
-      LEFT JOIN auth.users u ON u.id = v.user_id;
+      LEFT JOIN auth.users u ON u.id = v.user_id
+      LEFT JOIN held_by hb ON hb.uid = v.user_id;
 END;
 $$;
 
@@ -2002,6 +2023,57 @@ BEGIN
 END;
 $$;
 
+-- The checks every Model check answer passes, direct or held: task exists
+-- (P0002), mode (22023), answer is one of the task's (22023), a sample answer
+-- is blind and any other names a run of the task (22023), photo exists
+-- (P0002). Internal: no EXECUTE for authenticated; called by
+-- _apply_model_answer and submit_model_answer.
+CREATE OR REPLACE FUNCTION rat._validate_model_answer(
+  p_task_id text,
+  p_image_no text,
+  p_answer text,
+  p_shown_run_id bigint,
+  p_shown_answer text,
+  p_mode text
+)
+RETURNS void
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  v_task rat.model_task;
+BEGIN
+  SELECT t.* INTO v_task FROM rat.model_task t WHERE t.id = p_task_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'no model task %', p_task_id USING ERRCODE = 'P0002';
+  END IF;
+  IF p_mode IS NULL OR p_mode NOT IN ('sure', 'unsure', 'sample') THEN
+    RAISE EXCEPTION 'invalid mode: %', p_mode USING ERRCODE = '22023';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM jsonb_array_elements(v_task.answers) AS e
+                  WHERE e ->> 'id' = p_answer) THEN
+    RAISE EXCEPTION 'answer % is not an answer of task %', p_answer, p_task_id
+      USING ERRCODE = '22023';
+  END IF;
+  IF p_mode = 'sample' THEN
+    IF p_shown_run_id IS NOT NULL OR p_shown_answer IS NOT NULL THEN
+      RAISE EXCEPTION 'a random-sample answer is blind: nothing may be shown'
+        USING ERRCODE = '22023';
+    END IF;
+  ELSIF p_shown_run_id IS NULL
+        OR NOT EXISTS (SELECT 1 FROM rat.model_run r
+                        WHERE r.id = p_shown_run_id AND r.task_id = p_task_id) THEN
+    RAISE EXCEPTION 'mode % needs the shown run of task %', p_mode, p_task_id
+      USING ERRCODE = '22023';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM rat.catalog c WHERE c.image_no = p_image_no) THEN
+    RAISE EXCEPTION 'no catalog photo %', p_image_no USING ERRCODE = 'P0002';
+  END IF;
+END;
+$$;
+
 -- The one write path for a Model check answer: save_model_answer's former
 -- body, with the author (p_by), approver and answer time passed in. The
 -- Data Fixes fill records the answer id in history. Internal: no EXECUTE for
@@ -2033,35 +2105,13 @@ DECLARE
   v_filled text[] := '{}';
   v_conflicts jsonb := '[]'::jsonb;
 BEGIN
+  PERFORM rat._validate_model_answer(p_task_id, p_image_no, p_answer, p_shown_run_id,
+                                     p_shown_answer, p_mode);
   SELECT t.* INTO v_task FROM rat.model_task t WHERE t.id = p_task_id;
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'no model task %', p_task_id USING ERRCODE = 'P0002';
-  END IF;
-  IF p_mode IS NULL OR p_mode NOT IN ('sure', 'unsure', 'sample') THEN
-    RAISE EXCEPTION 'invalid mode: %', p_mode USING ERRCODE = '22023';
-  END IF;
   SELECT e INTO v_answer
     FROM jsonb_array_elements(v_task.answers) AS e
    WHERE e ->> 'id' = p_answer
    LIMIT 1;
-  IF v_answer IS NULL THEN
-    RAISE EXCEPTION 'answer % is not an answer of task %', p_answer, p_task_id
-      USING ERRCODE = '22023';
-  END IF;
-  IF p_mode = 'sample' THEN
-    IF p_shown_run_id IS NOT NULL OR p_shown_answer IS NOT NULL THEN
-      RAISE EXCEPTION 'a random-sample answer is blind: nothing may be shown'
-        USING ERRCODE = '22023';
-    END IF;
-  ELSIF p_shown_run_id IS NULL
-        OR NOT EXISTS (SELECT 1 FROM rat.model_run r
-                        WHERE r.id = p_shown_run_id AND r.task_id = p_task_id) THEN
-    RAISE EXCEPTION 'mode % needs the shown run of task %', p_mode, p_task_id
-      USING ERRCODE = '22023';
-  END IF;
-  IF NOT EXISTS (SELECT 1 FROM rat.catalog c WHERE c.image_no = p_image_no) THEN
-    RAISE EXCEPTION 'no catalog photo %', p_image_no USING ERRCODE = 'P0002';
-  END IF;
 
   INSERT INTO rat.model_answer
     (task_id, image_no, answer, shown_run_id, shown_answer, mode, answered_by,
@@ -2253,6 +2303,10 @@ BEGIN
        AND (p_collection IS NULL OR col.name = p_collection)
        AND (p_text IS NULL OR c.description ILIKE '%' || p_text || '%' OR v.image_no ILIKE p_text)
        AND v.image_no > coalesce(p_after, '')
+       -- A trainee's own held review keeps the photo out of their queue.
+       AND NOT EXISTS (SELECT 1 FROM rat.pending_fix_review h
+                        WHERE h.submitted_by = auth.uid() AND h.image_no = v.image_no
+                          AND h.fix_id = v.fix_id AND h.decision = 'pending')
      ORDER BY v.image_no
      LIMIT least(greatest(coalesce(p_limit, 25), 1), 500);
 END;
@@ -2371,6 +2425,10 @@ BEGIN
          AND NOT EXISTS (SELECT 1 FROM rat.model_answer_live a
                           WHERE a.task_id = p_task_id AND a.image_no = c.image_no
                             AND a.mode = 'sample')
+         AND NOT EXISTS (SELECT 1 FROM rat.pending_model_answer h
+                          WHERE h.submitted_by = auth.uid() AND h.task_id = p_task_id
+                            AND h.image_no = c.image_no AND h.mode = 'sample'
+                            AND h.decision = 'pending')
        ORDER BY md5(c.image_no::text)
        LIMIT v_limit;
   ELSE
@@ -2399,6 +2457,10 @@ BEGIN
          AND pr.image_no > coalesce(p_after, '')
          AND NOT EXISTS (SELECT 1 FROM rat.model_answer_live a
                           WHERE a.task_id = p_task_id AND a.image_no = pr.image_no)
+         AND NOT EXISTS (SELECT 1 FROM rat.pending_model_answer h
+                          WHERE h.submitted_by = auth.uid() AND h.task_id = p_task_id
+                            AND h.image_no = pr.image_no AND h.mode = p_mode
+                            AND h.decision = 'pending')
        ORDER BY pr.image_no
        LIMIT v_limit;
   END IF;
@@ -2678,6 +2740,482 @@ GRANT EXECUTE ON FUNCTION
   rat.data_fix_queue(text, text[], text[], boolean, text, text, text, integer),
   rat.model_check_queue(text, text, bigint, text, text, text, integer),
   rat.model_check_progress()
+  TO authenticated;
+
+-- ===========================================================================
+-- Held work (fourth section): a trainee's reviews and answers wait here until
+-- an admin approves (applied through _apply_fix_review / _apply_model_answer,
+-- author = the trainee, approver = the admin) or rejects them. A held row is a
+-- record: it is never deleted, only decided. Nothing in this section writes
+-- rat.model_answer or rat.data_fix_value except through the write path.
+-- ===========================================================================
+
+CREATE TABLE IF NOT EXISTS rat.pending_fix_review (
+  id bigserial PRIMARY KEY,
+  image_no text NOT NULL,
+  fix_id text NOT NULL REFERENCES rat.data_fix(id),
+  "values" text[] NOT NULL,
+  status text NOT NULL CHECK (status IN ('verified', 'corrected', 'none_visible', 'no_loco')),
+  base_updated_at timestamptz NOT NULL,
+  base_values text[],
+  base_status text,
+  submitted_by uuid NOT NULL,
+  submitted_at timestamptz NOT NULL DEFAULT now(),
+  decision text NOT NULL DEFAULT 'pending'
+    CHECK (decision IN ('pending', 'approved', 'rejected', 'withdrawn')),
+  decided_by uuid,
+  decided_at timestamptz,
+  note text
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS pending_fix_review_one_pending_idx
+  ON rat.pending_fix_review (submitted_by, image_no, fix_id) WHERE decision = 'pending';
+
+CREATE TABLE IF NOT EXISTS rat.pending_model_answer (
+  id bigserial PRIMARY KEY,
+  task_id text NOT NULL REFERENCES rat.model_task(id),
+  image_no text NOT NULL,
+  answer text NOT NULL,
+  shown_run_id bigint REFERENCES rat.model_run(id),
+  shown_answer text,
+  mode text NOT NULL CHECK (mode IN ('sure', 'unsure', 'sample')),
+  submitted_by uuid NOT NULL,
+  submitted_at timestamptz NOT NULL DEFAULT now(),
+  decision text NOT NULL DEFAULT 'pending'
+    CHECK (decision IN ('pending', 'approved', 'rejected', 'withdrawn')),
+  decided_by uuid,
+  decided_at timestamptz,
+  note text,
+  -- A blind sample answer must not record what the model said (as model_answer).
+  CHECK (mode <> 'sample' OR (shown_run_id IS NULL AND shown_answer IS NULL))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS pending_model_answer_one_pending_idx
+  ON rat.pending_model_answer (submitted_by, task_id, image_no, mode)
+  WHERE decision = 'pending';
+
+ALTER TABLE rat.pending_fix_review ENABLE ROW LEVEL SECURITY;
+ALTER TABLE rat.pending_model_answer ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON rat.pending_fix_review, rat.pending_model_answer
+  FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON SEQUENCE rat.pending_fix_review_id_seq, rat.pending_model_answer_id_seq
+  FROM PUBLIC, anon, authenticated;
+
+-- Submit (trainee only). Validation matches review_fix_value: status list
+-- (22023), row exists (P0002), row unchanged since loaded (PT409). A
+-- re-submit of the same key withdraws the caller's pending row first.
+CREATE OR REPLACE FUNCTION rat.submit_fix_review(
+  p_image_no text,
+  p_fix_id text,
+  p_values text[],
+  p_status text,
+  p_expected_updated_at timestamptz
+)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  v_live rat.data_fix_value;
+  v_id bigint;
+BEGIN
+  IF NOT rat.is_trainee() THEN
+    RAISE EXCEPTION 'only a volunteer in training submits work for approval'
+      USING ERRCODE = '42501';
+  END IF;
+  IF p_status IS NULL
+     OR p_status NOT IN ('verified', 'corrected', 'none_visible', 'no_loco') THEN
+    RAISE EXCEPTION 'invalid review status: %', p_status USING ERRCODE = '22023';
+  END IF;
+  SELECT v.* INTO v_live FROM rat.data_fix_value v
+   WHERE v.image_no = p_image_no AND v.fix_id = p_fix_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'no data_fix_value for image_no=% fix_id=%', p_image_no, p_fix_id
+      USING ERRCODE = 'P0002';
+  END IF;
+  IF v_live.updated_at IS DISTINCT FROM p_expected_updated_at THEN
+    RAISE EXCEPTION 'record changed since it was loaded' USING ERRCODE = 'PT409';
+  END IF;
+
+  UPDATE rat.pending_fix_review h
+     SET decision = 'withdrawn', decided_by = auth.uid(), decided_at = now()
+   WHERE h.submitted_by = auth.uid() AND h.image_no = p_image_no
+     AND h.fix_id = p_fix_id AND h.decision = 'pending';
+  INSERT INTO rat.pending_fix_review
+    (image_no, fix_id, "values", status, base_updated_at, base_values, base_status,
+     submitted_by)
+  VALUES (p_image_no, p_fix_id,
+          CASE WHEN p_status IN ('none_visible', 'no_loco') THEN '{}'::text[]
+               ELSE coalesce(p_values, '{}'::text[]) END,
+          p_status, v_live.updated_at, v_live."values", v_live.status, auth.uid())
+  RETURNING id INTO v_id;
+  RETURN v_id;
+END;
+$$;
+
+-- Mirrors confirm_fix_values: one held 'verified' row (values = the
+-- suggestion) per item whose row is still 'extracted' and unchanged. Stale or
+-- reviewed items are simply not counted.
+CREATE OR REPLACE FUNCTION rat.submit_fix_confirm(p_fix_id text, p_items jsonb)
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  r record;
+  v_count integer := 0;
+BEGIN
+  IF NOT rat.is_trainee() THEN
+    RAISE EXCEPTION 'only a volunteer in training submits work for approval'
+      USING ERRCODE = '42501';
+  END IF;
+  FOR r IN
+    SELECT v.image_no, v.updated_at, v."values", v.status, v.suggested_values
+      FROM rat.data_fix_value v
+      JOIN (SELECT DISTINCT i.image_no, i.updated_at
+              FROM pg_catalog.jsonb_to_recordset(coalesce(p_items, '[]'::jsonb))
+                   AS i(image_no text, updated_at timestamptz)) AS item
+        ON v.image_no = item.image_no AND v.updated_at = item.updated_at
+     WHERE v.fix_id = p_fix_id AND v.status = 'extracted'
+     ORDER BY v.image_no
+  LOOP
+    UPDATE rat.pending_fix_review h
+       SET decision = 'withdrawn', decided_by = auth.uid(), decided_at = now()
+     WHERE h.submitted_by = auth.uid() AND h.image_no = r.image_no
+       AND h.fix_id = p_fix_id AND h.decision = 'pending';
+    INSERT INTO rat.pending_fix_review
+      (image_no, fix_id, "values", status, base_updated_at, base_values, base_status,
+       submitted_by)
+    VALUES (r.image_no, p_fix_id, r.suggested_values, 'verified', r.updated_at,
+            r."values", r.status, auth.uid());
+    v_count := v_count + 1;
+  END LOOP;
+  RETURN v_count;
+END;
+$$;
+
+-- Validation matches save_model_answer (rat._validate_model_answer).
+CREATE OR REPLACE FUNCTION rat.submit_model_answer(
+  p_task_id text,
+  p_image_no text,
+  p_answer text,
+  p_shown_run_id bigint,
+  p_shown_answer text,
+  p_mode text
+)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  v_id bigint;
+BEGIN
+  IF NOT rat.is_trainee() THEN
+    RAISE EXCEPTION 'only a volunteer in training submits work for approval'
+      USING ERRCODE = '42501';
+  END IF;
+  PERFORM rat._validate_model_answer(p_task_id, p_image_no, p_answer, p_shown_run_id,
+                                     p_shown_answer, p_mode);
+  UPDATE rat.pending_model_answer h
+     SET decision = 'withdrawn', decided_by = auth.uid(), decided_at = now()
+   WHERE h.submitted_by = auth.uid() AND h.task_id = p_task_id
+     AND h.image_no = p_image_no AND h.mode = p_mode AND h.decision = 'pending';
+  INSERT INTO rat.pending_model_answer
+    (task_id, image_no, answer, shown_run_id, shown_answer, mode, submitted_by)
+  VALUES (p_task_id, p_image_no, p_answer, p_shown_run_id, p_shown_answer, p_mode,
+          auth.uid())
+  RETURNING id INTO v_id;
+  RETURN v_id;
+END;
+$$;
+
+-- Admin decisions. Each id is handled on its own, in id order, inside its own
+-- subtransaction: an error in one item becomes a 'skipped' (or 'stale') entry
+-- and never fails the call or the other items.
+CREATE OR REPLACE FUNCTION rat.approve_fix_review(p_ids bigint[], p_force boolean DEFAULT false)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  v_id bigint;
+  r rat.pending_fix_review;
+  v_live rat.data_fix_value;
+  v_expected timestamptz;
+  v_approved integer := 0;
+  v_stale jsonb := '[]'::jsonb;
+  v_skipped jsonb := '[]'::jsonb;
+BEGIN
+  IF NOT rat.is_admin() THEN
+    RAISE EXCEPTION 'not a data fixes admin' USING ERRCODE = '42501';
+  END IF;
+  FOR v_id IN SELECT DISTINCT x FROM unnest(coalesce(p_ids, '{}'::bigint[])) AS x
+               WHERE x IS NOT NULL ORDER BY x
+  LOOP
+    BEGIN
+      SELECT h.* INTO r FROM rat.pending_fix_review h WHERE h.id = v_id FOR UPDATE;
+      IF NOT FOUND OR r.decision <> 'pending' THEN
+        v_skipped := v_skipped || jsonb_build_object('id', v_id, 'reason', 'not pending');
+      ELSE
+        IF coalesce(p_force, false) THEN
+          -- The admin saw the current value: approve over it.
+          SELECT v.updated_at INTO v_expected FROM rat.data_fix_value v
+           WHERE v.image_no = r.image_no AND v.fix_id = r.fix_id;
+        ELSE
+          v_expected := r.base_updated_at;
+        END IF;
+        PERFORM rat._apply_fix_review(r.image_no, r.fix_id, r."values", r.status,
+                                      v_expected, r.submitted_by, auth.uid());
+        UPDATE rat.pending_fix_review h
+           SET decision = 'approved', decided_by = auth.uid(), decided_at = now()
+         WHERE h.id = v_id;
+        v_approved := v_approved + 1;
+      END IF;
+    EXCEPTION
+      WHEN SQLSTATE 'PT409' THEN
+        SELECT v.* INTO v_live FROM rat.data_fix_value v
+         WHERE v.image_no = r.image_no AND v.fix_id = r.fix_id;
+        v_stale := v_stale || jsonb_build_object('id', v_id,
+                                                 'current_values', to_jsonb(v_live."values"),
+                                                 'current_status', v_live.status);
+      WHEN no_data_found THEN
+        v_skipped := v_skipped || jsonb_build_object('id', v_id, 'reason', 'no data_fix_value');
+      WHEN OTHERS THEN
+        v_skipped := v_skipped || jsonb_build_object('id', v_id, 'reason', SQLERRM);
+    END;
+  END LOOP;
+  RETURN jsonb_build_object('approved', v_approved, 'stale', v_stale, 'skipped', v_skipped);
+END;
+$$;
+
+-- Answers are never stale: a later answer simply becomes the latest.
+CREATE OR REPLACE FUNCTION rat.approve_model_answer(p_ids bigint[])
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  v_id bigint;
+  r rat.pending_model_answer;
+  v_approved integer := 0;
+  v_skipped jsonb := '[]'::jsonb;
+BEGIN
+  IF NOT rat.is_admin() THEN
+    RAISE EXCEPTION 'not a data fixes admin' USING ERRCODE = '42501';
+  END IF;
+  FOR v_id IN SELECT DISTINCT x FROM unnest(coalesce(p_ids, '{}'::bigint[])) AS x
+               WHERE x IS NOT NULL ORDER BY x
+  LOOP
+    BEGIN
+      SELECT h.* INTO r FROM rat.pending_model_answer h WHERE h.id = v_id FOR UPDATE;
+      IF NOT FOUND OR r.decision <> 'pending' THEN
+        v_skipped := v_skipped || jsonb_build_object('id', v_id, 'reason', 'not pending');
+      ELSE
+        PERFORM rat._apply_model_answer(r.task_id, r.image_no, r.answer, r.shown_run_id,
+                                        r.shown_answer, r.mode, r.submitted_by, auth.uid(),
+                                        r.submitted_at);
+        UPDATE rat.pending_model_answer h
+           SET decision = 'approved', decided_by = auth.uid(), decided_at = now()
+         WHERE h.id = v_id;
+        v_approved := v_approved + 1;
+      END IF;
+    EXCEPTION
+      WHEN OTHERS THEN
+        v_skipped := v_skipped || jsonb_build_object('id', v_id, 'reason', SQLERRM);
+    END;
+  END LOOP;
+  RETURN jsonb_build_object('approved', v_approved, 'skipped', v_skipped);
+END;
+$$;
+
+-- Nothing reaches the real tables. A rejection is final (no undo).
+CREATE OR REPLACE FUNCTION rat.reject_held(p_kind text, p_ids bigint[], p_note text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  v_id bigint;
+  v_decision text;
+  v_rejected integer := 0;
+  v_skipped jsonb := '[]'::jsonb;
+BEGIN
+  IF NOT rat.is_admin() THEN
+    RAISE EXCEPTION 'not a data fixes admin' USING ERRCODE = '42501';
+  END IF;
+  IF p_kind IS NULL OR p_kind NOT IN ('fix', 'answer') THEN
+    RAISE EXCEPTION 'invalid held kind: %', p_kind USING ERRCODE = '22023';
+  END IF;
+  FOR v_id IN SELECT DISTINCT x FROM unnest(coalesce(p_ids, '{}'::bigint[])) AS x
+               WHERE x IS NOT NULL ORDER BY x
+  LOOP
+    BEGIN
+      v_decision := NULL;
+      IF p_kind = 'fix' THEN
+        SELECT h.decision INTO v_decision FROM rat.pending_fix_review h
+         WHERE h.id = v_id FOR UPDATE;
+      ELSE
+        SELECT h.decision INTO v_decision FROM rat.pending_model_answer h
+         WHERE h.id = v_id FOR UPDATE;
+      END IF;
+      IF v_decision IS DISTINCT FROM 'pending' THEN
+        v_skipped := v_skipped || jsonb_build_object('id', v_id, 'reason', 'not pending');
+      ELSE
+        IF p_kind = 'fix' THEN
+          UPDATE rat.pending_fix_review h
+             SET decision = 'rejected', decided_by = auth.uid(), decided_at = now(),
+                 note = p_note
+           WHERE h.id = v_id;
+        ELSE
+          UPDATE rat.pending_model_answer h
+             SET decision = 'rejected', decided_by = auth.uid(), decided_at = now(),
+                 note = p_note
+           WHERE h.id = v_id;
+        END IF;
+        v_rejected := v_rejected + 1;
+      END IF;
+    EXCEPTION
+      WHEN OTHERS THEN
+        v_skipped := v_skipped || jsonb_build_object('id', v_id, 'reason', SQLERRM);
+    END;
+  END LOOP;
+  RETURN jsonb_build_object('rejected', v_rejected, 'skipped', v_skipped);
+END;
+$$;
+
+-- Admin: every pending row (or one user's), oldest first. A fix is stale when
+-- its live row changed (or vanished) since the trainee loaded it.
+CREATE OR REPLACE FUNCTION rat.held_list(p_user uuid DEFAULT NULL)
+RETURNS TABLE (
+  kind text,
+  id bigint,
+  submitted_by uuid,
+  submitted_at timestamptz,
+  image_no text,
+  description text,
+  subject text,
+  before jsonb,
+  proposed jsonb,
+  current jsonb,
+  stale boolean
+)
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+BEGIN
+  IF NOT rat.is_admin() THEN
+    RAISE EXCEPTION 'not a data fixes admin' USING ERRCODE = '42501';
+  END IF;
+  RETURN QUERY
+    SELECT hl.k, hl.hid, hl.sb, hl.sa, hl.img, hl.descr, hl.subj, hl.bef, hl.prop,
+           hl.cur, hl.st
+      FROM (
+        SELECT 'fix'::text AS k, f.id AS hid, f.submitted_by AS sb, f.submitted_at AS sa,
+               f.image_no AS img, c.description AS descr, d.title AS subj,
+               jsonb_build_object('values', to_jsonb(f.base_values), 'status', f.base_status) AS bef,
+               jsonb_build_object('values', to_jsonb(f."values"), 'status', f.status) AS prop,
+               CASE WHEN v.image_no IS NULL THEN NULL::jsonb
+                    ELSE jsonb_build_object('values', to_jsonb(v."values"), 'status', v.status)
+               END AS cur,
+               (v.updated_at IS DISTINCT FROM f.base_updated_at) AS st
+          FROM rat.pending_fix_review f
+          LEFT JOIN rat.data_fix_value v ON v.image_no = f.image_no AND v.fix_id = f.fix_id
+          LEFT JOIN rat.catalog c ON c.image_no = f.image_no
+          LEFT JOIN rat.data_fix d ON d.id = f.fix_id
+         WHERE f.decision = 'pending' AND (p_user IS NULL OR f.submitted_by = p_user)
+        UNION ALL
+        SELECT 'answer'::text, m.id, m.submitted_by, m.submitted_at,
+               m.image_no, c.description, t.question,
+               jsonb_build_object('shown_answer', m.shown_answer),
+               jsonb_build_object('answer', m.answer, 'mode', m.mode),
+               NULL::jsonb, false
+          FROM rat.pending_model_answer m
+          LEFT JOIN rat.catalog c ON c.image_no = m.image_no
+          LEFT JOIN rat.model_task t ON t.id = m.task_id
+         WHERE m.decision = 'pending' AND (p_user IS NULL OR m.submitted_by = p_user)
+      ) hl
+     ORDER BY hl.sa, hl.k DESC, hl.hid;
+END;
+$$;
+
+-- Any signed-in caller: their own pending and rejected rows, newest first.
+CREATE OR REPLACE FUNCTION rat.my_held()
+RETURNS TABLE (
+  kind text,
+  id bigint,
+  image_no text,
+  subject text,
+  proposed jsonb,
+  decision text,
+  decided_at timestamptz,
+  note text
+)
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+BEGIN
+  RETURN QUERY
+    SELECT hl.k, hl.hid, hl.img, hl.subj, hl.prop, hl.dec, hl.dat, hl.nt
+      FROM (
+        SELECT 'fix'::text AS k, f.id AS hid, f.image_no AS img, d.title AS subj,
+               jsonb_build_object('values', to_jsonb(f."values"), 'status', f.status) AS prop,
+               f.decision AS dec, f.decided_at AS dat, f.note AS nt, f.submitted_at AS sa
+          FROM rat.pending_fix_review f
+          LEFT JOIN rat.data_fix d ON d.id = f.fix_id
+         WHERE f.submitted_by = auth.uid() AND f.decision IN ('pending', 'rejected')
+        UNION ALL
+        SELECT 'answer'::text, m.id, m.image_no, t.question,
+               jsonb_build_object('answer', m.answer, 'mode', m.mode),
+               m.decision, m.decided_at, m.note, m.submitted_at
+          FROM rat.pending_model_answer m
+          LEFT JOIN rat.model_task t ON t.id = m.task_id
+         WHERE m.submitted_by = auth.uid() AND m.decision IN ('pending', 'rejected')
+      ) hl
+     ORDER BY hl.sa DESC, hl.k, hl.hid DESC;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION
+  rat._validate_model_answer(text, text, text, bigint, text, text)
+  FROM PUBLIC, anon, authenticated;
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'picaloco_agent') THEN
+    REVOKE ALL ON FUNCTION
+      rat._validate_model_answer(text, text, text, bigint, text, text)
+      FROM picaloco_agent;
+  END IF;
+END $$;
+
+REVOKE EXECUTE ON FUNCTION
+  rat.submit_fix_review(text, text, text[], text, timestamptz),
+  rat.submit_fix_confirm(text, jsonb),
+  rat.submit_model_answer(text, text, text, bigint, text, text),
+  rat.approve_fix_review(bigint[], boolean),
+  rat.approve_model_answer(bigint[]),
+  rat.reject_held(text, bigint[], text),
+  rat.held_list(uuid),
+  rat.my_held()
+  FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION
+  rat.submit_fix_review(text, text, text[], text, timestamptz),
+  rat.submit_fix_confirm(text, jsonb),
+  rat.submit_model_answer(text, text, text, bigint, text, text),
+  rat.approve_fix_review(bigint[], boolean),
+  rat.approve_model_answer(bigint[]),
+  rat.reject_held(text, bigint[], text),
+  rat.held_list(uuid),
+  rat.my_held()
   TO authenticated;
 
 COMMIT;

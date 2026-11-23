@@ -601,3 +601,399 @@ def test_withdrawal_objects_closed(pg):
                     "(values ('anon'), ('authenticated')) a(r), "
                     "(values ('rat.model_answer_live'), ('rat.model_answer_withdrawal')) b(t)")
         assert [x[0] for x in cur.fetchall()] == [False] * 4
+
+
+# --------------------------------------------------------------------------
+# Task 4: held work (trainees submit, an admin approves or rejects)
+# --------------------------------------------------------------------------
+
+SUBMIT_FIX = "select rat.submit_fix_review(%s, 'loco_number', %s, %s, %s)"
+SUBMIT_ANSWER = "select rat.submit_model_answer(%s, %s, %s, %s, %s, %s)"
+
+
+def _one(pg, uid, sql, args=()):
+    """Run sql as uid (must succeed); return the first column of the first row."""
+    rows, err = _as(pg, uid, sql, args)
+    assert err is None, err
+    return rows[0][0]
+
+
+def _pending(pg, table, pid):
+    with pg.cursor() as cur:
+        cur.execute(f"select decision, decided_by::text, note from rat.{table} where id = %s",
+                    (pid,))
+        return cur.fetchone()
+
+
+def _live(pg, image_no, fix_id="loco_number"):
+    with pg.cursor() as cur:
+        cur.execute('select "values", status, reviewed_by::text, updated_at '
+                    "from rat.data_fix_value where image_no = %s and fix_id = %s",
+                    (image_no, fix_id))
+        return cur.fetchone()
+
+
+def _linked_photo(pg, img, description="A station scene"):
+    seed_catalog(pg, img, description)
+    for fix_id in LINKS["fix_ids"]:
+        seed_fix_value(pg, img, fix_id, confidence="none")
+
+
+def test_submit_trainee_only(pg):
+    task = seed_task(pg, "t4_only")
+    seed_catalog(pg, "v4o_a", "a scene")
+    ts = seed_fix_value(pg, "v4o_r", values=["1"])
+    users = {who: _make(pg, who) for who in ("admin", "volunteer", "removed", "stranger", "trainee")}
+    pg.commit()
+    calls = [
+        (SUBMIT_FIX, ("v4o_r", ["2"], "corrected", ts)),
+        ("select rat.submit_fix_confirm('loco_number', %s::jsonb)",
+         (json.dumps([{"image_no": "v4o_r", "updated_at": ts.isoformat()}]),)),
+        (SUBMIT_ANSWER, (task, "v4o_a", "loco", None, None, "sample")),
+    ]
+    for who, uid in users.items():
+        for sql, args in calls:
+            _, err = _as(pg, uid, sql, args)
+            if who == "trainee":
+                assert err is None, (sql, err)
+            else:
+                assert err is not None and err.pgcode == "42501", (who, sql)
+
+
+def test_submit_validates_like_direct(pg):
+    task = seed_task(pg, "t4_valid")
+    seed_catalog(pg, "v4v_a", "a scene")
+    run = seed_run(pg, task)
+    ts = seed_fix_value(pg, "v4v_r", values=["1"])
+    t = make_volunteer(pg)
+    pg.commit()
+    bad = [
+        (SUBMIT_FIX, ("v4v_r", ["2"], "bogus", ts), "22023"),
+        (SUBMIT_FIX, ("v4v_none", ["2"], "corrected", ts), "P0002"),
+        (SUBMIT_FIX, ("v4v_r", ["2"], "corrected", "2000-01-01T00:00:00Z"), "PT409"),
+        (SUBMIT_ANSWER, ("t4_nope", "v4v_a", "loco", None, None, "sample"), "P0002"),
+        (SUBMIT_ANSWER, (task, "v4v_a", "loco", None, None, "bogus"), "22023"),
+        (SUBMIT_ANSWER, (task, "v4v_a", "nope", None, None, "sample"), "22023"),
+        (SUBMIT_ANSWER, (task, "v4v_a", "loco", run, "loco", "sample"), "22023"),
+        (SUBMIT_ANSWER, (task, "v4v_a", "loco", None, None, "sure"), "22023"),
+        (SUBMIT_ANSWER, (task, "v4v_none", "loco", None, None, "sample"), "P0002"),
+    ]
+    for sql, args, code in bad:
+        _, err = _as(pg, t, sql, args)
+        assert err is not None and err.pgcode == code, (args, err)
+    # The table itself also refuses a non-blind sample row.
+    with pytest.raises(psycopg2.errors.CheckViolation):
+        with pg.cursor() as cur:
+            cur.execute("insert into rat.pending_model_answer (task_id, image_no, answer, "
+                        "shown_run_id, shown_answer, mode, submitted_by) "
+                        "values (%s, 'v4v_a', 'loco', %s, 'loco', 'sample', %s)", (task, run, t))
+    pg.rollback()
+
+
+def test_submit_holds_nothing_live(pg):
+    task, img = seed_task(pg, "t4_hold", links=LINKS), "v4h_a"
+    _linked_photo(pg, img)
+    run = seed_run(pg, task, predictions={img: ("station", 0.95)})
+    ts = seed_fix_value(pg, "v4h_r", values=["1"])
+    tc = seed_fix_value(pg, "v4h_c", values=["7"], suggested_values=["8"])
+    t = make_volunteer(pg)
+    pg.commit()
+    before = {i: _live(pg, i) for i in ("v4h_r", "v4h_c")}
+    before_fill = [_live(pg, img, f) for f in LINKS["fix_ids"]]
+
+    _one(pg, t, SUBMIT_FIX, ("v4h_r", ["2"], "corrected", ts))
+    n = _one(pg, t, "select rat.submit_fix_confirm('loco_number', %s::jsonb)",
+             (json.dumps([{"image_no": "v4h_c", "updated_at": tc.isoformat()},
+                          {"image_no": "v4h_r", "updated_at": ts.isoformat()},
+                          {"image_no": "v4h_c", "updated_at": "2000-01-01T00:00:00Z"}]),))
+    assert n == 2
+    _one(pg, t, SUBMIT_ANSWER, (task, img, "station", run, "station", "sure"))
+
+    assert {i: _live(pg, i) for i in before} == before
+    assert [_live(pg, img, f) for f in LINKS["fix_ids"]] == before_fill
+    with pg.cursor() as cur:
+        cur.execute("select count(*) from rat.model_answer where task_id = %s", (task,))
+        assert cur.fetchone()[0] == 0
+        cur.execute("select count(*) from rat.data_fix_history "
+                    "where image_no in ('v4h_r', 'v4h_c', %s) and old_status is not null", (img,))
+        assert cur.fetchone()[0] == 0
+        cur.execute("select image_no, \"values\", status, base_values, base_status, "
+                    "base_updated_at, submitted_by::text, decision "
+                    "from rat.pending_fix_review where submitted_by = %s order by image_no, id",
+                    (t,))
+        # The confirm re-held v4h_r (still 'extracted' live): the earlier review is withdrawn.
+        assert cur.fetchall() == [
+            ("v4h_c", ["8"], "verified", ["7"], "extracted", tc, t, "pending"),
+            ("v4h_r", ["2"], "corrected", ["1"], "extracted", ts, t, "withdrawn"),
+            ("v4h_r", ["1"], "verified", ["1"], "extracted", ts, t, "pending"),
+        ]
+    admin = make_admin(pg)
+    pg.commit()
+    rows, err = _as(pg, admin, "select n_checked from rat.model_check_progress() where run_id = %s",
+                    (run,))
+    assert err is None and rows == [(0,)]
+
+
+def test_resubmit_withdraws_previous(pg):
+    task, img = seed_task(pg, "t4_resub"), "v4rs_a"
+    seed_catalog(pg, img, "a scene")
+    ts = seed_fix_value(pg, "v4rs_r", values=["1"])
+    t = make_volunteer(pg)
+    pg.commit()
+    f1 = _one(pg, t, SUBMIT_FIX, ("v4rs_r", ["2"], "corrected", ts))
+    f2 = _one(pg, t, SUBMIT_FIX, ("v4rs_r", ["3"], "corrected", ts))
+    a1 = _one(pg, t, SUBMIT_ANSWER, (task, img, "loco", None, None, "sample"))
+    a2 = _one(pg, t, SUBMIT_ANSWER, (task, img, "station", None, None, "sample"))
+    assert _pending(pg, "pending_fix_review", f1) == ("withdrawn", t, None)
+    assert _pending(pg, "pending_fix_review", f2) == ("pending", None, None)
+    assert _pending(pg, "pending_model_answer", a1) == ("withdrawn", t, None)
+    assert _pending(pg, "pending_model_answer", a2) == ("pending", None, None)
+    with pg.cursor() as cur:
+        cur.execute("select count(*) from rat.pending_fix_review "
+                    "where image_no = 'v4rs_r' and decision = 'pending'")
+        assert cur.fetchone()[0] == 1
+        cur.execute("select count(*) from rat.pending_model_answer "
+                    "where image_no = %s and decision = 'pending'", (img,))
+        assert cur.fetchone()[0] == 1
+        # At most one pending row per key per trainee, enforced by the table.
+        with pytest.raises(psycopg2.errors.UniqueViolation):
+            cur.execute("insert into rat.pending_fix_review (image_no, fix_id, \"values\", status, "
+                        "base_updated_at, submitted_by) "
+                        "values ('v4rs_r', 'loco_number', '{4}', 'corrected', now(), %s)", (t,))
+    pg.rollback()
+
+
+def test_own_pending_hidden_from_own_queue_only(pg):
+    import hashlib
+    task, img, s_img = seed_task(pg, "t4_queue"), "v4q_a", "v4q_s"
+    seed_catalog(pg, img, "a scene")
+    seed_catalog(pg, s_img, "a scene")
+    run = seed_run(pg, task, predictions={img: ("loco", 0.95)})
+    ts = seed_fix_value(pg, img, values=["1"])
+    a, b, admin = make_volunteer(pg), make_volunteer(pg), make_admin(pg)
+    pg.commit()
+    _one(pg, a, SUBMIT_FIX, (img, ["2"], "corrected", ts))
+    _one(pg, a, SUBMIT_ANSWER, (task, img, "loco", run, "loco", "sure"))
+    _one(pg, a, SUBMIT_ANSWER, (task, s_img, "loco", None, None, "sample"))
+
+    fixq = "select image_no from rat.data_fix_queue('loco_number', p_text => %s)"
+    sure = "select image_no from rat.model_check_queue(%s, 'sure', %s)"
+    after = hashlib.md5(s_img.encode()).hexdigest()[:-1]
+    sample = "select image_no from rat.model_check_queue(%s, 'sample', null, null, null, %s, 1)"
+    for uid, sees in ((a, False), (b, True), (admin, True)):
+        expect = [(img,)] if sees else []
+        rows, err = _as(pg, uid, fixq, (img,))
+        assert err is None and rows == expect, uid
+        rows, err = _as(pg, uid, sure, (task, run))
+        assert err is None and rows == expect, uid
+        rows, err = _as(pg, uid, sample, (task, after))
+        assert err is None and ((s_img,) in rows) is sees, uid
+
+
+def test_approve_fix_records_author_and_approver(pg):
+    ts = seed_fix_value(pg, "v4af_r", values=["1"])
+    t, admin = make_volunteer(pg), make_admin(pg)
+    pg.commit()
+    pid = _one(pg, t, SUBMIT_FIX, ("v4af_r", ["2"], "corrected", ts))
+    res = _one(pg, admin, "select rat.approve_fix_review(%s)", ([pid],))
+    assert res == {"approved": 1, "stale": [], "skipped": []}
+    assert _live(pg, "v4af_r")[:3] == (["2"], "corrected", t)
+    with pg.cursor() as cur:
+        cur.execute("select changed_by::text, approved_by::text, source from rat.data_fix_history "
+                    "where image_no = 'v4af_r' order by id desc limit 1")
+        assert cur.fetchone() == (t, admin, "review")
+        cur.execute("select decision, decided_by::text, decided_at is not null "
+                    "from rat.pending_fix_review where id = %s", (pid,))
+        assert cur.fetchone() == ("approved", admin, True)
+
+
+def test_approve_stale_then_force(pg):
+    ts = seed_fix_value(pg, "v4st_r", values=["1"])
+    t, v, admin = make_volunteer(pg), make_volunteer(pg, in_training=False), make_admin(pg)
+    pg.commit()
+    pid = _one(pg, t, SUBMIT_FIX, ("v4st_r", ["2"], "corrected", ts))
+    _one(pg, v, "select rat.review_fix_value('v4st_r', 'loco_number', %s, 'corrected', %s)",
+         (["5"], ts))
+    res = _one(pg, admin, "select rat.approve_fix_review(%s)", ([pid],))
+    assert res == {"approved": 0, "skipped": [],
+                   "stale": [{"id": pid, "current_values": ["5"], "current_status": "corrected"}]}
+    assert _pending(pg, "pending_fix_review", pid)[0] == "pending"
+    assert _live(pg, "v4st_r")[:3] == (["5"], "corrected", v)
+    rows = _one(pg, admin, "select json_agg(h) from rat.held_list(%s) h", (t,))
+    assert rows[0]["stale"] is True and rows[0]["current"] == {"values": ["5"], "status": "corrected"}
+    res = _one(pg, admin, "select rat.approve_fix_review(%s, true)", ([pid],))
+    assert res == {"approved": 1, "stale": [], "skipped": []}
+    assert _live(pg, "v4st_r")[:3] == (["2"], "corrected", t)
+
+
+def test_approve_twice_skips(pg):
+    ts = seed_fix_value(pg, "v4tw_r", values=["1"])
+    t, admin = make_volunteer(pg), make_admin(pg)
+    pg.commit()
+    pid = _one(pg, t, SUBMIT_FIX, ("v4tw_r", ["2"], "corrected", ts))
+    assert _one(pg, admin, "select rat.approve_fix_review(%s)", ([pid],))["approved"] == 1
+    hist = "select count(*) from rat.data_fix_history where image_no = 'v4tw_r'"
+    with pg.cursor() as cur:
+        cur.execute(hist)
+        n = cur.fetchone()[0]
+    res = _one(pg, admin, "select rat.approve_fix_review(%s, true)", ([pid],))
+    assert res == {"approved": 0, "stale": [], "skipped": [{"id": pid, "reason": "not pending"}]}
+    with pg.cursor() as cur:
+        cur.execute(hist)
+        assert cur.fetchone()[0] == n
+
+
+def test_approve_missing_row_skipped(pg):
+    ts1 = seed_fix_value(pg, "v4mr_1", values=["1"])
+    ts2 = seed_fix_value(pg, "v4mr_2", values=["1"])
+    t, admin = make_volunteer(pg), make_admin(pg)
+    pg.commit()
+    p1 = _one(pg, t, SUBMIT_FIX, ("v4mr_1", ["2"], "corrected", ts1))
+    p2 = _one(pg, t, SUBMIT_FIX, ("v4mr_2", ["3"], "corrected", ts2))
+    with pg.cursor() as cur:
+        cur.execute("delete from rat.data_fix_value where image_no = 'v4mr_1'")
+    pg.commit()
+    res = _one(pg, admin, "select rat.approve_fix_review(%s)", ([p2, p1],))
+    assert res == {"approved": 1, "stale": [],
+                   "skipped": [{"id": p1, "reason": "no data_fix_value"}]}
+    assert _live(pg, "v4mr_2")[:3] == (["3"], "corrected", t)
+    assert _pending(pg, "pending_fix_review", p1)[0] == "pending"
+
+
+def test_approve_answer_dates_and_fills(pg):
+    task, img = seed_task(pg, "t4_appr", links=LINKS), "v4aa_a"
+    _linked_photo(pg, img)
+    t, admin = make_volunteer(pg), make_admin(pg)
+    pg.commit()
+    pid = _one(pg, t, SUBMIT_ANSWER, (task, img, "station", None, None, "sample"))
+    res = _one(pg, admin, "select rat.approve_model_answer(%s)", ([pid, 999999999],))
+    assert res == {"approved": 1, "skipped": [{"id": 999999999, "reason": "not pending"}]}
+    with pg.cursor() as cur:
+        cur.execute("select a.id, a.answered_by::text, a.answered_at = p.submitted_at, "
+                    "a.approved_by::text, a.approved_at is not null, a.answer, a.mode "
+                    "from rat.model_answer a, rat.pending_model_answer p "
+                    "where a.task_id = %s and p.id = %s", (task, pid))
+        aid, *rest = cur.fetchone()
+        assert rest == [t, True, admin, True, "station", "sample"]
+        cur.execute("select fix_id, source, changed_by::text, approved_by::text, model_answer_id "
+                    "from rat.data_fix_history where image_no = %s and old_status is not null "
+                    "order by fix_id", (img,))
+        assert cur.fetchall() == [("loco_name", "model_check", t, admin, aid),
+                                  ("loco_number", "model_check", t, admin, aid)]
+    assert _pending(pg, "pending_model_answer", pid)[:2] == ("approved", admin)
+
+
+def test_reject_keeps_note_and_my_held(pg):
+    task, img = seed_task(pg, "t4_rej"), "v4rj_a"
+    seed_catalog(pg, img, "a scene")
+    ts = seed_fix_value(pg, "v4rj_r", values=["1"])
+    t, other, admin = make_volunteer(pg), make_volunteer(pg), make_admin(pg)
+    pg.commit()
+    fid = _one(pg, t, SUBMIT_FIX, ("v4rj_r", ["2"], "corrected", ts))
+    aid = _one(pg, t, SUBMIT_ANSWER, (task, img, "loco", None, None, "sample"))
+    _, err = _as(pg, admin, "select rat.reject_held('bogus', %s, null)", ([fid],))
+    assert err is not None and err.pgcode == "22023"
+    res = _one(pg, admin, "select rat.reject_held('fix', %s, 'wrong number')", ([fid],))
+    assert res == {"rejected": 1, "skipped": []}
+    res = _one(pg, admin, "select rat.reject_held('answer', %s, null)", ([aid],))
+    assert res["rejected"] == 1
+    res = _one(pg, admin, "select rat.reject_held('fix', %s, 'again')", ([fid],))
+    assert res == {"rejected": 0, "skipped": [{"id": fid, "reason": "not pending"}]}
+    assert _live(pg, "v4rj_r")[:2] == (["1"], "extracted")
+    assert _pending(pg, "pending_fix_review", fid) == ("rejected", admin, "wrong number")
+
+    rows, err = _as(pg, t, "select kind, id, image_no, subject, proposed, decision, "
+                           "decided_at is not null, note from rat.my_held()")
+    assert err is None, err
+    assert ("fix", fid, "v4rj_r", "Loco number", {"values": ["2"], "status": "corrected"},
+            "rejected", True, "wrong number") in rows
+    assert ("answer", aid, img, f"Question for {task}?", {"answer": "loco", "mode": "sample"},
+            "rejected", True, None) in rows
+    rows, err = _as(pg, other, "select id from rat.my_held()")
+    assert err is None and rows == []
+
+
+def test_removed_trainee_items_still_approvable(pg):
+    ts = seed_fix_value(pg, "v4rm_r", values=["1"])
+    ts2 = seed_fix_value(pg, "v4rm_s", values=["1"])
+    t, admin = make_volunteer(pg), make_admin(pg)
+    pg.commit()
+    pid = _one(pg, t, SUBMIT_FIX, ("v4rm_r", ["2"], "corrected", ts))
+    _one(pg, admin, "select rat.set_volunteer(%s, null, false)", (t,))
+    _, err = _as(pg, t, SUBMIT_FIX, ("v4rm_s", ["2"], "corrected", ts2))
+    assert err is not None and err.pgcode == "42501"
+    res = _one(pg, admin, "select rat.approve_fix_review(%s)", ([pid],))
+    assert res == {"approved": 1, "stale": [], "skipped": []}
+    assert _live(pg, "v4rm_r")[:3] == (["2"], "corrected", t)
+    with pg.cursor() as cur:
+        cur.execute("select changed_by::text, approved_by::text from rat.data_fix_history "
+                    "where image_no = 'v4rm_r' order by id desc limit 1")
+        assert cur.fetchone() == (t, admin)
+
+
+def test_people_held_count(pg):
+    task = seed_task(pg, "t4_people")
+    seed_catalog(pg, "v4p_a", "a scene")
+    ts1 = seed_fix_value(pg, "v4p_1", values=["1"])
+    ts2 = seed_fix_value(pg, "v4p_2", values=["1"])
+    t, admin = make_volunteer(pg), make_admin(pg)
+    pg.commit()
+    p1 = _one(pg, t, SUBMIT_FIX, ("v4p_1", ["2"], "corrected", ts1))
+    _one(pg, t, SUBMIT_FIX, ("v4p_1", ["3"], "corrected", ts1))      # withdraws p1
+    _one(pg, t, SUBMIT_FIX, ("v4p_2", ["2"], "corrected", ts2))
+    _one(pg, t, SUBMIT_ANSWER, (task, "v4p_a", "loco", None, None, "sample"))
+    people = "select held_count from rat.people() where user_id = %s"
+    assert _call(pg, admin, people, (t,)) == [(3,)]
+    assert _call(pg, admin, people, (admin,)) == [(0,)]
+    held = _call(pg, admin, "select kind, image_no, subject, before, proposed, current, stale "
+                            "from rat.held_list(%s)", (t,))
+    assert held == [
+        ("fix", "v4p_1", "Loco number", {"values": ["1"], "status": "extracted"},
+         {"values": ["3"], "status": "corrected"}, {"values": ["1"], "status": "extracted"}, False),
+        ("fix", "v4p_2", "Loco number", {"values": ["1"], "status": "extracted"},
+         {"values": ["2"], "status": "corrected"}, {"values": ["1"], "status": "extracted"}, False),
+        ("answer", "v4p_a", f"Question for {task}?", {"shown_answer": None},
+         {"answer": "loco", "mode": "sample"}, None, False),
+    ]
+    assert p1 not in [r[0] for r in _call(pg, admin, "select id from rat.held_list()")]
+    _call(pg, admin, "select rat.reject_held('answer', array(select id from rat.held_list(%s) "
+                     "where kind = 'answer'), null)", (t,))
+    assert _call(pg, admin, people, (t,)) == [(2,)]
+
+
+def test_held_admin_rpcs_and_tables_closed(pg):
+    t, v = make_volunteer(pg), make_volunteer(pg, in_training=False)
+    pg.commit()
+    for uid in (t, v):
+        for sql in ("select rat.approve_fix_review('{1}')",
+                    "select rat.approve_model_answer('{1}')",
+                    "select rat.reject_held('fix', '{1}', null)",
+                    "select * from rat.held_list()"):
+            _, err = _as(pg, uid, sql)
+            assert err is not None and err.pgcode == "42501", (uid, sql)
+    with pg.cursor() as cur:
+        for tbl in ("rat.pending_fix_review", "rat.pending_model_answer"):
+            cur.execute("select has_table_privilege('anon', %s, 'select'), "
+                        "has_table_privilege('authenticated', %s, 'select'), "
+                        "has_table_privilege('authenticated', %s, 'insert'), "
+                        "c.relrowsecurity from pg_class c where c.oid = %s::regclass",
+                        (tbl, tbl, tbl, tbl))
+            assert cur.fetchone() == (False, False, False, True), tbl
+        for fn in ("rat.submit_fix_review(text, text, text[], text, timestamptz)",
+                   "rat.submit_fix_confirm(text, jsonb)",
+                   "rat.submit_model_answer(text, text, text, bigint, text, text)",
+                   "rat.approve_fix_review(bigint[], boolean)",
+                   "rat.approve_model_answer(bigint[])",
+                   "rat.reject_held(text, bigint[], text)",
+                   "rat.held_list(uuid)",
+                   "rat.my_held()"):
+            cur.execute("select has_function_privilege('anon', %s, 'EXECUTE'), "
+                        "has_function_privilege('authenticated', %s, 'EXECUTE'), "
+                        "p.prosecdef, p.proconfig "
+                        "from pg_proc p where p.oid = %s::regprocedure", (fn, fn, fn))
+            assert cur.fetchone() == (False, True, True, ['search_path=""']), fn
+        fn = "rat._validate_model_answer(text, text, text, bigint, text, text)"
+        cur.execute("select has_function_privilege('anon', %s, 'EXECUTE'), "
+                    "has_function_privilege('authenticated', %s, 'EXECUTE'), "
+                    "has_function_privilege('public', %s, 'EXECUTE')", (fn, fn, fn))
+        assert cur.fetchone() == (False, False, False)
