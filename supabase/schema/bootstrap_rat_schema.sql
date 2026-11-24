@@ -3609,10 +3609,16 @@ GRANT EXECUTE ON FUNCTION
 -- 'YYYY-MM-DD"T"HH24:MI:SS.US' (at, in UTC) | ref_table | ref_id, and p_after
 -- returns the rows strictly after it (a malformed cursor is 22023).
 -- p_limit is clamped to 1..500 (NULL = 100).
+-- p_fix_id / p_task_id: one question only (both set is 22023 'pick one question');
+-- a fix matches history and held fix rows, a task matches answers, withdrawals
+-- (through their answer) and held answers.
 -- ===========================================================================
 
 CREATE INDEX IF NOT EXISTS data_fix_history_undo_idx
   ON rat.data_fix_history (image_no, fix_id, id) WHERE source = 'undo';
+
+DROP FUNCTION IF EXISTS
+  rat.change_list(uuid, timestamptz, timestamptz, text[], text, integer);
 
 CREATE OR REPLACE FUNCTION rat.change_list(
   p_user uuid DEFAULT NULL,
@@ -3620,7 +3626,9 @@ CREATE OR REPLACE FUNCTION rat.change_list(
   p_to timestamptz DEFAULT NULL,
   p_kinds text[] DEFAULT NULL,
   p_after text DEFAULT NULL,
-  p_limit integer DEFAULT 100
+  p_limit integer DEFAULT 100,
+  p_fix_id text DEFAULT NULL,
+  p_task_id text DEFAULT NULL
 )
 RETURNS TABLE (
   cursor text,
@@ -3654,6 +3662,9 @@ DECLARE
 BEGIN
   IF NOT rat.is_admin() THEN
     RAISE EXCEPTION 'not a data fixes admin' USING ERRCODE = '42501';
+  END IF;
+  IF p_fix_id IS NOT NULL AND p_task_id IS NOT NULL THEN
+    RAISE EXCEPTION 'pick one question' USING ERRCODE = '22023';
   END IF;
   IF EXISTS (SELECT 1 FROM unnest(p_kinds) AS k WHERE k IS NULL OR NOT (k = ANY (v_kinds))) THEN
     RAISE EXCEPTION 'unknown change kind' USING ERRCODE = '22023';
@@ -3706,7 +3717,8 @@ BEGIN
                         WHERE x.source = 'undo' AND x.image_no = h.image_no
                           AND x.fix_id = h.fix_id
                           AND coalesce(x.undoes_from, x.undoes) <= h.id AND h.id <= x.undoes
-                          AND NOT (x.id = ANY (v_dead))) AS e_undone
+                          AND NOT (x.id = ANY (v_dead))) AS e_undone,
+               h.fix_id AS e_fix, NULL::text AS e_task
           FROM rat.data_fix_history h
           LEFT JOIN rat.data_fix d ON d.id = h.fix_id
          WHERE h.source IN ('review', 'model_check', 'undo')
@@ -3715,13 +3727,14 @@ BEGIN
                jsonb_build_object('shown_answer', a.shown_answer),
                jsonb_build_object('answer', a.answer, 'mode', a.mode),
                'model_answer', a.id,
-               EXISTS (SELECT 1 FROM rat.model_answer_withdrawal w WHERE w.answer_id = a.id)
+               EXISTS (SELECT 1 FROM rat.model_answer_withdrawal w WHERE w.answer_id = a.id),
+               NULL::text, a.task_id
           FROM rat.model_answer a
           LEFT JOIN rat.model_task t ON t.id = a.task_id
         UNION ALL
         SELECT 'answer_withdrawn', w.withdrawn_at, w.withdrawn_by, NULL::uuid, a.image_no,
                t.question, NULL::jsonb, jsonb_build_object('note', w.note),
-               'model_answer_withdrawal', w.answer_id, false
+               'model_answer_withdrawal', w.answer_id, false, NULL::text, a.task_id
           FROM rat.model_answer_withdrawal w
           JOIN rat.model_answer a ON a.id = w.answer_id
           LEFT JOIN rat.model_task t ON t.id = a.task_id
@@ -3731,7 +3744,7 @@ BEGIN
                jsonb_build_object('values', to_jsonb(f."values"), 'status', f.status)
                  || CASE WHEN ev.k = 'held_rejected' THEN jsonb_build_object('note', f.note)
                          ELSE '{}'::jsonb END,
-               'pending_fix_review', f.id, false
+               'pending_fix_review', f.id, false, f.fix_id, NULL::text
           FROM rat.pending_fix_review f
           CROSS JOIN LATERAL (
             VALUES ('held_submitted', f.submitted_at, f.submitted_by),
@@ -3747,7 +3760,7 @@ BEGIN
                jsonb_build_object('answer', m.answer, 'mode', m.mode)
                  || CASE WHEN ev.k = 'held_rejected' THEN jsonb_build_object('note', m.note)
                          ELSE '{}'::jsonb END,
-               'pending_model_answer', m.id, false
+               'pending_model_answer', m.id, false, NULL::text, m.task_id
           FROM rat.pending_model_answer m
           CROSS JOIN LATERAL (
             VALUES ('held_submitted', m.submitted_at, m.submitted_by),
@@ -3760,6 +3773,8 @@ BEGIN
       ) e
      WHERE (p_kinds IS NULL OR e.e_kind = ANY (p_kinds))
        AND (p_user IS NULL OR e.e_by = p_user)
+       AND (p_fix_id IS NULL OR e.e_fix = p_fix_id)
+       AND (p_task_id IS NULL OR e.e_task = p_task_id)
        AND (p_from IS NULL OR e.e_at >= p_from)
        AND (p_to IS NULL OR e.e_at < p_to)
        AND (p_after IS NULL
@@ -3772,10 +3787,10 @@ END;
 $$;
 
 REVOKE EXECUTE ON FUNCTION
-  rat.change_list(uuid, timestamptz, timestamptz, text[], text, integer)
+  rat.change_list(uuid, timestamptz, timestamptz, text[], text, integer, text, text)
   FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION
-  rat.change_list(uuid, timestamptz, timestamptz, text[], text, integer)
+  rat.change_list(uuid, timestamptz, timestamptz, text[], text, integer, text, text)
   TO authenticated;
 
 COMMIT;

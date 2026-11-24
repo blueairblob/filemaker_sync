@@ -1458,12 +1458,13 @@ def test_preservation_checksum_untouched_by_migration(pg):
 # --------------------------------------------------------------------------
 
 CHANGES = ("select * from rat.change_list(p_user => %s::uuid, p_from => %s::timestamptz, "
-           "p_to => %s::timestamptz, p_kinds => %s::text[], p_after => %s, p_limit => %s)")
+           "p_to => %s::timestamptz, p_kinds => %s::text[], p_after => %s, p_limit => %s, "
+           "p_fix_id => %s, p_task_id => %s)")
 CURSOR_RE = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}\|[a-z_]+\|\d+$"
 
 
 def _changes(pg, admin, user=None, frm=None, to=None, kinds=None, after=None, limit=100,
-             tz=None):
+             tz=None, fix_id=None, task_id=None):
     """change_list as admin (optionally in session time zone tz); a list of
     dicts (column name -> value)."""
     pg.commit()
@@ -1471,7 +1472,7 @@ def _changes(pg, admin, user=None, frm=None, to=None, kinds=None, after=None, li
     with pg.cursor() as cur:
         if tz:
             cur.execute("select set_config('timezone', %s, true)", (tz,))
-        cur.execute(CHANGES, (user, frm, to, kinds, after, limit))
+        cur.execute(CHANGES, (user, frm, to, kinds, after, limit, fix_id, task_id))
         names = [d[0] for d in cur.description]
         rows = [dict(zip(names, r)) for r in cur.fetchall()]
     pg.commit()
@@ -1584,7 +1585,7 @@ def test_change_list_kinds_and_people(pg):
     as_user(pg, admin)
     with pg.cursor() as cur:
         with pytest.raises(psycopg2.Error) as ei:
-            cur.execute(CHANGES, (None, None, None, ["extractor"], None, 10))
+            cur.execute(CHANGES, (None, None, None, ["extractor"], None, 10, None, None))
         assert ei.value.pgcode == "22023"
     pg.rollback()
 
@@ -1631,7 +1632,7 @@ def test_change_list_paging(pg):
         as_user(pg, admin)
         with pg.cursor() as cur:
             with pytest.raises(psycopg2.Error) as ei:
-                cur.execute(CHANGES, (v, None, None, None, bad, 10))
+                cur.execute(CHANGES, (v, None, None, None, bad, 10, None, None))
             assert ei.value.pgcode == "22023", bad
         pg.rollback()
 
@@ -1710,7 +1711,8 @@ def test_change_list_admin_only(pg):
     for who, uid in users.items():
         _, err = _as(pg, uid, "select * from rat.change_list()")
         assert err is not None and err.pgcode == "42501", who
-    fn = "rat.change_list(uuid, timestamptz, timestamptz, text[], text, integer)"
+    fn = ("rat.change_list(uuid, timestamptz, timestamptz, text[], text, integer, text, "
+          "text)")
     with pg.cursor() as cur:
         cur.execute("select has_function_privilege('anon', %s, 'EXECUTE'), "
                     "has_function_privilege('authenticated', %s, 'EXECUTE'), "
@@ -1718,6 +1720,67 @@ def test_change_list_admin_only(pg):
                     "p.prosecdef, p.proconfig "
                     "from pg_proc p where p.oid = %s::regprocedure", (fn, fn, fn, fn))
         assert cur.fetchone() == (False, True, False, True, ['search_path=""'])
+
+
+def test_change_list_fix_filter(pg):
+    seed_fix_value(pg, "v6f_num", "loco_number", values=["1"])
+    seed_fix_value(pg, "v6f_name", "loco_name", values=["x"])
+    ts = seed_fix_value(pg, "v6f_held", "loco_number", values=["1"])
+    v, t, admin = make_volunteer(pg, in_training=False), make_volunteer(pg), make_admin(pg)
+    pg.commit()
+    hn = _review(pg, v, "v6f_num", ["2"])
+    _review(pg, v, "v6f_name", ["y"], fix_id="loco_name")
+    p = _one(pg, t, SUBMIT_FIX, ("v6f_held", ["5"], "corrected", ts))
+    got = [r for r in _changes(pg, admin, fix_id="loco_number", limit=500)
+           if r["image_no"].startswith("v6f_")]   # the DB is shared with other tests
+    assert sorted((r["ref_table"], r["ref_id"]) for r in got) == sorted(
+        [("data_fix_history", hn), ("pending_fix_review", p)])
+    assert {r["subject"] for r in got} == {"Loco number"}
+    names = [r for r in _changes(pg, admin, fix_id="loco_name", limit=500)
+             if r["image_no"].startswith("v6f_")]
+    assert {r["subject"] for r in names} == {"Loco name"}
+
+
+def test_change_list_task_filter(pg):
+    a, b = seed_task(pg, "t6_taskA"), seed_task(pg, "t6_taskB")
+    for i in ("a1", "a2", "a3", "b1"):
+        seed_catalog(pg, f"v6t_{i}", "a scene")
+    v, t, admin = make_volunteer(pg, in_training=False), make_volunteer(pg), make_admin(pg)
+    pg.commit()
+    ans = _answer(pg, v, a, "v6t_a1", "loco")
+    wd = _answer(pg, v, a, "v6t_a2", "station")
+    _answer(pg, v, b, "v6t_b1", "loco")
+    _one(pg, admin, WITHDRAW, ([wd], "misread"))
+    pa = _one(pg, t, SUBMIT_ANSWER, (a, "v6t_a3", "loco", None, None, "sample"))
+    got = _changes(pg, admin, task_id=a)
+    assert sorted((r["kind"], r["ref_table"], r["ref_id"]) for r in got) == sorted([
+        ("answer", "model_answer", ans), ("answer", "model_answer", wd),
+        ("answer_withdrawn", "model_answer_withdrawal", wd),
+        ("held_submitted", "pending_model_answer", pa)])
+    assert all(r["image_no"] != "v6t_b1" for r in got)
+
+
+def test_change_list_one_question_only(pg):
+    admin = make_admin(pg)
+    pg.commit()
+    as_user(pg, admin)
+    with pg.cursor() as cur:
+        with pytest.raises(psycopg2.Error) as ei:
+            cur.execute(CHANGES, (None, None, None, None, None, 10, "loco_number", "t"))
+        assert ei.value.pgcode == "22023"
+    pg.rollback()
+
+
+def test_change_list_no_question_is_all(pg):
+    seed_fix_value(pg, "v6n_x", "loco_number", values=["1"])
+    task = seed_task(pg, "t6_none")
+    seed_catalog(pg, "v6n_a", "a scene")
+    v, admin = make_volunteer(pg, in_training=False), make_admin(pg)
+    pg.commit()
+    hx = _review(pg, v, "v6n_x", ["2"])
+    ans = _answer(pg, v, task, "v6n_a", "loco")
+    got = {(r["ref_table"], r["ref_id"]) for r in _changes(pg, admin)}
+    assert {("data_fix_history", hx), ("model_answer", ans)} <= got
 
 
 # --------------------------------------------------------------------------
