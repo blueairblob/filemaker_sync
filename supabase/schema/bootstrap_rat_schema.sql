@@ -2984,7 +2984,9 @@ $$;
 -- trainee loaded. "Approve anyway" (p_force) applies over the row the admin
 -- saw: p_seen_updated_at, held_list's current_updated_at, so a change made
 -- after the admin looked comes back as stale again. With p_force and no
--- p_seen_updated_at it applies over whatever the row holds now. Replaces the
+-- p_seen_updated_at it applies over whatever the row holds now. A seen value
+-- is for one item at a time (rows written in one transaction share
+-- updated_at): with several ids it is 22023. Replaces the
 -- two-argument version (dropped here, so the call is never ambiguous).
 DROP FUNCTION IF EXISTS rat.approve_fix_review(bigint[], boolean);
 CREATE OR REPLACE FUNCTION rat.approve_fix_review(
@@ -3008,6 +3010,9 @@ DECLARE
 BEGIN
   IF NOT rat.is_admin() THEN
     RAISE EXCEPTION 'not a data fixes admin' USING ERRCODE = '42501';
+  END IF;
+  IF p_seen_updated_at IS NOT NULL AND cardinality(p_ids) > 1 THEN
+    RAISE EXCEPTION 'a seen value is for one item at a time' USING ERRCODE = '22023';
   END IF;
   FOR v_id IN SELECT DISTINCT x FROM unnest(coalesce(p_ids, '{}'::bigint[])) AS x
                WHERE x IS NOT NULL ORDER BY x
@@ -3317,7 +3322,7 @@ GRANT EXECUTE ON FUNCTION
 -- Whether history row p_id is undone: an undo row u for the same key
 -- (image_no, fix_id) has u.undoes_from <= p_id <= u.undoes and u is not itself
 -- undone (the rule rat.change_list's undone flag uses). An undo row listed in
--- p_except does not count. Internal.
+-- p_except does not count, at any depth of the chain. Internal.
 CREATE OR REPLACE FUNCTION rat._fix_history_undone(p_id bigint,
                                                    p_except bigint[] DEFAULT '{}')
 RETURNS boolean
@@ -3337,7 +3342,7 @@ BEGIN
             WHERE h.id = p_id
               AND NOT (x.id = ANY (coalesce(p_except, '{}'::bigint[])))
   LOOP
-    IF NOT rat._fix_history_undone(u) THEN
+    IF NOT rat._fix_history_undone(u, p_except) THEN
       RETURN true;
     END IF;
   END LOOP;

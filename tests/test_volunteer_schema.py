@@ -2017,3 +2017,40 @@ def test_undo_restored_reviewer_after_reapply(pg):
     assert _live(pg, "wa_rev2")[:2] == (["3"], "corrected")
     _, _, reviewed_by, reviewed_at = _flags(pg, "wa_rev2")
     assert (reviewed_by, reviewed_at) == (bob, _hist_at(pg, r2))
+
+
+def test_undo_restored_reviewer_through_undo_chain(pg):
+    # alice R1, bob R2, U1 undoes R2 (alice back), U2 undoes U1 (bob back),
+    # then undo U2: alice's value is back, so alice is the reviewer. U2 is
+    # given, so it must not count as undoing U1 anywhere down the chain.
+    seed_fix_value(pg, "wb_tri", values=["1"])
+    alice, bob = make_volunteer(pg, in_training=False), make_volunteer(pg, in_training=False)
+    admin = make_admin(pg)
+    pg.commit()
+    r1 = _review(pg, alice, "wb_tri", ["2"])
+    r2 = _review(pg, bob, "wb_tri", ["3"])
+    _one(pg, admin, UNDO, ([r2],))
+    u1 = _last_hist(pg, "wb_tri")[0]
+    _one(pg, admin, UNDO, ([u1],))
+    u2 = _last_hist(pg, "wb_tri")[0]
+    res = _one(pg, admin, UNDO, ([u2],))
+    assert res == {"undone": 1, "changed_since": [], "skipped": []}
+    assert _live(pg, "wb_tri")[:2] == (["2"], "corrected")
+    _, _, reviewed_by, reviewed_at = _flags(pg, "wb_tri")
+    assert (reviewed_by, reviewed_at) == (alice, _hist_at(pg, r1))
+
+
+def test_approve_seen_value_is_for_one_item(pg):
+    t, v, admin, pid = _stale_held(pg, "wb_one")
+    ts2 = seed_fix_value(pg, "wb_one2", values=["1"])
+    pg.commit()
+    pid2 = _one(pg, t, SUBMIT_FIX, ("wb_one2", ["2"], "corrected", ts2))
+    seen = _held_row(pg, admin, t, pid)["current_updated_at"]
+    _, err = _as(pg, admin, APPROVE_SEEN, ([pid, pid2], seen))
+    assert err is not None and err.pgcode == "22023"
+    assert "a seen value is for one item at a time" in str(err)
+    assert _pending(pg, "pending_fix_review", pid)[0] == "pending"
+    assert _pending(pg, "pending_fix_review", pid2)[0] == "pending"
+    # Several ids without a seen value still work.
+    res = _one(pg, admin, "select rat.approve_fix_review(%s, true)", ([pid, pid2],))
+    assert res == {"approved": 2, "stale": [], "skipped": []}
